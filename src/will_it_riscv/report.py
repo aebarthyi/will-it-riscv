@@ -83,6 +83,10 @@ def _project_section(analysis: Analysis, console: Console) -> None:
     console.print(Text("This project", style="bold"))
     builds = ", ".join(sorted(profile.languages | profile.build_systems)) or "nothing"
     console.print(f"  builds   {builds}   ({analysis.files_scanned} files scanned)")
+    if analysis.meson_introspect == "ok":
+        console.print(
+            "  meson    dependency list came from meson introspect", style="dim"
+        )
     build_only = [
         r for r in profile.system_requirements
         if r.purpose == "build" and not r.optional
@@ -396,6 +400,7 @@ def to_dict(analysis: Analysis) -> dict:
         "project": (
             {
                 "files_scanned": analysis.files_scanned,
+                "meson_introspect": analysis.meson_introspect,
                 "languages": sorted(analysis.project_build.languages),
                 "build_systems": sorted(analysis.project_build.build_systems),
                 "system_requirements": [

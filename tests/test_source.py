@@ -1,5 +1,8 @@
 from pathlib import Path
 
+import pytest
+
+from will_it_riscv.meson_introspect import available as meson_available
 from will_it_riscv.source import (
     check_submodules,
     discover_manifests,
@@ -448,3 +451,66 @@ def test_required_anywhere_beats_optional_elsewhere(tmp_path):
         ),
     })
     assert "zlib" in required_names(inspect_repository(tmp_path, scan_ci=False))
+
+
+# -- meson introspect -------------------------------------------------------
+
+
+def test_meson_introspect_is_opt_outable(tmp_path):
+    build_repo(tmp_path, {
+        "meson.build": "project('demo', 'c')\nzlib = dependency('zlib')\n",
+    })
+    inspection = inspect_repository(
+        tmp_path, scan_ci=False, use_meson_introspect=False
+    )
+    assert inspection.meson_introspect is None
+    assert "zlib" in required_names(inspection)     # the scrapers still work
+
+
+def test_a_failed_introspect_falls_back_to_reading_the_files(tmp_path, monkeypatch):
+    """QEMU declares Rust, so meson runs rustc and fails without it."""
+    import subprocess
+
+    from will_it_riscv import meson_introspect
+
+    build_repo(tmp_path, {
+        "meson.build": (
+            "project('demo', 'c')\n"
+            "zlib = dependency('zlib')\n"
+            "curl = dependency('libcurl', required: false)\n"
+        ),
+    })
+    monkeypatch.setattr(meson_introspect.shutil, "which", lambda _: "/usr/bin/meson")
+    monkeypatch.setattr(
+        meson_introspect.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(
+            a, 1, stdout="", stderr="ERROR: Unknown compiler(s): [['rustc']]\n"
+        ),
+    )
+    inspection = inspect_repository(tmp_path, scan_ci=False)
+    assert "rustc" in inspection.meson_introspect
+    assert any("meson introspect unavailable" in n for n in inspection.profile.notes)
+    # The regex reading carried on, so nothing was lost.
+    assert "zlib" in required_names(inspection)
+    assert "libcurl" in optional_names(inspection)
+
+
+@pytest.mark.skipif(not meson_available(), reason="meson is not installed")
+def test_meson_verdict_overrides_a_scraper_guess(tmp_path):
+    """A regex over configure.ac must not outvote meson about meson's files.
+
+    PostgreSQL is the real case: its configure.ac mentions libxml2 with no
+    hint that --with-libxml is optional, while its meson.build says so.
+    """
+    build_repo(tmp_path, {
+        "meson.build": (
+            "project('demo', 'c')\n"
+            "xml = dependency('libxml-2.0', required: false)\n"
+        ),
+        "configure.ac": "AC_CHECK_LIB([xml2], [xmlParseFile])\n",
+    })
+    inspection = inspect_repository(tmp_path, scan_ci=False)
+    assert inspection.meson_introspect == "ok"
+    assert "libxml2" in optional_names(inspection)
+    assert "libxml2" not in required_names(inspection)

@@ -66,6 +66,9 @@ names = [
   "iokit", "cocoa", "appkit", "quartz", "quartzcore", "audiotoolbox",
   "videotoolbox", "corevideo", "coremedia", "avfoundation", "opengl",
   "carbon", "diskarbitration", "metal", "metalkit", "coreaudio",
+  "dns_sd", "dnssd",
+  # Cygwin and Windows-only shims
+  "cygipc", "wldap", "wldap32", "gnugetopt", "getopt", "mingwex", "msvcr",
 ]
 
 # ---------------------------------------------------------------- libraries

@@ -178,6 +178,8 @@ class Analysis:
     requirements above, because the project has no wheel to fall back on --
     you are building it either way."""
     files_scanned: int = 0
+    meson_introspect: Optional[str] = None
+    """"ok" when Meson reported its own dependencies, else why it could not."""
     bundled_libraries: set[str] = field(default_factory=set)
     """Libraries the project ships its own copy of, making the system package
     optional rather than required."""

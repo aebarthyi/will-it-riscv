@@ -101,6 +101,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip CI configs and Dockerfiles when scanning a source tree",
     )
     scope.add_argument(
+        "--no-meson-introspect", action="store_true",
+        help="do not ask meson about its own dependencies; read the "
+        "meson.build files directly instead (meson resolves the project's "
+        "languages first, so it runs compiler probes and can fail)",
+    )
+    scope.add_argument(
         "--max-depth", type=int, default=None, metavar="N",
         help="stop walking below this depth",
     )
@@ -188,11 +194,12 @@ def _scan_source_tree(
     path = Path(args.path)
     if not path.is_dir():
         return None
-    message = f"scanning {path}…"
+    scan_ci = not args.no_ci_scan
+    use_meson = not args.no_meson_introspect
     if args.quiet:
-        return inspect_repository(path, scan_ci=not args.no_ci_scan)
-    with stderr.status(message):
-        return inspect_repository(path, scan_ci=not args.no_ci_scan)
+        return inspect_repository(path, scan_ci=scan_ci, use_meson_introspect=use_meson)
+    with stderr.status(f"scanning {path}…"):
+        return inspect_repository(path, scan_ci=scan_ci, use_meson_introspect=use_meson)
 
 
 def _annotate_distro(analysis: Analysis, distro: DistroIndex) -> None:
@@ -297,6 +304,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             }
             analysis.files_scanned = scan.files_scanned
             analysis.bundled_libraries = scan.bundled
+            analysis.meson_introspect = scan.meson_introspect
             for warning in scan.warnings:
                 analysis.add_warning(warning)
             analysis.root = scan.name

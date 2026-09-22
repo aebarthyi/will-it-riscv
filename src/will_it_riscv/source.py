@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from .meson_introspect import MesonDependency, MesonScan, scan_dependencies
 from .models import BuildProfile, SystemRequirement
 from .sdist import (
     ScanPolicy,
@@ -67,6 +68,9 @@ class RepositoryInspection:
 
     root: Path
     profile: BuildProfile = field(default_factory=BuildProfile)
+    meson_introspect: Optional[str] = None
+    """What Meson's own dependency scan did: None if not attempted, "ok",
+    or the reason it could not be used."""
     manifests: list[Path] = field(default_factory=list)
     """Dependency manifests found, for the analyzer to pick up."""
     bundled: set[str] = field(default_factory=set)
@@ -225,6 +229,53 @@ def check_submodules(root: Path) -> list[str]:
     return warnings
 
 
+def _apply_meson_verdict(scan: MesonScan, found: dict, record) -> None:
+    """Let Meson's own answer settle optionality, overriding the scrapers.
+
+    "Required anywhere wins" is the right rule between two inferences. It is
+    the wrong rule when one side is the language's own parser and the other
+    is a regex over a configure.ac that knows nothing about AC_ARG_WITH. So
+    this runs last and overrides, for the names Meson actually reported.
+
+    Meson may mention a dependency more than once with different answers --
+    PostgreSQL asks for ICU twice -- and there, required wins.
+    """
+    from dataclasses import replace
+
+    from .syslibs import database
+
+    db = database()
+    verdicts: dict[str, MesonDependency] = {}
+    for dependency in scan.dependencies:
+        known = db.lookup(dependency.name, "library")
+        if known is None:
+            continue
+        existing = verdicts.get(known.name)
+        if existing is None or (existing.optional and not dependency.optional):
+            verdicts[known.name] = dependency
+
+    for canonical, dependency in verdicts.items():
+        current = found.get(canonical)
+        if current is None:
+            # The regex reading of dependency() stood aside for Meson, so
+            # for a pure-Meson project this is the only thing that knows
+            # about it at all.
+            record(
+                dependency.name,
+                "library",
+                "meson introspect",
+                optional=dependency.optional,
+                gate=dependency.gate,
+            )
+            continue
+        found[canonical] = replace(
+            current,
+            optional=dependency.optional,
+            gate=dependency.gate if dependency.optional else None,
+            found_in=tuple(dict.fromkeys(current.found_in + ("meson introspect",))),
+        )
+
+
 def _cmake_symbols(members: list) -> object:
     """Learn every CMake option default before judging any condition.
 
@@ -250,6 +301,7 @@ def inspect_repository(
     root: Path,
     policy: Optional[ScanPolicy] = None,
     scan_ci: bool = True,
+    use_meson_introspect: bool = True,
 ) -> RepositoryInspection:
     """Read a source tree and work out what building it needs from the system."""
     root = Path(root)
@@ -261,6 +313,19 @@ def inspect_repository(
     own = own_names(root)
     found: dict[str, SystemRequirement] = {}
     record = make_recorder(found, exclude=own)
+
+    # Ask Meson before scraping, so the scrapers know to stand aside.
+    meson_scan = scan_dependencies(root) if use_meson_introspect else None
+    if meson_scan is not None:
+        if meson_scan.ok:
+            inspection.meson_introspect = "ok"
+            policy.meson_dependencies_handled = True
+        else:
+            inspection.meson_introspect = meson_scan.error
+            inspection.profile.notes.append(
+                f"meson introspect unavailable ({meson_scan.error}); "
+                "read the meson.build files directly instead"
+            )
 
     result = SdistInspection(profile=inspection.profile)
     members = list(iter_directory(root))
@@ -275,6 +340,9 @@ def inspect_repository(
         ci = scan_ci_configuration(root, record)
         inspection.warnings.extend(ci.warnings)
         inspection.profile.notes.extend(ci.notes)
+
+    if meson_scan is not None and meson_scan.ok:
+        _apply_meson_verdict(meson_scan, found, record)
 
     _apply_implied_tools(inspection.profile, record)
     inspection.profile.system_requirements = sorted(

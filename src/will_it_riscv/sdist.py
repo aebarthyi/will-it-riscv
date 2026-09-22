@@ -331,6 +331,10 @@ class ScanPolicy:
     cmake_symbols: object = None
     """Option defaults gathered across the whole tree, so a switch declared
     in one file can gate a find_package in another."""
+    meson_dependencies_handled: bool = False
+    """True when `meson introspect` already reported this project's
+    dependency() calls, so the regex reading of them would only add noise.
+    find_library() is still scraped -- introspect does not report it."""
 
     @classmethod
     def for_sdist(cls) -> ScanPolicy:
@@ -483,7 +487,10 @@ def scan_members(
             if owns_build:
                 profile.build_systems.add("meson")
                 profile.evidence.add(Evidence.BUILD_CONFIG)
-                _scan_meson(_decode(read()), path, record, profile)
+                _scan_meson(
+                    _decode(read()), path, record, profile,
+                    skip_dependencies=policy.meson_dependencies_handled,
+                )
         elif base in ("configure.ac", "configure.in", "makefile.am"):
             if owns_build:
                 profile.build_systems.add("autotools")
@@ -660,8 +667,14 @@ _MESON_LANG_MAP = {"c": "c", "cpp": "c++", "c++": "c++", "fortran": "fortran", "
                    "cython": "cython", "cuda": "cuda", "objc": "objective-c"}
 
 
-def _scan_meson(text: str, path: str, record, profile: BuildProfile) -> None:
-    for match in _MESON_DEPENDENCY.finditer(text):
+def _scan_meson(
+    text: str,
+    path: str,
+    record,
+    profile: BuildProfile,
+    skip_dependencies: bool = False,
+) -> None:
+    for match in () if skip_dependencies else _MESON_DEPENDENCY.finditer(text):
         optional = bool(_MESON_NOT_REQUIRED.search(match.group("rest")))
         record(
             match.group("name"), "library", path,

@@ -63,6 +63,23 @@ so about, rather than silently reporting nothing. It also flags third-party
 package sources — a PPA or a vendor apt repo that has no builds for your
 architecture is a finding, not a detail.
 
+### Meson projects are asked, not guessed at
+
+`meson introspect --scan-dependencies` walks a project's `meson.build` files,
+recursing through `subdir()`, and reports every dependency with whether it is
+required and whether it sits behind a condition — exactly the classification
+this tool reconstructs by hand everywhere else, from the parser that owns the
+language. When it works, its answer wins: a regex over `configure.ac` that
+knows nothing about `AC_ARG_WITH` must not outvote Meson about Meson's files.
+On PostgreSQL that moves ldap, libcurl, libxml2, libxslt, lz4, numa and pam
+out of the install line, where they belong.
+
+It is an enhancement, never a dependency. Meson resolves the project's
+languages first, so a project declaring Rust makes it run `rustc --version`
+and fail without a Rust toolchain — QEMU does exactly that. On any failure the
+regex readers carry on unchanged, and the report says which happened.
+`--no-meson-introspect` turns it off.
+
 ### Optional dependencies are separated from required ones
 
 Most `find_package` calls in a large project sit inside a branch nobody

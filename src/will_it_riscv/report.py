@@ -472,11 +472,11 @@ def render_markdown(analysis: Analysis, distro: Optional[DistroIndex] = None) ->
         if not extra:
             continue
         heading, _ = _PURPOSE_HEADINGS[purpose]
-        packages = sorted({p for r in extra.values() for p in r.debian})
+        extra_packages = sorted({p for r in extra.values() for p in r.debian})
         out.append(f"## {heading}")
         out.append("")
         out.append("```console")
-        out.append(f"$ sudo apt install {' '.join(packages)}")
+        out.append(f"$ sudo apt install {' '.join(extra_packages)}")
         out.append("```")
         out.append("")
 

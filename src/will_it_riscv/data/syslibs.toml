@@ -1,0 +1,766 @@
+# Mapping from a library/tool name as it appears in build files to the system
+# packages that provide it. `aliases` covers the spellings found in setup.py
+# `libraries=`, CMake `find_package()`, pkg-config module names and -l flags.
+#
+# Anything not listed here is still reported, with a guessed Debian name.
+
+[ignore]
+# CMake find_package() / meson dependency() names that are not system packages:
+# they are either provided by the Python build itself, pulled from PyPI, or
+# built into the toolchain.
+names = [
+  "python", "python2", "python3", "pythoninterp", "pythonlibs", "pythonextensions",
+  "development.module", "development", "interpreter", "numpy", "cython",
+  "pybind11", "nanobind", "skbuild", "scikit-build", "threads", "git", "doxygen",
+  "pkgconfig", "sphinx", "catch2", "gtest", "benchmark", "googletest",
+  "sanitizers", "ccache", "clang-tidy", "ipo", "lto", "filesystem", "dl", "m",
+  "rt", "pthread", "c", "stdc++", "util", "nsl", "socket",
+  # provided by gcc/glibc, never a separate package
+  "atomic", "atomics", "quadmath", "gcc", "gcc_s", "supc++", "resolv", "anl",
+  "crypt", "mvec", "execinfo", "gomp_implicit", "backtrace", "ssp",
+  # Windows import libraries, common in cross-platform build files
+  "synchronization", "advapi32", "ws2_32", "kernel32", "user32", "shell32",
+  "bcrypt", "crypt32", "ole32", "oleaut32", "gdi32", "winmm", "iphlpapi",
+  "setupapi", "msvcrt", "dbghelp", "psapi", "comdlg32", "rpcrt4", "secur32",
+  "wsock32", "mincore", "pathcch", "shlwapi", "userenv", "netapi32", "mswsock",
+  "winsock2", "ntdll", "powrprof", "version", "winhttp", "wininet",
+  # other language ecosystems and linters, common in polyglot CMake projects
+  "java", "jni", "jvm", "ant", "flake", "flake", "pylint", "matlab", "octave",
+  "halide", "openvino", "ade", "tengine", "nvcc", "cuda", "cudnn", "cublas",
+  # macOS frameworks
+  "accelerate", "corefoundation", "coregraphics", "appleframeworks", "objc",
+]
+
+# ---------------------------------------------------------------- libraries
+
+[library.openssl]
+aliases = ["ssl", "crypto", "libssl", "libcrypto", "openssl-sys"]
+pkgconfig = "openssl"
+debian = ["libssl-dev"]
+fedora = ["openssl-devel"]
+
+[library.zlib]
+aliases = ["z", "libz", "libz-sys", "zlib-ng"]
+pkgconfig = "zlib"
+debian = ["zlib1g-dev"]
+fedora = ["zlib-devel"]
+
+[library.bzip2]
+aliases = ["bz2", "libbz2", "bzip2-sys"]
+debian = ["libbz2-dev"]
+fedora = ["bzip2-devel"]
+
+[library.lzma]
+aliases = ["liblzma", "xz", "lzma-sys"]
+pkgconfig = "liblzma"
+debian = ["liblzma-dev"]
+fedora = ["xz-devel"]
+
+[library.zstd]
+aliases = ["libzstd", "zstd-sys"]
+pkgconfig = "libzstd"
+debian = ["libzstd-dev"]
+fedora = ["libzstd-devel"]
+
+[library.lz4]
+aliases = ["liblz4"]
+pkgconfig = "liblz4"
+debian = ["liblz4-dev"]
+fedora = ["lz4-devel"]
+
+[library.snappy]
+debian = ["libsnappy-dev"]
+fedora = ["snappy-devel"]
+
+[library.brotli]
+aliases = ["brotlidec", "brotlienc", "brotlicommon", "libbrotli"]
+debian = ["libbrotli-dev"]
+fedora = ["brotli-devel"]
+
+[library.libffi]
+aliases = ["ffi"]
+pkgconfig = "libffi"
+debian = ["libffi-dev"]
+fedora = ["libffi-devel"]
+
+[library.libxml2]
+aliases = ["xml2"]
+pkgconfig = "libxml-2.0"
+debian = ["libxml2-dev"]
+fedora = ["libxml2-devel"]
+
+[library.libxslt]
+aliases = ["xslt", "exslt", "libexslt"]
+pkgconfig = "libxslt"
+debian = ["libxslt1-dev"]
+fedora = ["libxslt-devel"]
+
+[library.expat]
+aliases = ["libexpat"]
+pkgconfig = "expat"
+debian = ["libexpat1-dev"]
+fedora = ["expat-devel"]
+
+[library.libjpeg]
+aliases = ["jpeg", "jpeg-turbo", "libjpeg-turbo", "turbojpeg"]
+pkgconfig = "libjpeg"
+debian = ["libjpeg-dev"]
+fedora = ["libjpeg-turbo-devel"]
+
+[library.libpng]
+aliases = ["png", "png16"]
+pkgconfig = "libpng"
+debian = ["libpng-dev"]
+fedora = ["libpng-devel"]
+
+[library.libtiff]
+aliases = ["tiff"]
+debian = ["libtiff-dev"]
+fedora = ["libtiff-devel"]
+
+[library.libwebp]
+aliases = ["webp", "webpmux", "webpdemux"]
+debian = ["libwebp-dev"]
+fedora = ["libwebp-devel"]
+
+[library.freetype]
+aliases = ["freetype2"]
+pkgconfig = "freetype2"
+debian = ["libfreetype-dev"]
+fedora = ["freetype-devel"]
+
+[library.lcms2]
+aliases = ["lcms"]
+debian = ["liblcms2-dev"]
+fedora = ["lcms2-devel"]
+
+[library.openjpeg]
+aliases = ["openjp2"]
+debian = ["libopenjp2-7-dev"]
+fedora = ["openjpeg2-devel"]
+
+[library.imagequant]
+debian = ["libimagequant-dev"]
+fedora = ["libimagequant-devel"]
+
+[library.libavif]
+aliases = ["avif"]
+debian = ["libavif-dev"]
+fedora = ["libavif-devel"]
+
+[library.libheif]
+aliases = ["heif"]
+debian = ["libheif-dev"]
+fedora = ["libheif-devel"]
+
+[library.raqm]
+debian = ["libraqm-dev"]
+fedora = ["libraqm-devel"]
+
+[library.harfbuzz]
+debian = ["libharfbuzz-dev"]
+fedora = ["harfbuzz-devel"]
+
+[library.fribidi]
+debian = ["libfribidi-dev"]
+fedora = ["fribidi-devel"]
+
+[library.openblas]
+aliases = ["blas", "cblas", "openblas64", "blas64", "scipy-openblas", "openblas-pthreads"]
+pkgconfig = "openblas"
+debian = ["libopenblas-dev"]
+fedora = ["openblas-devel"]
+
+[library.mkl]
+aliases = ["mkl-dynamic-lp64-iomp", "mkl-sdl", "mkl_rt", "mklroot", "intel-mkl"]
+debian = ["intel-mkl"]
+fedora = []
+
+[library.blis]
+aliases = ["blis64"]
+debian = ["libblis-dev"]
+fedora = ["blis-devel"]
+
+[library.flexiblas]
+debian = ["libflexiblas-dev"]
+fedora = ["flexiblas-devel"]
+
+[library.lapack]
+aliases = ["lapacke", "lapack64"]
+debian = ["liblapack-dev"]
+fedora = ["lapack-devel"]
+
+[library.fftw3]
+aliases = ["fftw", "fftw3f", "fftw3l"]
+debian = ["libfftw3-dev"]
+fedora = ["fftw-devel"]
+
+[library.gsl]
+aliases = ["gslcblas"]
+debian = ["libgsl-dev"]
+fedora = ["gsl-devel"]
+
+[library.eigen3]
+aliases = ["eigen"]
+debian = ["libeigen3-dev"]
+fedora = ["eigen3-devel"]
+
+[library.tbb]
+debian = ["libtbb-dev"]
+fedora = ["tbb-devel"]
+
+[library.openmp]
+aliases = ["omp", "gomp", "iomp5"]
+debian = ["libomp-dev"]
+fedora = ["libomp-devel"]
+
+[library.numa]
+aliases = ["libnuma"]
+debian = ["libnuma-dev"]
+fedora = ["numactl-devel"]
+
+[library.hdf5]
+aliases = ["hdf5_hl", "hdf5_serial"]
+debian = ["libhdf5-dev"]
+fedora = ["hdf5-devel"]
+
+[library.netcdf]
+debian = ["libnetcdf-dev"]
+fedora = ["netcdf-devel"]
+
+[library.qhull]
+aliases = ["qhull_r", "qhull_p", "qhullstatic"]
+debian = ["libqhull-dev"]
+fedora = ["qhull-devel"]
+
+[library.cfitsio]
+debian = ["libcfitsio-dev"]
+fedora = ["cfitsio-devel"]
+
+[library.geos]
+aliases = ["geos_c"]
+debian = ["libgeos-dev"]
+fedora = ["geos-devel"]
+
+[library.proj]
+debian = ["libproj-dev"]
+fedora = ["proj-devel"]
+
+[library.gdal]
+debian = ["libgdal-dev"]
+fedora = ["gdal-devel"]
+
+[library.libpq]
+aliases = ["pq", "postgresql", "pq-sys"]
+debian = ["libpq-dev"]
+fedora = ["libpq-devel"]
+
+[library.mysqlclient]
+aliases = ["mysql", "mariadb", "mariadbclient"]
+debian = ["libmysqlclient-dev", "default-libmysqlclient-dev"]
+fedora = ["mariadb-connector-c-devel"]
+
+[library.sqlite3]
+aliases = ["sqlite", "libsqlite3-sys"]
+debian = ["libsqlite3-dev"]
+fedora = ["sqlite-devel"]
+
+[library.leveldb]
+debian = ["libleveldb-dev"]
+fedora = ["leveldb-devel"]
+
+[library.rocksdb]
+debian = ["librocksdb-dev"]
+fedora = ["rocksdb-devel"]
+
+[library.libcurl]
+aliases = ["curl", "curl-sys"]
+pkgconfig = "libcurl"
+debian = ["libcurl4-openssl-dev"]
+fedora = ["libcurl-devel"]
+
+[library.nghttp2]
+debian = ["libnghttp2-dev"]
+fedora = ["libnghttp2-devel"]
+
+[library.libsodium]
+aliases = ["sodium"]
+debian = ["libsodium-dev"]
+fedora = ["libsodium-devel"]
+
+[library.gmp]
+aliases = ["libgmp", "gmpxx"]
+debian = ["libgmp-dev"]
+fedora = ["gmp-devel"]
+
+[library.mpfr]
+debian = ["libmpfr-dev"]
+fedora = ["mpfr-devel"]
+
+[library.mpc]
+aliases = ["libmpc"]
+debian = ["libmpc-dev"]
+fedora = ["libmpc-devel"]
+
+[library.secp256k1]
+debian = ["libsecp256k1-dev"]
+fedora = ["libsecp256k1-devel"]
+
+[library.libuuid]
+aliases = ["uuid"]
+debian = ["uuid-dev"]
+fedora = ["libuuid-devel"]
+
+[library.systemd]
+aliases = ["libsystemd"]
+debian = ["libsystemd-dev"]
+fedora = ["systemd-devel"]
+
+[library.udev]
+aliases = ["libudev"]
+debian = ["libudev-dev"]
+fedora = ["systemd-devel"]
+
+[library.dbus]
+aliases = ["dbus-1", "libdbus-1"]
+debian = ["libdbus-1-dev"]
+fedora = ["dbus-devel"]
+
+[library.glib]
+aliases = ["glib-2.0", "gobject-2.0", "gio-2.0", "gmodule-2.0"]
+pkgconfig = "glib-2.0"
+debian = ["libglib2.0-dev"]
+fedora = ["glib2-devel"]
+
+[library.gobject-introspection]
+aliases = ["girepository-1.0", "girepository-2.0", "gobject-introspection-1.0"]
+debian = ["libgirepository1.0-dev"]
+fedora = ["gobject-introspection-devel"]
+
+[library.cairo]
+aliases = ["cairo-gobject"]
+debian = ["libcairo2-dev"]
+fedora = ["cairo-devel"]
+
+[library.pango]
+aliases = ["pangocairo", "pangoft2"]
+debian = ["libpango1.0-dev"]
+fedora = ["pango-devel"]
+
+[library.x11]
+aliases = ["libx11", "xcb", "xext", "xrender"]
+debian = ["libx11-dev"]
+fedora = ["libX11-devel"]
+
+[library.sasl2]
+aliases = ["libsasl2"]
+debian = ["libsasl2-dev"]
+fedora = ["cyrus-sasl-devel"]
+
+[library.ldap]
+aliases = ["ldap_r", "lber"]
+debian = ["libldap2-dev"]
+fedora = ["openldap-devel"]
+
+[library.krb5]
+aliases = ["gssapi_krb5", "gssapi"]
+debian = ["libkrb5-dev"]
+fedora = ["krb5-devel"]
+
+[library.pcre2]
+aliases = ["pcre2-8", "pcre"]
+debian = ["libpcre2-dev"]
+fedora = ["pcre2-devel"]
+
+[library.re2]
+debian = ["libre2-dev"]
+fedora = ["re2-devel"]
+
+[library.icu]
+aliases = ["icuuc", "icui18n", "icudata", "icu-uc", "icu-i18n"]
+debian = ["libicu-dev"]
+fedora = ["libicu-devel"]
+
+[library.yaml]
+aliases = ["yaml-0.1", "libyaml"]
+debian = ["libyaml-dev"]
+fedora = ["libyaml-devel"]
+
+[library.jansson]
+debian = ["libjansson-dev"]
+fedora = ["jansson-devel"]
+
+[library.protobuf]
+aliases = ["protoc", "protobuf-lite"]
+debian = ["libprotobuf-dev", "protobuf-compiler"]
+fedora = ["protobuf-devel", "protobuf-compiler"]
+
+[library.grpc]
+aliases = ["grpc++"]
+debian = ["libgrpc-dev", "libgrpc++-dev"]
+fedora = ["grpc-devel"]
+
+[library.ncurses]
+aliases = ["ncursesw", "tinfo", "curses"]
+debian = ["libncurses-dev"]
+fedora = ["ncurses-devel"]
+
+[library.readline]
+debian = ["libreadline-dev"]
+fedora = ["readline-devel"]
+
+[library.fuse]
+aliases = ["fuse3"]
+debian = ["libfuse3-dev"]
+fedora = ["fuse3-devel"]
+
+[library.pcap]
+aliases = ["libpcap"]
+debian = ["libpcap-dev"]
+fedora = ["libpcap-devel"]
+
+[library.libnl]
+aliases = ["nl-3", "nl-route-3"]
+debian = ["libnl-3-dev", "libnl-route-3-dev"]
+fedora = ["libnl3-devel"]
+
+[library.libusb]
+aliases = ["usb-1.0", "usb"]
+debian = ["libusb-1.0-0-dev"]
+fedora = ["libusb1-devel"]
+
+[library.libftdi]
+aliases = ["ftdi1", "ftdi"]
+debian = ["libftdi1-dev"]
+fedora = ["libftdi-devel"]
+
+[library.gpiod]
+debian = ["libgpiod-dev"]
+fedora = ["libgpiod-devel"]
+
+[library.libmagic]
+aliases = ["magic"]
+debian = ["libmagic-dev"]
+fedora = ["file-devel"]
+
+[library.libunwind]
+aliases = ["unwind"]
+debian = ["libunwind-dev"]
+fedora = ["libunwind-devel"]
+
+[library.capstone]
+debian = ["libcapstone-dev"]
+fedora = ["capstone-devel"]
+
+[library.z3]
+debian = ["libz3-dev"]
+fedora = ["z3-devel"]
+
+[library.boost]
+aliases = ["boost_python", "boost_system", "boost_filesystem", "boost_thread"]
+debian = ["libboost-all-dev"]
+fedora = ["boost-devel"]
+
+[library.opencv]
+aliases = ["opencv4", "opencv_core"]
+debian = ["libopencv-dev"]
+fedora = ["opencv-devel"]
+
+[library.ffmpeg]
+aliases = ["avcodec", "avformat", "avutil", "swscale", "swresample", "avfilter", "avdevice"]
+debian = ["libavcodec-dev", "libavformat-dev", "libavutil-dev", "libswscale-dev"]
+fedora = ["ffmpeg-free-devel"]
+
+[library.portaudio]
+aliases = ["portaudio-2.0"]
+debian = ["portaudio19-dev"]
+fedora = ["portaudio-devel"]
+
+[library.sndfile]
+aliases = ["libsndfile"]
+debian = ["libsndfile1-dev"]
+fedora = ["libsndfile-devel"]
+
+[library.taglib]
+debian = ["libtaglib-dev"]
+fedora = ["taglib-devel"]
+
+[library.argon2]
+debian = ["libargon2-dev"]
+fedora = ["libargon2-devel"]
+
+[library.libgit2]
+aliases = ["git2", "libgit2-sys"]
+debian = ["libgit2-dev"]
+fedora = ["libgit2-devel"]
+
+[library.libssh2]
+aliases = ["ssh2"]
+debian = ["libssh2-1-dev"]
+fedora = ["libssh2-devel"]
+
+[library.libevent]
+aliases = ["event", "event_core"]
+debian = ["libevent-dev"]
+fedora = ["libevent-devel"]
+
+[library.libuv]
+aliases = ["uv"]
+debian = ["libuv1-dev"]
+fedora = ["libuv-devel"]
+
+[library.zeromq]
+aliases = ["zmq", "libzmq"]
+debian = ["libzmq3-dev"]
+fedora = ["zeromq-devel"]
+
+[library.librdkafka]
+aliases = ["rdkafka"]
+debian = ["librdkafka-dev"]
+fedora = ["librdkafka-devel"]
+
+[library.arrow]
+aliases = ["arrow_python", "parquet"]
+debian = ["libarrow-dev"]
+fedora = ["libarrow-devel"]
+
+[library.keyutils]
+debian = ["libkeyutils-dev"]
+fedora = ["keyutils-libs-devel"]
+
+[library.libseccomp]
+aliases = ["seccomp"]
+debian = ["libseccomp-dev"]
+fedora = ["libseccomp-devel"]
+
+[library.blosc]
+aliases = ["blosc2"]
+debian = ["libblosc-dev"]
+fedora = ["blosc-devel"]
+
+# ------------------------------------------------------------- build tools
+
+[buildtool.cmake]
+debian = ["cmake"]
+fedora = ["cmake"]
+
+[buildtool.ninja]
+debian = ["ninja-build"]
+fedora = ["ninja-build"]
+
+[buildtool.meson]
+debian = ["meson"]
+fedora = ["meson"]
+
+[buildtool.pkg-config]
+aliases = ["pkgconf"]
+debian = ["pkg-config"]
+fedora = ["pkgconf-pkg-config"]
+
+[buildtool.cargo]
+aliases = ["rustc", "rust"]
+debian = ["cargo", "rustc"]
+fedora = ["cargo", "rust"]
+
+[buildtool.gfortran]
+aliases = ["fortran", "f77", "f90"]
+debian = ["gfortran"]
+fedora = ["gcc-gfortran"]
+
+[buildtool."g++"]
+aliases = ["c++", "cxx", "clang++"]
+debian = ["g++"]
+fedora = ["gcc-c++"]
+
+[buildtool.gcc]
+aliases = ["cc", "clang"]
+debian = ["gcc"]
+fedora = ["gcc"]
+
+[buildtool.make]
+debian = ["make"]
+fedora = ["make"]
+
+[buildtool.autoconf]
+aliases = ["automake", "libtool", "autotools"]
+debian = ["autoconf", "automake", "libtool"]
+fedora = ["autoconf", "automake", "libtool"]
+
+[buildtool.swig]
+debian = ["swig"]
+fedora = ["swig"]
+
+[buildtool.patchelf]
+debian = ["patchelf"]
+fedora = ["patchelf"]
+
+[buildtool.python3-dev]
+aliases = ["python-dev", "python3-devel", "python.h"]
+debian = ["python3-dev"]
+fedora = ["python3-devel"]
+
+# ------------------------------------- PyPI name -> Debian python3-* suffix
+# Only the cases where the distro name is not just the normalized PyPI name.
+[pymap]
+pyyaml = "yaml"
+pillow = "pil"
+beautifulsoup4 = "bs4"
+attrs = "attr"
+pyzmq = "zmq"
+pycryptodome = "cryptodome"
+pycryptodomex = "cryptodomex"
+msgpack-python = "msgpack"
+python-dateutil = "dateutil"
+python-magic = "magic"
+pygobject = "gi"
+pyserial = "serial"
+pyusb = "usb"
+pytest = "pytest"
+setuptools-scm = "setuptools-scm"
+typing-extensions = "typing-extensions"
+mysqlclient = "mysqldb"
+psycopg2-binary = "psycopg2"
+opencv-python = "opencv"
+scikit-learn = "sklearn"
+scikit-image = "skimage"
+protobuf = "protobuf"
+grpcio = "grpcio"
+pycairo = "cairo"
+ruamel-yaml = "ruamel.yaml"
+jaraco-classes = "jaraco.classes"
+
+
+# -------------------------------------------- #include <...> -> library
+# Scraped from C/C++/Cython sources: the most reliable signal there is for a
+# package with a bespoke setup.py that never writes a literal `libraries=[...]`.
+[header]
+"zlib.h" = "zlib"
+"zconf.h" = "zlib"
+"bzlib.h" = "bzip2"
+"lzma.h" = "lzma"
+"zstd.h" = "zstd"
+"lz4.h" = "lz4"
+"snappy.h" = "snappy"
+"snappy-c.h" = "snappy"
+"brotli/" = "brotli"
+"jpeglib.h" = "libjpeg"
+"jerror.h" = "libjpeg"
+"turbojpeg.h" = "libjpeg"
+"png.h" = "libpng"
+"pngconf.h" = "libpng"
+"tiffio.h" = "libtiff"
+"tiff.h" = "libtiff"
+"webp/" = "libwebp"
+"ft2build.h" = "freetype"
+"freetype/" = "freetype"
+"lcms2.h" = "lcms2"
+"openjpeg.h" = "openjpeg"
+"libimagequant.h" = "imagequant"
+"raqm.h" = "raqm"
+"hb.h" = "harfbuzz"
+"harfbuzz/" = "harfbuzz"
+"fribidi.h" = "fribidi"
+"fribidi/" = "fribidi"
+"avif/" = "libavif"
+"openssl/" = "openssl"
+"ffi.h" = "libffi"
+"ffitarget.h" = "libffi"
+"libxml/" = "libxml2"
+"libxslt/" = "libxslt"
+"libexslt/" = "libxslt"
+"expat.h" = "expat"
+"yaml.h" = "yaml"
+"jansson.h" = "jansson"
+"sqlite3.h" = "sqlite3"
+"libpq-fe.h" = "libpq"
+"postgres_fe.h" = "libpq"
+"mysql.h" = "mysqlclient"
+"mysql/" = "mysqlclient"
+"hdf5.h" = "hdf5"
+"netcdf.h" = "netcdf"
+"fitsio.h" = "cfitsio"
+"geos_c.h" = "geos"
+"proj.h" = "proj"
+"gdal.h" = "gdal"
+"cblas.h" = "openblas"
+"openblas_config.h" = "openblas"
+"lapacke.h" = "lapack"
+"fftw3.h" = "fftw3"
+"gsl/" = "gsl"
+"curl/" = "libcurl"
+"nghttp2/" = "nghttp2"
+"sodium.h" = "libsodium"
+"sodium/" = "libsodium"
+"gmp.h" = "gmp"
+"gmpxx.h" = "gmp"
+"mpfr.h" = "mpfr"
+"mpc.h" = "mpc"
+"secp256k1.h" = "secp256k1"
+"argon2.h" = "argon2"
+"ncurses.h" = "ncurses"
+"curses.h" = "ncurses"
+"ncursesw/" = "ncurses"
+"readline/" = "readline"
+"uuid/" = "libuuid"
+"systemd/" = "systemd"
+"libudev.h" = "udev"
+"dbus/" = "dbus"
+"glib.h" = "glib"
+"glib/" = "glib"
+"glib-object.h" = "glib"
+"gio/" = "glib"
+"girepository.h" = "gobject-introspection"
+"cairo.h" = "cairo"
+"cairo/" = "cairo"
+"pango/" = "pango"
+"X11/" = "x11"
+"sasl/" = "sasl2"
+"ldap.h" = "ldap"
+"lber.h" = "ldap"
+"krb5.h" = "krb5"
+"krb5/" = "krb5"
+"gssapi/" = "krb5"
+"pcre2.h" = "pcre2"
+"re2/" = "re2"
+"unicode/" = "icu"
+"google/protobuf/" = "protobuf"
+"grpc/" = "grpc"
+"grpcpp/" = "grpc"
+"leveldb/" = "leveldb"
+"rocksdb/" = "rocksdb"
+"event.h" = "libevent"
+"event2/" = "libevent"
+"uv.h" = "libuv"
+"zmq.h" = "zeromq"
+"librdkafka/" = "librdkafka"
+"arrow/" = "arrow"
+"parquet/" = "arrow"
+"capstone/" = "capstone"
+"magic.h" = "libmagic"
+"libunwind.h" = "libunwind"
+"pcap.h" = "pcap"
+"pcap/" = "pcap"
+"libusb-1.0/" = "libusb"
+"ftdi.h" = "libftdi"
+"gpiod.h" = "gpiod"
+"numa.h" = "numa"
+"seccomp.h" = "libseccomp"
+"blosc.h" = "blosc"
+"blosc2.h" = "blosc"
+"portaudio.h" = "portaudio"
+"sndfile.h" = "sndfile"
+"libavcodec/" = "ffmpeg"
+"libavformat/" = "ffmpeg"
+"libavutil/" = "ffmpeg"
+"libswscale/" = "ffmpeg"
+"opencv2/" = "opencv"
+"Eigen/" = "eigen3"
+"boost/" = "boost"
+"tbb/" = "tbb"
+"omp.h" = "openmp"
+"z3.h" = "z3"
+"keyutils.h" = "keyutils"
+"ssh2.h" = "libssh2"
+"libssh2.h" = "libssh2"
+"git2.h" = "libgit2"
+"taglib/" = "taglib"

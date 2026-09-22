@@ -1,0 +1,189 @@
+from pathlib import Path
+
+from will_it_riscv.source import (
+    check_submodules,
+    discover_manifests,
+    find_bundled,
+    inspect_repository,
+    iter_directory,
+    own_names,
+)
+
+
+def build_repo(root: Path, files: dict) -> Path:
+    for relative, content in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    return root
+
+
+def libs(inspection):
+    return sorted(r.name for r in inspection.profile.system_requirements
+                  if r.kind == "library")
+
+
+def tools(inspection):
+    return sorted(r.name for r in inspection.profile.system_requirements
+                  if r.kind == "tool")
+
+
+def test_iter_directory_yields_relative_posix_paths(tmp_path):
+    build_repo(tmp_path, {"src/a.c": "", "CMakeLists.txt": ""})
+    assert sorted(p for p, _ in iter_directory(tmp_path)) == ["CMakeLists.txt", "src/a.c"]
+
+
+def test_iter_directory_skips_build_output_and_vcs(tmp_path):
+    build_repo(tmp_path, {
+        "src/a.c": "",
+        "build/generated.c": "",
+        ".git/config.c": "",
+        "node_modules/pkg/index.c": "",
+        ".venv/lib/x.c": "",
+    })
+    assert [p for p, _ in iter_directory(tmp_path)] == ["src/a.c"]
+
+
+def test_iter_directory_ignores_uninteresting_files(tmp_path):
+    build_repo(tmp_path, {"README.md": "", "logo.png": "", "main.c": ""})
+    assert [p for p, _ in iter_directory(tmp_path)] == ["main.c"]
+
+
+def test_scans_build_files_at_any_depth(tmp_path):
+    """The sdist depth limit would miss this; a repo is not flat."""
+    build_repo(tmp_path, {
+        "CMakeLists.txt": "project(demo)\n",
+        "src/gromacs/fileio/CMakeLists.txt": "find_package(HDF5)\n",
+        "cmake/deep/a/b/FindThing.cmake": "pkg_check_modules(X libxml-2.0)\n",
+    })
+    inspection = inspect_repository(tmp_path, scan_ci=False)
+    assert "hdf5" in libs(inspection)
+    assert "libxml2" in libs(inspection)
+
+
+def test_vendored_directories_are_not_this_projects_build(tmp_path):
+    build_repo(tmp_path, {
+        "CMakeLists.txt": "project(demo)\nfind_package(ZLIB)\n",
+        "src/external/someone_else/CMakeLists.txt": "find_package(OpenSSL)\n",
+        "third_party/other/meson.build": "dependency('libcurl')\n",
+    })
+    inspection = inspect_repository(tmp_path, scan_ci=False)
+    assert libs(inspection) == ["zlib"]
+
+
+def test_find_bundled_lists_vendored_projects(tmp_path):
+    build_repo(tmp_path, {
+        "src/external/tinyxml2/x.cpp": "",
+        "src/external/lmfit/y.c": "",
+        "src/gromacs/real.cpp": "",
+    })
+    assert find_bundled(tmp_path) == {"tinyxml2", "lmfit"}
+
+
+def test_own_names_covers_the_project_and_its_subprojects(tmp_path):
+    build_repo(tmp_path, {
+        "CMakeLists.txt": "project(gromacs)\n",
+        "python_packaging/gmxapi/CMakeLists.txt": "",
+    })
+    names = own_names(tmp_path)
+    assert "gromacs" in names
+    assert "gmxapi" in names
+
+
+def test_self_references_are_not_reported_as_system_libraries(tmp_path):
+    build_repo(tmp_path, {
+        "CMakeLists.txt": "project(gromacs)\nfind_package(ZLIB)\n",
+        "python_packaging/gmxapi/CMakeLists.txt": "find_package(gromacs)\nfind_package(gmxapi)\n",
+    })
+    inspection = inspect_repository(tmp_path, scan_ci=False)
+    assert libs(inspection) == ["zlib"]
+
+
+def test_cmake_comments_do_not_become_library_names(tmp_path):
+    build_repo(tmp_path, {
+        "CMakeLists.txt": (
+            "find_library(ITT\n"
+            "    NAMES libittnotify.a # We need the static library\n"
+            "    HINTS ENV VTUNE_DIR)\n"
+            "find_package(ZLIB)\n"
+        ),
+    })
+    inspection = inspect_repository(tmp_path, scan_ci=False)
+    assert libs(inspection) == ["zlib"]
+
+
+def test_library_filenames_are_reduced_to_names(tmp_path):
+    build_repo(tmp_path, {
+        "CMakeLists.txt": "find_library(Z NAMES libz.so.1)\n",
+    })
+    assert libs(inspect_repository(tmp_path, scan_ci=False)) == ["zlib"]
+
+
+def test_toolchain_is_implied_from_languages(tmp_path):
+    build_repo(tmp_path, {
+        "CMakeLists.txt": "project(demo)\n",
+        "src/a.cpp": "",
+        "src/b.f90": "",
+    })
+    found = tools(inspect_repository(tmp_path, scan_ci=False))
+    assert {"cmake", "g++", "gfortran", "ninja"} <= set(found)
+
+
+def test_ci_declarations_merge_with_scraped_findings(tmp_path):
+    build_repo(tmp_path, {
+        "CMakeLists.txt": "find_package(OpenSSL)\n",
+        ".github/workflows/ci.yml": "run: apt-get install -y libssl-dev libhwloc-dev\n",
+    })
+    inspection = inspect_repository(tmp_path, scan_ci=True)
+    # libssl-dev resolves backwards onto openssl rather than duplicating it.
+    assert libs(inspection) == ["hwloc", "openssl"]
+
+
+def test_ci_scan_can_be_disabled(tmp_path):
+    build_repo(tmp_path, {
+        ".github/workflows/ci.yml": "run: apt-get install -y libhwloc-dev\n",
+        "CMakeLists.txt": "project(x)\n",
+    })
+    assert libs(inspect_repository(tmp_path, scan_ci=False)) == []
+
+
+def test_discover_manifests_orders_shallowest_first(tmp_path):
+    build_repo(tmp_path, {
+        "docs/requirements.txt": "sphinx\n",
+        "pyproject.toml": "[project]\nname='x'\n",
+    })
+    found = discover_manifests(tmp_path)
+    assert [p.name for p in found] == ["pyproject.toml", "requirements.txt"]
+
+
+def test_uninitialised_submodule_is_a_loud_warning(tmp_path):
+    (tmp_path / ".gitmodules").write_text(
+        '[submodule "vendor/dep"]\n\tpath = vendor/dep\n\turl = https://example.invalid\n'
+    )
+    (tmp_path / "vendor" / "dep").mkdir(parents=True)
+    warnings = check_submodules(tmp_path)
+    assert len(warnings) == 1
+    assert "not checked out" in warnings[0]
+
+
+def test_populated_submodule_is_silent(tmp_path):
+    (tmp_path / ".gitmodules").write_text(
+        '[submodule "vendor/dep"]\n\tpath = vendor/dep\n\turl = https://example.invalid\n'
+    )
+    (tmp_path / "vendor" / "dep").mkdir(parents=True)
+    (tmp_path / "vendor" / "dep" / "CMakeLists.txt").write_text("")
+    assert check_submodules(tmp_path) == []
+
+
+def test_no_gitmodules_means_nothing_to_warn_about(tmp_path):
+    assert check_submodules(tmp_path) == []
+
+
+def test_pure_python_repo_reports_no_native_build(tmp_path):
+    build_repo(tmp_path, {
+        "pyproject.toml": '[project]\nname="x"\ndependencies=["click"]\n',
+        "x/__init__.py": "",
+    })
+    inspection = inspect_repository(tmp_path, scan_ci=False)
+    assert not inspection.profile.is_native
+    assert inspection.manifests == [tmp_path / "pyproject.toml"]

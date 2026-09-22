@@ -19,6 +19,7 @@ from .index import IndexError_, PackageIndex
 from .inputs import RootRequirements, load
 from .models import Analysis, Verdict
 from .report import render_json, render_list, render_markdown, render_text
+from .source import RepositoryInspection, inspect_repository
 from .target import Target
 
 USER_AGENT = f"will-it-riscv/{__version__} (+https://github.com/tactcomplabs/will-it-riscv)"
@@ -28,9 +29,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="will-it-riscv",
         description=(
-            "Walk a project's dependency tree and report what will not install on "
-            "riscv64 without compiling, what has to be built from source, and which "
-            "system packages those builds need."
+            "Find out what a project needs to build on riscv64. Point it at a "
+            "repository to scan its sources and CI configuration, or at a "
+            "pyproject.toml / requirements.txt to walk its dependency tree. "
+            "Reports what has no wheel for the target, what must be compiled, and "
+            "which system packages those builds need -- checked against the "
+            "target distro's actual archive."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -88,6 +92,14 @@ def build_parser() -> argparse.ArgumentParser:
         "(much faster, much less accurate)",
     )
     scope.add_argument("--pre", action="store_true", help="consider pre-releases")
+    scope.add_argument(
+        "--no-scan", action="store_true",
+        help="do not scan the source tree; only resolve declared dependencies",
+    )
+    scope.add_argument(
+        "--no-ci-scan", action="store_true",
+        help="skip CI configs and Dockerfiles when scanning a source tree",
+    )
     scope.add_argument(
         "--max-depth", type=int, default=None, metavar="N",
         help="stop walking below this depth",
@@ -158,8 +170,29 @@ def _roots(args: argparse.Namespace) -> RootRequirements:
         raise SystemExit(f"{path}: no such file or directory")
     try:
         return load(path, tuple(args.extra), tuple(args.group))
+    except FileNotFoundError:
+        # A source tree with no Python manifest -- GROMACS, say. That is a
+        # perfectly good thing to analyse; there are just no declared
+        # dependencies to resolve.
+        return RootRequirements(source=str(path), project_name=path.resolve().name)
     except (OSError, ValueError) as exc:
         raise SystemExit(f"{path}: {exc}") from exc
+
+
+def _scan_source_tree(
+    args: argparse.Namespace, stderr: Console
+) -> Optional[RepositoryInspection]:
+    """Scan the repository at args.path, unless told not to."""
+    if args.package or args.no_scan:
+        return None
+    path = Path(args.path)
+    if not path.is_dir():
+        return None
+    message = f"scanning {path}…"
+    if args.quiet:
+        return inspect_repository(path, scan_ci=not args.no_ci_scan)
+    with stderr.status(message):
+        return inspect_repository(path, scan_ci=not args.no_ci_scan)
 
 
 def _annotate_distro(analysis: Analysis, distro: DistroIndex) -> None:
@@ -202,8 +235,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             free_threaded=True,
         )
 
+    scan = _scan_source_tree(args, stderr)
     roots = _roots(args)
-    if not roots:
+    deep_manifests: list[Path] = []
+    if scan is not None and not roots and scan.manifests:
+        # Manifests exist, but not at the root. A deep one is usually for
+        # something else -- documentation, bindings, a test harness -- so it
+        # is offered rather than silently adopted.
+        deep_manifests = [m for m in scan.manifests if m.parent != scan.root]
+    if not roots and scan is None:
         stderr.print(f"[yellow]{roots.source}: no dependencies declared[/yellow]")
         return 0
 
@@ -249,6 +289,24 @@ def main(argv: Optional[list[str]] = None) -> int:
         except KeyboardInterrupt:
             stderr.print("[yellow]interrupted[/yellow]")
             return 130
+
+        if scan is not None:
+            analysis.project_build = scan.profile
+            analysis.project_requirements = {
+                r.name: r for r in scan.profile.system_requirements
+            }
+            analysis.files_scanned = scan.files_scanned
+            analysis.bundled_libraries = scan.bundled
+            for warning in scan.warnings:
+                analysis.add_warning(warning)
+            analysis.root = scan.name
+            for manifest in deep_manifests:
+                analysis.add_warning(
+                    f"{manifest.relative_to(scan.root)} was not analysed: it is not "
+                    "at the repository root, so it probably describes something "
+                    "other than this project's own dependencies. Point at it "
+                    "directly to analyse it."
+                )
 
         if distro is not None:
             if not args.quiet:

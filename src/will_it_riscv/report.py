@@ -47,6 +47,7 @@ def render_text(
     console.print()
 
     _summary(analysis, console)
+    _project_section(analysis, console)
 
     for verdict in (
         Verdict.UNRESOLVED,
@@ -74,9 +75,37 @@ def render_text(
         console.print()
 
 
+def _project_section(analysis: Analysis, console: Console) -> None:
+    """What building *this* project needs, as distinct from its dependencies."""
+    profile = analysis.project_build
+    if profile is None:
+        return
+    console.print(Text("This project", style="bold"))
+    builds = ", ".join(sorted(profile.languages | profile.build_systems)) or "nothing"
+    console.print(f"  builds   {builds}   ({analysis.files_scanned} files scanned)")
+    libs = [r for r in profile.system_requirements if r.kind == "library"]
+    tools = [r for r in profile.system_requirements if r.kind == "tool"]
+    if libs:
+        console.print(f"  links    {', '.join(r.name for r in libs)}", highlight=False)
+    if tools:
+        console.print(f"  toolchain {', '.join(r.name for r in tools)}", highlight=False)
+    if not profile.is_native:
+        console.print("  no compiled sources found", style="dim")
+    console.print()
+
+
 def _summary(analysis: Analysis, console: Console) -> None:
     counts = {v: len(analysis.by_verdict(v)) for v in Verdict}
     total = len(analysis.packages)
+    if not total:
+        if analysis.project_build is not None:
+            console.print(
+                "No dependency manifest at the repository root — reporting the "
+                "project's own build requirements only.",
+                style="dim",
+            )
+            console.print()
+        return
     table = Table(show_header=False, box=None, pad_edge=False, padding=(0, 2, 0, 0))
     table.add_column(justify="right")
     table.add_column()
@@ -132,11 +161,14 @@ def _package_table(
 def _system_packages(
     analysis: Analysis, console: Console, distro: Optional[DistroIndex]
 ) -> None:
-    if not analysis.system_requirements:
+    requirements = analysis.all_system_requirements()
+    if not requirements:
         return
     db = database()
-    known = [r for r in analysis.system_requirements.values() if not db.is_guess(r)]
-    guessed = [r for r in analysis.system_requirements.values() if db.is_guess(r)]
+    bundled = [r for r in requirements.values() if analysis.is_bundled(r)]
+    rest = [r for r in requirements.values() if not analysis.is_bundled(r)]
+    known = [r for r in rest if not db.is_guess(r)]
+    guessed = [r for r in rest if db.is_guess(r)]
 
     console.print(Text("System packages needed to build the above", style="bold"))
 
@@ -175,6 +207,20 @@ def _system_packages(
             "    build these from source on the target, or vendor them", style="dim"
         )
 
+    if bundled:
+        console.print()
+        console.print(
+            Text("  optional — the project bundles its own copy:", style="bold cyan")
+        )
+        for req in sorted(bundled, key=lambda r: r.name):
+            packages = " / ".join(req.debian) or "—"
+            console.print(f"    • {req.name}  (system package: {packages})",
+                          highlight=False)
+        console.print(
+            "    the build falls back to the bundled source if these are absent",
+            style="dim",
+        )
+
     if guessed:
         console.print()
         console.print(
@@ -192,7 +238,7 @@ def _system_packages(
 
 
 def _owners(analysis: Analysis, debian_package: str) -> str:
-    for req in analysis.system_requirements.values():
+    for req in analysis.all_system_requirements().values():
         if debian_package in req.debian:
             return ", ".join(sorted(req.found_in)[:4])
     return "?"
@@ -279,18 +325,38 @@ def to_dict(analysis: Analysis) -> dict:
             }
             for p in sorted(analysis.packages.values(), key=lambda r: r.sort_key())
         ],
-        "system_requirements": [
+        "project": (
             {
-                "name": r.name,
-                "kind": r.kind,
-                "pkgconfig": r.pkgconfig,
-                "debian": list(r.debian),
-                "fedora": list(r.fedora),
-                "required_by": sorted(r.found_in),
+                "files_scanned": analysis.files_scanned,
+                "languages": sorted(analysis.project_build.languages),
+                "build_systems": sorted(analysis.project_build.build_systems),
+                "system_requirements": [
+                    _requirement_dict(r)
+                    for r in analysis.project_requirements.values()
+                ],
             }
-            for r in analysis.system_requirements.values()
+            if analysis.project_build is not None
+            else None
+        ),
+        "system_requirements": [
+            _requirement_dict(r) for r in analysis.system_requirements.values()
+        ],
+        "all_system_requirements": [
+            _requirement_dict(r) for r in analysis.all_system_requirements().values()
         ],
         "warnings": analysis.warnings,
+    }
+
+
+def _requirement_dict(r) -> dict:
+    return {
+        "name": r.name,
+        "kind": r.kind,
+        "pkgconfig": r.pkgconfig,
+        "debian": list(r.debian),
+        "fedora": list(r.fedora),
+        "declared": r.declared,
+        "required_by": sorted(r.found_in),
     }
 
 
@@ -338,15 +404,13 @@ def render_markdown(analysis: Analysis, distro: Optional[DistroIndex] = None) ->
             )
         out.append("")
 
-    if analysis.system_requirements:
+    requirements = analysis.all_system_requirements()
+    if requirements:
         db = database()
         known = sorted(
-            {p for r in analysis.system_requirements.values() if not db.is_guess(r)
-             for p in r.debian}
+            {p for r in requirements.values() if not db.is_guess(r) for p in r.debian}
         )
-        guessed = sorted(
-            r.name for r in analysis.system_requirements.values() if db.is_guess(r)
-        )
+        guessed = sorted(r.name for r in requirements.values() if db.is_guess(r))
         out.append("## System packages")
         out.append("")
         if known:

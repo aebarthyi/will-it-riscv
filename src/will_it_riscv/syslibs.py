@@ -46,6 +46,7 @@ class SysLibDatabase:
             )
         )
         self._entries: dict[str, SystemRequirement] = {}
+        self._by_package: dict[str, SystemRequirement] = {}
         for kind, section in (("library", "library"), ("tool", "buildtool")):
             for canonical, body in raw.get(section, {}).items():
                 req = SystemRequirement(
@@ -62,11 +63,24 @@ class SysLibDatabase:
                     keys.append(body["pkgconfig"])
                 for key in keys:
                     self._entries.setdefault(normalize(key), req)
+                # CI files name distro packages, not libraries. Index them
+                # backwards so "libssl-dev" and a scraped "OpenSSL" converge
+                # on one entry instead of being reported twice.
+                for package in (*req.debian, *req.fedora):
+                    self._by_package.setdefault(package.lower(), req)
 
     def lookup(self, raw_name: str, kind: str = "library") -> Optional[SystemRequirement]:
         """Resolve a scraped name, or None if it should be ignored."""
         candidates = list(_candidates(raw_name))
         if not candidates:
+            return None
+        # The ignore list wins over the alias table, but only for libraries.
+        # Stripping the "lib" prefix makes libgit2 answer to "git", which
+        # would otherwise hijack CMake's find_package(Git) -- the tool, not a
+        # library. The same list holds "gcc" (as in libgcc_s, never a thing
+        # to install) while `gcc` the compiler is a perfectly real build tool,
+        # so the precedence only applies on the library side.
+        if kind == "library" and normalize(raw_name) in self.ignore:
             return None
         for key in candidates:
             hit = self._entries.get(key)
@@ -93,6 +107,10 @@ class SysLibDatabase:
             fedora=(f"{name}-devel",),
         )
 
+    def by_distro_package(self, package: str) -> Optional[SystemRequirement]:
+        """Resolve a distro package name (``libssl-dev``) to a known library."""
+        return self._by_package.get(package.strip().lower())
+
     def header(self, include_path: str) -> Optional[str]:
         """Map a ``#include`` path to a curated library name, if we know it.
 
@@ -113,6 +131,8 @@ class SysLibDatabase:
         return self._header_exact.get(path.rsplit("/", 1)[-1])
 
     def is_guess(self, req: SystemRequirement) -> bool:
+        if req.declared:
+            return False
         return normalize(req.name) not in self._entries
 
 

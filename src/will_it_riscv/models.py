@@ -76,7 +76,11 @@ class SystemRequirement:
     debian: tuple[str, ...] = ()
     fedora: tuple[str, ...] = ()
     found_in: tuple[str, ...] = ()
-    """Files inside the sdist that mentioned it, for auditability."""
+    """Files that mentioned it, for auditability."""
+    declared: bool = False
+    """True when a human wrote this package name down -- in a CI config, a
+    Dockerfile or a PEP 725 ``[external]`` table -- rather than us inferring
+    it from a build file. Declared names are never reported as guesses."""
 
     def merged_with(self, other: SystemRequirement) -> SystemRequirement:
         return SystemRequirement(
@@ -86,6 +90,7 @@ class SystemRequirement:
             debian=self.debian or other.debian,
             fedora=self.fedora or other.fedora,
             found_in=tuple(dict.fromkeys(self.found_in + other.found_in)),
+            declared=self.declared or other.declared,
         )
 
 
@@ -144,7 +149,41 @@ class Analysis:
     python_version: str
     packages: dict[str, PackageReport] = field(default_factory=dict)
     system_requirements: dict[str, SystemRequirement] = field(default_factory=dict)
+    """What building the *dependencies* needs."""
     warnings: list[str] = field(default_factory=list)
+
+    # -- set only when a source tree was scanned (repository mode) -----------
+    project_build: Optional[BuildProfile] = None
+    """How the analysed project itself builds, if its source was scanned."""
+    project_requirements: dict[str, SystemRequirement] = field(default_factory=dict)
+    """What building *this project* needs. Kept apart from the dependency
+    requirements above, because the project has no wheel to fall back on --
+    you are building it either way."""
+    files_scanned: int = 0
+    bundled_libraries: set[str] = field(default_factory=set)
+    """Libraries the project ships its own copy of, making the system package
+    optional rather than required."""
+
+    def is_bundled(self, requirement: SystemRequirement) -> bool:
+        name = requirement.name.lower()
+        return any(
+            name == b or name.replace("-", "_") == b.replace("-", "_")
+            for b in self.bundled_libraries
+        )
+
+    def all_system_requirements(self) -> dict[str, SystemRequirement]:
+        """Project and dependency requirements, merged for the install line."""
+        merged: dict[str, SystemRequirement] = {}
+        for source in (self.project_requirements, self.system_requirements):
+            for name, req in source.items():
+                existing = merged.get(name)
+                merged[name] = req.merged_with(existing) if existing else req
+        return dict(sorted(merged.items()))
+
+    def add_warning(self, message: str) -> None:
+        """Record a warning once. CI files repeat themselves a great deal."""
+        if message not in self.warnings:
+            self.warnings.append(message)
 
     def by_verdict(self, *verdicts: Verdict) -> list[PackageReport]:
         want = set(verdicts)
@@ -161,6 +200,13 @@ class Analysis:
 
     def exit_code(self) -> int:
         """0 = installs clean, 1 = needs source builds, 2 = something is blocked."""
+        if self.project_build is not None and self.project_build.is_native:
+            # The project itself compiles, so a source build is happening
+            # regardless of how its dependencies fare.
+            return max(1, self._dependency_exit_code())
+        return self._dependency_exit_code()
+
+    def _dependency_exit_code(self) -> int:
         worst = self.worst
         if worst.ok:
             return 0

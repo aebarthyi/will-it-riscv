@@ -5,13 +5,13 @@ build-backend = "hatchling.build"
 [project]
 name = "will-it-riscv"
 version = "0.1.0"
-description = "Walk a project's dependency tree and find out what will not install on riscv64 (or any other target) without building from source."
+description = "Find out what a project needs to build on riscv64: scans a repository's sources and CI, walks its dependency tree, and checks every system package against the target's distro archive."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Tactical Computing Labs" }]
-keywords = ["riscv", "riscv64", "wheels", "packaging", "cross-platform", "dependencies", "manylinux"]
+keywords = ["riscv", "riscv64", "wheels", "packaging", "cross-platform", "dependencies", "manylinux", "cmake", "cross-compilation"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",

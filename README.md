@@ -1,11 +1,19 @@
 # will-it-riscv
 
-Walk a Python project's dependency tree and find out what will **not** install on
-riscv64 without a compiler — before you get there.
+Find out what a project needs in order to build on riscv64 — before you get
+there. It reads a repository's source tree and its CI configuration to work out
+what the project itself links against, walks its Python dependency tree to find
+what has no riscv64 wheel, and checks every resulting system package against the
+distro's actual riscv64 archive.
 
 ```console
-$ will-it-riscv pyproject.toml
+$ git clone https://github.com/gromacs/gromacs && cd gromacs
+$ will-it-riscv
 ```
+
+Point it at a repository and it reads the source tree; point it at a
+`pyproject.toml` or `requirements.txt` and it walks the dependency graph. Most
+repositories want both, and it does both.
 
 It answers three questions for every package in the transitive closure:
 
@@ -36,6 +44,41 @@ The alternative is finding out one traceback at a time on an emulated board.
 [manylinux]: https://github.com/pypa/manylinux
 [uv-issue]: https://github.com/astral-sh/uv/issues/8889
 
+## Two modes
+
+**Repository mode** runs automatically when you point it at a directory. It
+reads the source tree to find what *this* project needs in order to compile —
+scraping `CMakeLists.txt`, `meson.build`, `configure.ac`, `Cargo.toml`,
+`setup.py` and the `#include` directives in the C and C++ sources — and then
+reads the CI configuration, where projects usually write their system
+dependencies down outright. Those declared lists are authoritative in a way
+inference is not, so they are never reported as guesses.
+
+It understands the shapes real repositories use: Pillow's bash array
+(`packages=( … )` installed as `"${packages[@]}"`), psycopg2's interpolated
+version pin, GROMACS's [HPC Container Maker][hpccm] `ospackages=[…]`, plain
+Dockerfiles, `apt.txt`, and nix `buildInputs`. What it cannot resolve it says
+so about, rather than silently reporting nothing. It also flags third-party
+package sources — a PPA or a vendor apt repo that has no builds for your
+architecture is a finding, not a detail.
+
+Two repository-specific things it knows:
+
+- **Bundled libraries are optional.** A project that ships its own copy of a
+  library in `external/`, `third_party/` or `vendor/` can build without the
+  system package. GROMACS bundles sixteen; those are listed separately from
+  the ones you actually have to install.
+- **An uninitialised submodule is a loud warning.** It scans perfectly
+  cleanly and reports nothing, which is the most dangerous way for this tool
+  to be wrong.
+
+**Manifest mode** is the dependency walk described above. A manifest that is
+not at the repository root usually describes something else — documentation,
+language bindings, a test harness — so it is reported rather than silently
+adopted, and you point at it directly if you want it analysed.
+
+[hpccm]: https://github.com/NVIDIA/hpc-container-maker
+
 ## Install
 
 ```console
@@ -56,6 +99,12 @@ $ will-it-riscv requirements.txt --target riscv64-musl1.2 --python 3.11
 
 # ad-hoc packages, no file needed
 $ will-it-riscv -p 'numpy>=2' -p pandas
+
+# a source repository: scans the tree and its CI configuration
+$ will-it-riscv ~/src/gromacs
+
+# only resolve declared dependencies, do not read the source tree
+$ will-it-riscv --no-scan
 
 # machine-readable, for CI
 $ will-it-riscv -f json -o riscv-report.json
@@ -117,6 +166,12 @@ static inference from reading the archive. That is a deliberate trade: it runs
 anywhere in seconds, needs no emulator, and cannot execute a hostile `setup.py`.
 It also means a package reported as buildable can still fail on a detail no
 static read would catch. Treat the output as a work list, not a guarantee.
+
+**Repository scanning is inference too.** A CMake option you never enable is
+indistinguishable, statically, from one you always do — so an optional
+backend can appear in the list. Vendor GPU stacks (CUDA, ROCm, SYCL, oneAPI)
+are filtered out entirely, since none of them exists for riscv64 and all are
+opt-in.
 
 **It is not a resolver.** For each package it takes the highest version satisfying
 the constraints seen so far, and revisits when a later edge tightens them. It does

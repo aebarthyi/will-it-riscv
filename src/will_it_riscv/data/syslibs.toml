@@ -24,6 +24,20 @@ names = [
   "setupapi", "msvcrt", "dbghelp", "psapi", "comdlg32", "rpcrt4", "secur32",
   "wsock32", "mincore", "pathcch", "shlwapi", "userenv", "netapi32", "mswsock",
   "winsock2", "ntdll", "powrprof", "version", "winhttp", "wininet",
+  # provided by the C++ compiler itself
+  "libstdcpp", "stdcpp", "stdc++fs", "cxx",
+  # Vendor GPU / accelerator stacks. All are opt-in build options and none
+  # has a riscv64 build, so finding them says nothing about a riscv64 build.
+  "cudatoolkit", "cufft", "cufftmp", "cublas", "cusolver", "cusparse", "curand",
+  "nvshmem", "nvshmem_host", "nvshmem_device", "nvml", "nvtx", "nvhpc",
+  "hip", "hiprtc", "amdhip", "rocfft", "rocprim", "rocblas", "roctx", "rocm",
+  "adaptivecpp", "hipsycl", "opensycl", "sycl", "mkl_sycl", "bbfft-sycl",
+  "onemath", "onemkl", "onedpl", "oneapi", "dpcpp", "level_zero", "ze_loader",
+  "clfft", "vkfft", "opencl", "vulkan", "torch", "torch_extension", "cp2k",
+  "heffte", "mimiccommlib", "nvpl",
+  # Intel VTune's ITT API and VMD's molfile plugins: opt-in, proprietary,
+  # and not packaged by any distro.
+  "ittnotify", "ittapi", "vmd", "xyzplugin", "vmdplugin", "molfile",
   # other language ecosystems and linters, common in polyglot CMake projects
   "java", "jni", "jvm", "ant", "flake", "flake", "pylint", "matlab", "octave",
   "halide", "openvino", "ade", "tengine", "nvcc", "cuda", "cudnn", "cublas",
@@ -227,6 +241,47 @@ fedora = ["hdf5-devel"]
 [library.netcdf]
 debian = ["libnetcdf-dev"]
 fedora = ["netcdf-devel"]
+
+# ------------------------------------------------------------- HPC / MPI
+
+[library.hwloc]
+aliases = ["libhwloc"]
+pkgconfig = "hwloc"
+debian = ["libhwloc-dev"]
+fedora = ["hwloc-devel"]
+
+[library.mpi]
+aliases = ["openmpi", "mpich", "mpi_cxx", "mpicxx", "mpich2", "mvapich"]
+debian = ["libopenmpi-dev"]
+fedora = ["openmpi-devel"]
+
+[library.scalapack]
+debian = ["libscalapack-openmpi-dev"]
+fedora = ["scalapack-openmpi-devel"]
+
+[library.metis]
+aliases = ["parmetis"]
+debian = ["libmetis-dev"]
+fedora = ["metis-devel"]
+
+[library.suitesparse]
+aliases = ["umfpack", "cholmod", "amd", "camd", "colamd"]
+debian = ["libsuitesparse-dev"]
+fedora = ["suitesparse-devel"]
+
+[library.muparser]
+debian = ["libmuparser-dev"]
+fedora = ["muparser-devel"]
+
+[library.tinyxml2]
+aliases = ["tinyxml"]
+debian = ["libtinyxml2-dev"]
+fedora = ["tinyxml2-devel"]
+
+[library.imagemagick]
+aliases = ["magickwand", "magick++", "magickcore"]
+debian = ["libmagickwand-dev"]
+fedora = ["ImageMagick-devel"]
 
 [library.qhull]
 aliases = ["qhull_r", "qhull_p", "qhullstatic"]
@@ -490,7 +545,7 @@ debian = ["libargon2-dev"]
 fedora = ["libargon2-devel"]
 
 [library.libgit2]
-aliases = ["git2", "libgit2-sys"]
+aliases = ["libgit2-sys"]
 debian = ["libgit2-dev"]
 fedora = ["libgit2-devel"]
 

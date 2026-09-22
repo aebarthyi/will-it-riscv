@@ -149,7 +149,21 @@ MAX_HEADER_BYTES = 8 * 1024
 #: but numpy builds it with meson, so that CMake file describes nobody's build.
 #: The PEP 517 backend drives the build system at the root; anything deeper
 #: belongs to vendored code, whose real needs the #include scan already finds.
+#:
+#: This is a proxy for "not vendored" that works because sdists are flat. A
+#: source repository is not flat -- GROMACS spreads 245 CMake files over six
+#: levels -- so repo scanning names the vendored directories outright instead
+#: (see :data:`VENDORED_DIRS`) and lifts the depth limit.
 MAX_BUILD_CONFIG_DEPTH = 1
+
+#: Directories holding somebody else's source, bundled into this tree. A build
+#: file here configures the bundled copy, and a project that bundles a library
+#: usually does so precisely so it does *not* need the system one.
+VENDORED_DIRS = frozenset({
+    "external", "externals", "thirdparty", "3rdparty", "extern", "deps",
+    "vendor", "vendored", "contrib", "bundled", "submodules", "subprojects",
+    "importedcode",
+})
 
 #: Cargo is the exception: a Cargo.toml inside a Python sdist is the project's
 #: own crate, conventionally at src/rust/, not someone else's build system.
@@ -162,8 +176,21 @@ _INCLUDE_SCAN_EXTENSIONS = {".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hxx", "
 _PLAUSIBLE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_+.:-]{0,39}$")
 
 
+#: libfoo.so.1 / libfoo.a / foo.dylib -- a filename, not a bare library name.
+_LIBRARY_FILENAME = re.compile(
+    r"^(?:lib)?(?P<stem>[A-Za-z][A-Za-z0-9_+.-]*?)"
+    r"(?:\.so(?:\.\d+)*|\.a|\.dylib|\.dll|\.lib)$"
+)
+
+
+def strip_library_filename(raw: str) -> str:
+    """``libittnotify.a`` -> ``ittnotify``; anything else is returned as-is."""
+    match = _LIBRARY_FILENAME.match(raw.strip().strip("\"'"))
+    return match.group("stem") if match else raw
+
+
 def _is_plausible_name(raw: str) -> bool:
-    name = raw.strip().strip("\"'")
+    name = strip_library_filename(raw)
     if not _PLAUSIBLE_NAME.match(name):
         return False
     return not any(c in name for c in "$/\\{}")
@@ -172,7 +199,13 @@ def _is_plausible_name(raw: str) -> bool:
 _CMAKE_KEYWORDS = {
     "names", "paths", "hints", "required", "quiet", "no_default_path", "optional",
     "path_suffixes", "doc", "components", "config", "module", "global", "static",
-    "no_module", "exact", "name", "no_cmake_path", "imported_target", "no_cmake_system_path",
+    "no_module", "exact", "name", "no_cmake_path", "imported_target",
+    "no_cmake_system_path", "env", "registry_view", "validator", "namespaces",
+    "no_package_root_path", "no_cmake_environment_path", "cmake_find_root_path_both",
+    "only_cmake_find_root_path", "no_cmake_find_root_path", "no_system_environment_path",
+    "no_cmake_builds_path", "no_cmake_install_prefix", "no_cmake_package_registry",
+    # values of PATH_SUFFIXES, which name directories rather than libraries
+    "lib", "lib64", "lib32", "bin", "include", "share", "usr", "local",
 }
 
 
@@ -253,8 +286,14 @@ def _normalize_dir(part: str) -> str:
     return re.sub(r"[\s_.-]+", "", part.lower())
 
 
-def _is_skipped(path: str) -> bool:
-    return any(_normalize_dir(part) in SKIP_DIRS for part in path.split("/")[:-1])
+def _is_skipped(path: str, skip_dirs: frozenset = frozenset()) -> bool:
+    against = skip_dirs or SKIP_DIRS
+    return any(_normalize_dir(part) in against for part in path.split("/")[:-1])
+
+
+def _is_vendored(path: str) -> bool:
+    """True if this path sits under a directory holding bundled third-party code."""
+    return any(_normalize_dir(part) in VENDORED_DIRS for part in path.split("/")[:-1])
 
 
 def _decode(raw: bytes) -> str:
@@ -264,38 +303,98 @@ def _decode(raw: bytes) -> str:
 # -------------------------------------------------------------- inspection
 
 
-def inspect_sdist(blob: bytes, filename: str) -> SdistInspection:
-    """Read an sdist and work out how, and with what, it builds."""
-    result = SdistInspection()
-    profile = result.profile
-    profile.inspected = True
-    db = database()
-    found: dict[str, SystemRequirement] = {}
+@dataclass
+class ScanPolicy:
+    """How to interpret a tree of files.
 
-    def record(raw_name: str, kind: str, source: str) -> None:
+    An sdist and a source repository need different readings of the same
+    scrapers. An sdist is a flat, curated subset, so depth stands in for
+    "is this ours". A repo is neither, so it names vendored directories
+    outright and scans to any depth.
+    """
+
+    build_config_depth: Optional[int] = MAX_BUILD_CONFIG_DEPTH
+    """Maximum depth for a build-system file, or None for no limit."""
+    honour_vendored_dirs: bool = False
+    """Skip build files under external/, third_party/, vendor/ and friends."""
+    read_python_metadata: bool = True
+    max_header_files: int = MAX_HEADER_FILES
+    root_only_setup_py: bool = True
+
+    @classmethod
+    def for_sdist(cls) -> ScanPolicy:
+        return cls()
+
+    @classmethod
+    def for_repository(cls) -> ScanPolicy:
+        return cls(
+            build_config_depth=None,
+            honour_vendored_dirs=True,
+            root_only_setup_py=False,
+            max_header_files=MAX_HEADER_FILES * 4,
+        )
+
+
+class Recorder:
+    """Collects system requirements, merging duplicates as they arrive.
+
+    Two ways in. :meth:`__call__` takes a raw name scraped out of a build
+    file and resolves it through the curated map -- that is inference.
+    :meth:`declare` takes a requirement somebody wrote down verbatim, which
+    is evidence, and is never reported as a guess.
+    """
+
+    def __init__(self, found: dict, exclude: Optional[set] = None):
+        self.found = found
+        self.exclude = {e.lower() for e in (exclude or set())}
+        self._db = database()
+
+    def __call__(self, raw_name: str, kind: str, source: str) -> None:
         if not _is_plausible_name(raw_name):
             return
-        req = db.lookup(raw_name, kind)
-        if req is None:
+        stem = strip_library_filename(raw_name)
+        if stem.lower() in self.exclude:
+            # A project referring to its own targets, not to a system library.
             return
-        req = SystemRequirement(
-            name=req.name,
-            kind=req.kind,
-            pkgconfig=req.pkgconfig,
-            debian=req.debian,
-            fedora=req.fedora,
-            found_in=(source,),
+        known = self._db.lookup(stem, kind)
+        if known is None:
+            return
+        self.declare(
+            SystemRequirement(
+                name=known.name,
+                kind=known.kind,
+                pkgconfig=known.pkgconfig,
+                debian=known.debian,
+                fedora=known.fedora,
+                found_in=(source,),
+            )
         )
-        existing = found.get(req.name)
-        found[req.name] = req.merged_with(existing) if existing else req
 
-    try:
-        members = list(_iter_archive(blob, filename))
-    except (tarfile.TarError, zipfile.BadZipFile, EOFError, OSError) as exc:
-        profile.inspected = False
-        profile.notes.append(f"could not read sdist: {exc}")
-        return result
+    def declare(self, requirement: SystemRequirement) -> None:
+        existing = self.found.get(requirement.name)
+        self.found[requirement.name] = (
+            requirement.merged_with(existing) if existing else requirement
+        )
 
+
+def make_recorder(found: dict, exclude: Optional[set] = None) -> Recorder:
+    """Build the recorder the scrapers write their findings into."""
+    return Recorder(found, exclude)
+
+
+def scan_members(
+    members,
+    result: SdistInspection,
+    record,
+    policy: ScanPolicy,
+) -> None:
+    """Apply every scraper to a sequence of ``(path, read)`` pairs.
+
+    This is the shared core: :func:`inspect_sdist` feeds it an archive and
+    :mod:`will_it_riscv.source` feeds it a directory walk. Neither the
+    scrapers nor this loop know which.
+    """
+    profile = result.profile
     pkg_info: Optional[bytes] = None
     pyproject_raw: Optional[bytes] = None
     setup_cfg_raw: Optional[bytes] = None
@@ -305,24 +404,28 @@ def inspect_sdist(blob: bytes, filename: str) -> SdistInspection:
         base = posixpath.basename(path).lower()
         depth = path.count("/")
         skipped = _is_skipped(path)
+        vendored = policy.honour_vendored_dirs and _is_vendored(path)
 
-        # -- metadata, root only
-        if depth == 0:
-            if base == "pkg-info" and pkg_info is None:
+        # -- Python metadata, root only
+        if policy.read_python_metadata:
+            if depth == 0:
+                if base == "pkg-info" and pkg_info is None:
+                    pkg_info = read()
+                    continue
+                if base == "pyproject.toml":
+                    pyproject_raw = read()
+                    continue
+                if base == "setup.cfg":
+                    setup_cfg_raw = read()
+                    continue
+            elif base == "pkg-info" and pkg_info is None and path.endswith(
+                ".egg-info/PKG-INFO"
+            ):
                 pkg_info = read()
                 continue
-            if base == "pyproject.toml":
-                pyproject_raw = read()
-                continue
-            if base == "setup.cfg":
-                setup_cfg_raw = read()
-                continue
-        elif base == "pkg-info" and pkg_info is None and path.endswith(".egg-info/PKG-INFO"):
-            pkg_info = read()
-            continue
 
         # -- language detection from file extensions
-        if not skipped:
+        if not skipped and not vendored:
             ext = posixpath.splitext(path)[1].lower()
             lang = LANGUAGE_EXTENSIONS.get(ext)
             if lang:
@@ -331,12 +434,22 @@ def inspect_sdist(blob: bytes, filename: str) -> SdistInspection:
             # What the sources #include is the most reliable statement of what
             # they need to link against -- more so than setup.py, which often
             # assembles its library list at runtime.
-            if ext in _INCLUDE_SCAN_EXTENSIONS and header_scans < MAX_HEADER_FILES:
+            if ext in _INCLUDE_SCAN_EXTENSIONS and header_scans < policy.max_header_files:
                 header_scans += 1
                 _scan_includes(read()[:MAX_HEADER_BYTES], path, record)
 
         # -- build systems and their configuration
-        owns_build = not skipped and depth <= MAX_BUILD_CONFIG_DEPTH
+        deep_enough = (
+            policy.build_config_depth is None or depth <= policy.build_config_depth
+        )
+        owns_build = not skipped and not vendored and deep_enough
+        cargo_ok = (
+            not skipped
+            and not vendored
+            and depth <= MAX_CARGO_DEPTH
+            and "vendor/" not in path
+        )
+
         if base == "cmakelists.txt" or base.endswith(".cmake"):
             if owns_build:
                 profile.build_systems.add("cmake")
@@ -353,27 +466,47 @@ def inspect_sdist(blob: bytes, filename: str) -> SdistInspection:
                 profile.evidence.add(Evidence.BUILD_CONFIG)
                 _scan_autoconf(_decode(read()), path, record)
         elif base == "cargo.toml":
-            if not skipped and depth <= MAX_CARGO_DEPTH and "vendor/" not in path:
+            if cargo_ok:
                 profile.build_systems.add("cargo")
                 profile.languages.add("rust")
                 profile.evidence.add(Evidence.BUILD_CONFIG)
                 _scan_cargo(read(), path, record)
         elif base == "build.rs":
-            if not skipped and depth <= MAX_CARGO_DEPTH and "vendor/" not in path:
+            if cargo_ok:
                 profile.build_systems.add("cargo")
                 profile.languages.add("rust")
                 _scan_build_rs(_decode(read()), path, record)
         elif base == "sconstruct" and depth == 0:
             profile.build_systems.add("scons")
-        elif base == "setup.py" and depth == 0:
-            _scan_setup_py(_decode(read()), path, record, profile)
+        elif base == "setup.py" and (depth == 0 or not policy.root_only_setup_py):
+            if not vendored:
+                _scan_setup_py(_decode(read()), path, record, profile)
 
-    _apply_pyproject(pyproject_raw, result, record)
-    _apply_setup_cfg(setup_cfg_raw, result, record)
-    _apply_pkg_info(pkg_info, result)
-    _apply_implied_tools(profile, record)
+    if policy.read_python_metadata:
+        _apply_pyproject(pyproject_raw, result, record)
+        _apply_setup_cfg(setup_cfg_raw, result, record)
+        _apply_pkg_info(pkg_info, result)
 
-    profile.system_requirements = sorted(found.values(), key=lambda r: (r.kind, r.name))
+
+def inspect_sdist(blob: bytes, filename: str) -> SdistInspection:
+    """Read an sdist and work out how, and with what, it builds."""
+    result = SdistInspection()
+    result.profile.inspected = True
+    found: dict[str, SystemRequirement] = {}
+    record = make_recorder(found)
+
+    try:
+        members = list(_iter_archive(blob, filename))
+    except (tarfile.TarError, zipfile.BadZipFile, EOFError, OSError) as exc:
+        result.profile.inspected = False
+        result.profile.notes.append(f"could not read sdist: {exc}")
+        return result
+
+    scan_members(members, result, record, ScanPolicy.for_sdist())
+    _apply_implied_tools(result.profile, record)
+    result.profile.system_requirements = sorted(
+        found.values(), key=lambda r: (r.kind, r.name)
+    )
     return result
 
 
@@ -418,7 +551,13 @@ _CMAKE_FIND_LIBRARY = re.compile(
 )
 
 
+#: A CMake comment runs from an unquoted # to end of line. Left in, the prose
+#: inside a command body gets tokenised as library names.
+_CMAKE_COMMENT = re.compile(r"(?<!\\)#[^\n]*")
+
+
 def _scan_cmake(text: str, path: str, record) -> None:
+    text = _CMAKE_COMMENT.sub("", text)
     for name in _CMAKE_FIND_PACKAGE.findall(text):
         record(name, "library", path)
     for regex in (_CMAKE_PKG_CHECK, _CMAKE_FIND_LIBRARY):

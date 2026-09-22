@@ -357,7 +357,9 @@ class Recorder:
         self.exclude = {e.lower() for e in (exclude or set())}
         self._db = database()
 
-    def __call__(self, raw_name: str, kind: str, source: str) -> None:
+    def __call__(
+        self, raw_name: str, kind: str, source: str, purpose: str = "build"
+    ) -> None:
         if not _is_plausible_name(raw_name):
             return
         stem = strip_library_filename(raw_name)
@@ -377,6 +379,7 @@ class Recorder:
                 debian=known.debian,
                 fedora=known.fedora,
                 found_in=(source,),
+                purpose=purpose,
             )
         )
 

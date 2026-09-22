@@ -35,11 +35,53 @@ CI_DIRS = frozenset({
 
 _DOCKERFILE = re.compile(r"^(dockerfile|containerfile)", re.IGNORECASE)
 
+#: CI definitions that live at a fixed path rather than in a directory.
+#: PostgreSQL uses Cirrus; plenty of projects still carry Travis or AppVeyor.
+_CI_FILENAMES = frozenset({
+    ".readthedocs.yaml", ".readthedocs.yml",
+    ".cirrus.yml", ".cirrus.yaml", ".cirrus.star",
+    ".travis.yml", ".travis.yaml",
+    "appveyor.yml", "appveyor.yaml", ".appveyor.yml",
+    "azure-pipelines.yml", "azure-pipelines.yaml",
+    ".drone.yml", "jenkinsfile", ".woodpecker.yml", ".woodpecker.yaml",
+    "bitbucket-pipelines.yml", ".builds", "codecov.yml", ".codecov.yml",
+    "shell.nix", "default.nix", "flake.nix", "meson.options",
+    "environment.yml", "environment.yaml", "vcpkg.json", "conanfile.txt",
+})
+
+
+#: Words in a CI step name, job name or filename that say what the step is
+#: for. Redis names its step "testprep" and installs tcl there.
+_TEST_CONTEXT = re.compile(
+    r"test|check|coverage|codecov|lcov|valgrind|saniti[sz]|fuzz|lint|format"
+    r"|static.?analysis|analy[sz]|benchmark|e2e|integration|smoke|qa|codeql"
+    r"|coverity|scan",
+    re.IGNORECASE,
+)
+_DOCS_CONTEXT = re.compile(
+    r"\bdocs?\b|documentation|sphinx|doxygen|manpage|man.page|website|readthedocs",
+    re.IGNORECASE,
+)
+#: A YAML step or job name, which is what gives an install command context.
+_STEP_NAME = re.compile(r"^[ \t]*(?:-[ \t]*)?name[ \t]*:[ \t]*(?P<label>.+?)[ \t]*$",
+                        re.MULTILINE)
+
+
+def _context_purpose(label: str) -> Optional[str]:
+    """What a step name or file path suggests the packages are for."""
+    if _DOCS_CONTEXT.search(label):
+        return "docs"
+    if _TEST_CONTEXT.search(label):
+        return "test"
+    return None
+
 
 @dataclass
 class CiFindings:
     packages: dict[str, str] = field(default_factory=dict)
     """distro package name -> the file it was declared in."""
+    purposes: dict[str, str] = field(default_factory=dict)
+    """distro package name -> build | test | docs."""
     warnings: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     files_read: int = 0
@@ -150,6 +192,49 @@ def _packages_from_install(tail: str, arrays: dict[str, list[str]]) -> list[str]
     return packages
 
 
+def _record_package(
+    findings: CiFindings, package: str, path: str, context: Optional[str]
+) -> None:
+    """Note a package, deciding what it is needed for.
+
+    Precedence, strongest first:
+
+    1. The name says so outright (``valgrind``, ``doxygen``).
+    2. The name is a curated library or build tool, in which case it is a
+       build dependency whatever step installed it. git installs cmake from
+       a step whose name matches "test"; cmake is still a build tool.
+    3. The surrounding step name, for packages nothing else recognises.
+    4. Otherwise: build, because dropping a real build dependency is a worse
+       error than keeping a test one.
+    """
+    from .syslibs import database
+
+    db = database()
+    named = db.purpose_of(package)
+    if named is not None:
+        purpose = named
+    elif db.by_distro_package(package) is not None:
+        purpose = "build"
+    else:
+        purpose = context or "build"
+    findings.packages.setdefault(package, path)
+    existing = findings.purposes.get(package)
+    if existing is None or (existing != "build" and purpose == "build"):
+        findings.purposes[package] = purpose
+
+
+def _context_at(text: str, offset: int, fallback: Optional[str]) -> Optional[str]:
+    """The purpose implied by the nearest step name above ``offset``."""
+    nearest = None
+    for match in _STEP_NAME.finditer(text, 0, offset):
+        nearest = match.group("label")
+    if nearest is not None:
+        implied = _context_purpose(nearest)
+        if implied is not None:
+            return implied
+    return fallback
+
+
 def scan_text(text: str, path: str, findings: CiFindings) -> None:
     """Pull declared packages and third-party sources out of one file."""
     # Comments first, then continuations. A Dockerfile puts comments *between*
@@ -160,30 +245,34 @@ def scan_text(text: str, path: str, findings: CiFindings) -> None:
     # which is how "Only" becomes a package name.
     text = _LINE_CONTINUATION.sub(" ", _SHELL_COMMENT.sub("", text))
     arrays = _bash_arrays(text)
+    # The filename is a weak last resort: codecov.yml, docs.yml, test.sh.
+    file_context = _context_purpose(path)
 
     for pattern in (_APT_INSTALL, _DNF_INSTALL, _APK_ADD):
-        for tail in pattern.findall(text):
-            for package in _packages_from_install(tail, arrays):
+        for match in pattern.finditer(text):
+            context = _context_at(text, match.start(), file_context)
+            for package in _packages_from_install(match.group(1), arrays):
                 if package == "\x00unresolved":
                     findings.notes.append(
                         f"{path}: an install command used a shell variable that "
                         "could not be resolved; its packages are missing here"
                     )
                     continue
-                findings.packages.setdefault(package, path)
+                _record_package(findings, package, path, context)
 
-    for body in _HPCCM_OSPACKAGES.findall(text):
-        for name in _QUOTED_ITEM.findall(body):
+    for match in _HPCCM_OSPACKAGES.finditer(text):
+        context = _context_at(text, match.start(), file_context)
+        for name in _QUOTED_ITEM.findall(match.group(1)):
             cleaned = _clean_package(name)
             if cleaned:
-                findings.packages.setdefault(cleaned, path)
+                _record_package(findings, cleaned, path, context)
 
     if path.endswith(".nix"):
         for body in _NIX_INPUTS.findall(text):
             for raw in re.split(r"[\s,]+", body):
                 cleaned = _clean_package(raw)
                 if cleaned and cleaned not in ("with", "pkgs"):
-                    findings.packages.setdefault(cleaned, path)
+                    _record_package(findings, cleaned, path, file_context)
 
     for match in _THIRD_PARTY_SOURCE.finditer(text):
         source = next((g for g in match.groups() if g), None)
@@ -208,7 +297,7 @@ def _is_ci_file(relative: str) -> bool:
         return True
     if name.startswith(".gitlab-ci") or name.endswith(".gitlab-ci.yml"):
         return True
-    if name in (".readthedocs.yaml", ".readthedocs.yml"):
+    if name in _CI_FILENAMES:
         return True
     if in_ci_dir and name.endswith((".yml", ".yaml", ".sh", ".bash", ".py", ".json")):
         return True
@@ -216,11 +305,12 @@ def _is_ci_file(relative: str) -> bool:
 
 
 def _apt_txt(text: str, path: str, findings: CiFindings) -> None:
+    context = _context_purpose(path)
     for line in text.splitlines():
         line = line.split("#", 1)[0].strip()
         cleaned = _clean_package(line)
         if cleaned:
-            findings.packages.setdefault(cleaned, path)
+            _record_package(findings, cleaned, path, context)
 
 
 def scan_ci_configuration(root: Path, record) -> CiFindings:
@@ -298,9 +388,10 @@ def _record_packages(findings: CiFindings, record) -> None:
     for package, path in sorted(findings.packages.items()):
         if package in _UNINTERESTING:
             continue
+        purpose = findings.purposes.get(package, "build")
         known = db.by_distro_package(package)
         if known is not None:
-            record(known.name, known.kind, f"declared in {path}")
+            record(known.name, known.kind, f"declared in {path}", purpose)
             continue
         # -dev / -devel packages exist to be linked against, whatever they
         # are called; everything else unrecognised is treated as a tool.
@@ -316,5 +407,6 @@ def _record_packages(findings: CiFindings, record) -> None:
                 debian=(package,),
                 found_in=(f"declared in {path}",),
                 declared=True,
+                purpose=purpose,
             )
         )

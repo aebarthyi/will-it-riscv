@@ -83,8 +83,9 @@ def _project_section(analysis: Analysis, console: Console) -> None:
     console.print(Text("This project", style="bold"))
     builds = ", ".join(sorted(profile.languages | profile.build_systems)) or "nothing"
     console.print(f"  builds   {builds}   ({analysis.files_scanned} files scanned)")
-    libs = [r for r in profile.system_requirements if r.kind == "library"]
-    tools = [r for r in profile.system_requirements if r.kind == "tool"]
+    build_only = [r for r in profile.system_requirements if r.purpose == "build"]
+    libs = [r for r in build_only if r.kind == "library"]
+    tools = [r for r in build_only if r.kind == "tool"]
     if libs:
         console.print(f"  links    {', '.join(r.name for r in libs)}", highlight=False)
     if tools:
@@ -161,8 +162,9 @@ def _package_table(
 def _system_packages(
     analysis: Analysis, console: Console, distro: Optional[DistroIndex]
 ) -> None:
-    requirements = analysis.all_system_requirements()
+    requirements = analysis.all_system_requirements("build")
     if not requirements:
+        _other_purposes(analysis, console, distro)
         return
     db = database()
     bundled = [r for r in requirements.values() if analysis.is_bundled(r)]
@@ -235,6 +237,38 @@ def _system_packages(
             style="dim",
         )
     console.print()
+    _other_purposes(analysis, console, distro)
+
+
+_PURPOSE_HEADINGS = {
+    "test": ("Additionally needed to run the test suite", "cyan"),
+    "docs": ("Additionally needed to build the documentation", "cyan"),
+}
+
+
+def _other_purposes(
+    analysis: Analysis, console: Console, distro: Optional[DistroIndex]
+) -> None:
+    """Test and documentation packages, kept out of the build install line."""
+    for purpose in ("test", "docs"):
+        requirements = analysis.all_system_requirements(purpose)
+        if not requirements:
+            continue
+        heading, style = _PURPOSE_HEADINGS[purpose]
+        console.print(Text(f"{heading} ({len(requirements)})", style=f"bold {style}"))
+        packages = sorted({p for r in requirements.values() for p in r.debian})
+        console.print(f"  sudo apt install {' '.join(packages)}", highlight=False)
+        if distro is not None and distro.available:
+            missing = [p for p in packages if not distro.has(p)]
+            if missing:
+                console.print(
+                    f"    not in {distro.spec.label} for {distro.arch}: "
+                    + ", ".join(missing),
+                    style="dim yellow",
+                    highlight=False,
+                )
+        console.print("    not required to compile the project", style="dim")
+        console.print()
 
 
 def _owners(analysis: Analysis, debian_package: str) -> str:
@@ -344,6 +378,13 @@ def to_dict(analysis: Analysis) -> dict:
         "all_system_requirements": [
             _requirement_dict(r) for r in analysis.all_system_requirements().values()
         ],
+        "system_requirements_by_purpose": {
+            purpose: [
+                _requirement_dict(r)
+                for r in analysis.all_system_requirements(purpose).values()
+            ]
+            for purpose in ("build", "test", "docs")
+        },
         "warnings": analysis.warnings,
     }
 
@@ -356,6 +397,7 @@ def _requirement_dict(r) -> dict:
         "debian": list(r.debian),
         "fedora": list(r.fedora),
         "declared": r.declared,
+        "purpose": r.purpose,
         "required_by": sorted(r.found_in),
     }
 
@@ -404,7 +446,7 @@ def render_markdown(analysis: Analysis, distro: Optional[DistroIndex] = None) ->
             )
         out.append("")
 
-    requirements = analysis.all_system_requirements()
+    requirements = analysis.all_system_requirements("build")
     if requirements:
         db = database()
         known = sorted(
@@ -424,6 +466,19 @@ def render_markdown(analysis: Analysis, distro: Optional[DistroIndex] = None) ->
             out.append("")
             out.extend(f"- `{name}`" for name in guessed)
             out.append("")
+
+    for purpose in ("test", "docs"):
+        extra = analysis.all_system_requirements(purpose)
+        if not extra:
+            continue
+        heading, _ = _PURPOSE_HEADINGS[purpose]
+        packages = sorted({p for r in extra.values() for p in r.debian})
+        out.append(f"## {heading}")
+        out.append("")
+        out.append("```console")
+        out.append(f"$ sudo apt install {' '.join(packages)}")
+        out.append("```")
+        out.append("")
 
     if analysis.warnings:
         out.append("## Warnings")

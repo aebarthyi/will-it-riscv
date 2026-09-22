@@ -63,6 +63,26 @@ so about, rather than silently reporting nothing. It also flags third-party
 package sources — a PPA or a vendor apt repo that has no builds for your
 architecture is a finding, not a detail.
 
+### Build, test and documentation dependencies are separated
+
+CI installs more than a build needs. The install line covers only what is
+required to *compile*; test harnesses and documentation toolchains are listed
+separately and left out of it.
+
+Classification is by package name first, because a single command routinely
+mixes purposes — git installs `gcc`, `libcurl4-openssl-dev`, `apache2` and
+`subversion` in one `apt-get`, and no amount of surrounding context separates
+those. The step name is consulted only for packages the name map does not
+recognise, so a build tool stays a build tool even when the step installing it
+is called "run tests". Anything still unclassified counts as a build
+dependency: dropping a real one is a worse error than keeping a test one.
+
+```
+git      45 build   12 test (apache2, cvs, subversion, valgrind…)   4 docs (asciidoc, xmlto…)
+redis    13 build    9 test (tcl, tclx, valgrind, lcov…)
+qemu    109 build    0 test
+```
+
 Two repository-specific things it knows:
 
 - **Bundled libraries are optional.** A project that ships its own copy of a

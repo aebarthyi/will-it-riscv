@@ -37,6 +37,21 @@ class SysLibDatabase:
             for key in (n.lower(), normalize(n))
             if key
         }
+        purpose = raw.get("purpose", {})
+        self._purpose: dict[str, str] = {}
+        for kind in ("test", "docs"):
+            for name in purpose.get(kind, []):
+                self._purpose.setdefault(name.lower(), kind)
+        self._purpose_prefixes = tuple(
+            (prefix.lower(), kind)
+            for kind in ("test", "docs")
+            for prefix in purpose.get(f"{kind}_prefixes", [])
+        )
+        self._purpose_suffixes = tuple(
+            (suffix.lower(), kind)
+            for kind in ("test", "docs")
+            for suffix in purpose.get(f"{kind}_suffixes", [])
+        )
         headers = raw.get("header", {})
         self._header_exact = {k.lower(): v for k, v in headers.items() if not k.endswith("/")}
         self._header_prefix = tuple(
@@ -107,6 +122,31 @@ class SysLibDatabase:
             debian=(f"lib{name}-dev",),
             fedora=(f"{name}-devel",),
         )
+
+    def purpose_of(self, package: str) -> Optional[str]:
+        """``"test"``, ``"docs"``, or None when the name says nothing.
+
+        Classification is by name because a single install command routinely
+        mixes purposes: git installs gcc, libcurl-dev, apache2 and subversion
+        in one go, and no amount of surrounding context separates those.
+        """
+        key = package.strip().lower()
+        if not key:
+            return None
+        hit = self._purpose.get(key)
+        if hit:
+            return hit
+        for suffix, kind in self._purpose_suffixes:
+            if key.endswith(suffix):
+                return kind
+        for prefix, kind in self._purpose_prefixes:
+            if key.startswith(prefix):
+                return kind
+        # A versioned spelling of a known entry: tcl8.6, python3-sphinx-rtd.
+        stem = re.sub(r"[-_]?[0-9.]+$", "", key)
+        if stem and stem != key:
+            return self._purpose.get(stem)
+        return None
 
     def by_distro_package(self, package: str) -> Optional[SystemRequirement]:
         """Resolve a distro package name (``libssl-dev``) to a known library.

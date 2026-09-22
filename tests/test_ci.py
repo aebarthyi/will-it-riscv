@@ -203,3 +203,89 @@ def test_comments_between_line_continuations_are_not_packages():
 def test_url_fragments_and_shell_expansions_survive_comment_stripping():
     f = scan('RUN apt-get install -y libssl-dev  # see http://example.invalid#notes')
     assert sorted(f.packages) == ["libssl-dev"]
+
+
+# -- build / test / docs separation -----------------------------------------
+
+
+def purposes(text: str, path: str = ".github/workflows/ci.yml") -> dict:
+    f = scan(text, path)
+    return {p: f.purposes.get(p, "build") for p in f.packages}
+
+
+def test_one_command_can_mix_purposes():
+    """git installs compiler, libraries, a web server and a VCS together."""
+    got = purposes(
+        "apt-get install -y gcc libcurl4-openssl-dev zlib1g-dev "
+        "apache2 apache2-http2 cvs subversion valgrind asciidoc"
+    )
+    assert got["gcc"] == "build"
+    assert got["libcurl4-openssl-dev"] == "build"
+    assert got["zlib1g-dev"] == "build"
+    assert got["apache2"] == "test"
+    assert got["apache2-http2"] == "test"      # prefix match
+    assert got["cvs"] == "test"
+    assert got["subversion"] == "test"
+    assert got["valgrind"] == "test"
+    assert got["asciidoc"] == "docs"
+
+
+def test_step_name_classifies_otherwise_unknown_packages():
+    """Redis names the step 'testprep' and installs tcl there."""
+    got = purposes(
+        "steps:\n"
+        "  - name: build\n"
+        "    run: sudo apt-get install -y libssl-dev\n"
+        "  - name: testprep\n"
+        "    run: sudo apt-get install -y some-harness-thing\n"
+    )
+    assert got["libssl-dev"] == "build"
+    assert got["some-harness-thing"] == "test"
+
+
+def test_step_name_cannot_demote_a_known_build_tool():
+    """git installs cmake from a step whose name matches 'test'."""
+    got = purposes(
+        "steps:\n"
+        "  - name: run tests\n"
+        "    run: sudo apt-get install -y cmake libssl-dev ninja-build\n"
+    )
+    assert got["cmake"] == "build"
+    assert got["libssl-dev"] == "build"
+    assert got["ninja-build"] == "build"
+
+
+def test_documentation_step_context():
+    got = purposes(
+        "steps:\n"
+        "  - name: Build documentation\n"
+        "    run: apt-get install -y some-doc-generator\n"
+    )
+    assert got["some-doc-generator"] == "docs"
+
+
+def test_filename_is_a_weak_fallback_context():
+    assert purposes("run: apt-get install -y mystery-tool",
+                    ".github/workflows/codecov.yml")["mystery-tool"] == "test"
+    assert purposes("run: apt-get install -y mystery-tool",
+                    ".github/workflows/build.yml")["mystery-tool"] == "build"
+
+
+def test_unknown_package_with_no_context_defaults_to_build():
+    """Dropping a real build dependency is worse than keeping a test one."""
+    assert purposes("run: apt-get install -y mystery-lib")["mystery-lib"] == "build"
+
+
+def test_build_wins_when_a_package_appears_in_both(tmp_path):
+    (tmp_path / "CMakeLists.txt").write_text("find_package(OpenSSL)\n")
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "test.yml").write_text(
+        "- name: test\n  run: apt-get install -y libssl-dev\n"
+    )
+    from will_it_riscv.source import inspect_repository
+
+    inspection = inspect_repository(tmp_path, scan_ci=True)
+    openssl = next(r for r in inspection.profile.system_requirements
+                   if r.name == "openssl")
+    assert openssl.purpose == "build"

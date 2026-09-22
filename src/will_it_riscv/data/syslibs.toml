@@ -840,3 +840,64 @@ jaraco-classes = "jaraco.classes"
 "libssh2.h" = "libssh2"
 "git2.h" = "libgit2"
 "taglib/" = "taglib"
+
+
+# ---------------------------------------------- what a package is needed for
+# Packages here are not needed to *build* the project. The classification is
+# by name, because a single install command routinely mixes the two -- git's
+# installs gcc, libcurl-dev, apache2 and subversion together.
+[purpose]
+
+# Test harnesses, runners and the servers a test suite talks to.
+test = [
+  # harnesses and unit-test frameworks
+  "tcl", "tclx", "tcl-tls", "tcltls", "tcl8.5", "tcl8.6", "tcl8.7", "expect",
+  "bats", "dejagnu", "cmocka", "check", "libcheck", "libcmocka-dev",
+  "googletest", "gtest", "libgtest-dev", "libgmock-dev", "catch2", "cunit",
+  "cppunit", "libcppunit-dev", "cxxtest", "criterion", "junit", "libtap-dev",
+  "pytest", "python3-pytest", "tox", "nose", "unittest2", "rspec", "minitest",
+  "python3-pytest-xdist", "python3-pytest-cov",
+  # coverage, sanitizers and static analysis
+  "valgrind", "lcov", "gcovr", "cppcheck", "clang-tidy", "clang-format",
+  "clang-tools", "iwyu", "shellcheck", "codespell", "cpplint", "oclint",
+  "infer", "coverity", "sonar-scanner", "afl", "afl++", "honggfuzz",
+  "libfuzzer", "python3-flake8", "flake8", "black", "ruff", "pylint",
+  "mypy", "kcov", "codecov", "sparse", "coccinelle", "smatch", "splint",
+  "default-jre", "default-jdk", "pre-commit", "uncrustify", "astyle",
+  # debuggers and tracing, used when a test fails
+  "gdb", "lldb", "strace", "ltrace", "perf-tools", "linux-tools-common",
+  "systemtap", "bpftrace", "heaptrack", "massif-visualizer", "rr",
+  # servers and clients a test suite drives
+  "apache2", "apache2-utils", "nginx", "lighttpd", "vsftpd", "proftpd",
+  "openssh-server", "openssh", "sshd", "slapd", "ldap-utils", "krb5-kdc",
+  "krb5-admin-server", "krb5-user", "samba", "cvs", "cvsps", "subversion",
+  "libsvn-perl", "mysql-server", "mariadb-server", "postgresql-server",
+  "redis-server", "memcached", "mosquitto", "stunnel4", "socat", "netcat",
+  "netcat-openbsd", "iproute", "iproute2", "iputils-ping", "dnsmasq",
+  "squid", "privoxy", "gnupg-agent", "libnss-wrapper", "ncurses-compat-libs",
+  # emulation and containers used to run tests elsewhere
+  "qemu-user", "qemu-user-static", "qemu-system", "binfmt-support",
+  "procps-ng", "vmtouch", "sysbench", "hyperfine", "stress-ng",
+]
+
+# Documentation toolchains.
+docs = [
+  "sphinx", "python3-sphinx", "sphinx-common", "sphinx-doc", "doxygen",
+  "graphviz", "latexmk", "pandoc", "asciidoc", "asciidoctor", "xmlto",
+  "dblatex", "docbook", "docbook-xsl", "docbook-utils", "rst2man", "mkdocs",
+  "breathe", "linkchecker", "epubcheck", "ghostscript", "imagemagick-doc",
+  "python3-sphinx-rtd-theme", "python3-myst-parser", "help2man", "man-db",
+  "texinfo", "info",
+]
+
+# Prefix matches, for package families.
+test_prefixes = [
+  "apache2-", "libtest-", "perl-test-", "python3-pytest", "golang-github-stretchr",
+  "libjunit", "ruby-rspec", "php-phpunit", "gcc-multilib", "g++-multilib",
+  "openjdk-", "valgrind", "clang-tidy", "clang-format", "cppcheck",
+]
+docs_prefixes = [
+  "texlive", "python3-sphinx", "ruby-asciidoctor", "fonts-", "docbook",
+  "asciidoc", "doxygen", "sphinx", "texinfo", "libjs-mathjax",
+]
+docs_suffixes = ["-doc", "-docs", "-manpages", "-javadoc"]

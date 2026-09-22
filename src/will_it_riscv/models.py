@@ -81,8 +81,15 @@ class SystemRequirement:
     """True when a human wrote this package name down -- in a CI config, a
     Dockerfile or a PEP 725 ``[external]`` table -- rather than us inferring
     it from a build file. Declared names are never reported as guesses."""
+    purpose: str = "build"
+    """``build``, ``test`` or ``docs``. Only ``build`` packages are needed to
+    compile the project; the others run its tests or render its manual."""
 
     def merged_with(self, other: SystemRequirement) -> SystemRequirement:
+        # "build" wins a disagreement. Something scraped from a build file and
+        # also installed by a test job is still needed to build, and dropping
+        # a real build dependency is a far worse error than keeping a test one.
+        purpose = "build" if "build" in (self.purpose, other.purpose) else self.purpose
         return SystemRequirement(
             name=self.name,
             kind=self.kind,
@@ -91,6 +98,7 @@ class SystemRequirement:
             fedora=self.fedora or other.fedora,
             found_in=tuple(dict.fromkeys(self.found_in + other.found_in)),
             declared=self.declared or other.declared,
+            purpose=purpose,
         )
 
 
@@ -171,13 +179,21 @@ class Analysis:
             for b in self.bundled_libraries
         )
 
-    def all_system_requirements(self) -> dict[str, SystemRequirement]:
-        """Project and dependency requirements, merged for the install line."""
+    def all_system_requirements(
+        self, purpose: Optional[str] = None
+    ) -> dict[str, SystemRequirement]:
+        """Project and dependency requirements, merged for the install line.
+
+        ``purpose`` filters to ``build``, ``test`` or ``docs``; omitted, every
+        requirement is returned.
+        """
         merged: dict[str, SystemRequirement] = {}
         for source in (self.project_requirements, self.system_requirements):
             for name, req in source.items():
                 existing = merged.get(name)
                 merged[name] = req.merged_with(existing) if existing else req
+        if purpose is not None:
+            merged = {k: v for k, v in merged.items() if v.purpose == purpose}
         return dict(sorted(merged.items()))
 
     def add_warning(self, message: str) -> None:

@@ -325,3 +325,22 @@ def test_vendored_ci_is_not_this_projects_ci(tmp_path):
     found = libs(inspect_repository(tmp_path, scan_ci=True))
     assert "hwloc" in found and "openssl" in found
     assert "libevent" not in found
+
+
+def test_test_packages_are_kept_out_of_the_build_set(tmp_path):
+    from will_it_riscv.models import Analysis
+
+    build_repo(tmp_path, {
+        "CMakeLists.txt": "find_package(ZLIB)\n",
+        ".github/workflows/ci.yml":
+            "run: apt-get install -y libssl-dev valgrind tclx doxygen\n",
+    })
+    inspection = inspect_repository(tmp_path, scan_ci=True)
+    analysis = Analysis(target="t", root="r", python_version="3.12")
+    analysis.project_requirements = {
+        r.name: r for r in inspection.profile.system_requirements
+    }
+    assert {"zlib", "openssl"} <= set(analysis.all_system_requirements("build"))
+    assert set(analysis.all_system_requirements("test")) == {"valgrind", "tclx"}
+    assert set(analysis.all_system_requirements("docs")) == {"doxygen"}
+    assert "valgrind" not in analysis.all_system_requirements("build")

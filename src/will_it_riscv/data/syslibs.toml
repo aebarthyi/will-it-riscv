@@ -41,8 +41,29 @@ names = [
   # other language ecosystems and linters, common in polyglot CMake projects
   "java", "jni", "jvm", "ant", "flake", "flake", "pylint", "matlab", "octave",
   "halide", "openvino", "ade", "tengine", "nvcc", "cuda", "cudnn", "cublas",
+  # English words that reach the scrapers through prose and CMake argument
+  # lists. "library" is the dangerous one: strip its lib prefix and it
+  # becomes the plausible-looking "rary".
+  "library", "libraries", "the", "to", "on", "in", "of", "is", "as", "has",
+  "and", "or", "not", "if", "for", "with", "this", "that", "it", "we", "need",
+  "use", "used", "using", "set", "add", "all", "any", "none", "name", "names",
+  "path", "paths", "dir", "dirs", "include", "includes", "version", "found",
+  "native", "individual", "windows", "linux", "darwin", "unix", "default",
+  "redist", "system", "systems", "static", "shared", "debug", "release",
+  # C runtime and compiler support libraries: never separately installable
+  "libc", "libc6", "musl", "libgcc", "libgcc_s", "libstdc", "glibc", "crypt",
+  # instrumentation and sanitizers, supplied by the compiler
+  "gcov", "gcov_", "asan", "ubsan", "tsan", "msan", "profiler", "coverage",
+  "efence", "duma", "gen",
+  # shell/build verbs and stray argument-list tokens
+  "poll", "strip", "ranlib", "files", "codec", "sysinclude", "ist", "wd",
+  "chardev", "migration", "qom", "hwcore", "graph", "graph_base", "redist",
   # macOS frameworks
   "accelerate", "corefoundation", "coregraphics", "appleframeworks", "objc",
+  "coreservices", "foundation", "security", "systemconfiguration", "network",
+  "iokit", "cocoa", "appkit", "quartz", "quartzcore", "audiotoolbox",
+  "videotoolbox", "corevideo", "coremedia", "avfoundation", "opengl",
+  "carbon", "diskarbitration", "metal", "metalkit", "coreaudio",
 ]
 
 # ---------------------------------------------------------------- libraries

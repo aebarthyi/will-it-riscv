@@ -48,8 +48,9 @@ The alternative is finding out one traceback at a time on an emulated board.
 
 **Repository mode** runs automatically when you point it at a directory. It
 reads the source tree to find what *this* project needs in order to compile —
-scraping `CMakeLists.txt`, `meson.build`, `configure.ac`, `Cargo.toml`,
-`setup.py` and the `#include` directives in the C and C++ sources — and then
+scraping `CMakeLists.txt`, `meson.build`, `configure.ac`, `Makefile`,
+hand-written `configure` scripts, `Cargo.toml`, `setup.py` and the `#include`
+directives in the C and C++ sources — and then
 reads the CI configuration, where projects usually write their system
 dependencies down outright. Those declared lists are authoritative in a way
 inference is not, so they are never reported as guesses.
@@ -166,6 +167,22 @@ static inference from reading the archive. That is a deliberate trade: it runs
 anywhere in seconds, needs no emulator, and cannot execute a hostile `setup.py`.
 It also means a package reported as buildable can still fail on a detail no
 static read would catch. Treat the output as a work list, not a guarantee.
+
+### Build systems
+
+| | read from |
+| --- | --- |
+| CMake | `find_package`, `pkg_check_modules`, `find_library` |
+| Meson | `dependency()`, `find_library()`, `project()` languages |
+| Autotools | `AC_CHECK_LIB`, `PKG_CHECK_MODULES`, `AC_SEARCH_LIBS` |
+| Make | `-l` flags in `*LIBS` / `*LDFLAGS` variables, `pkg-config` calls |
+| Hand-written `configure` | FFmpeg-style `require_pkg_config`, `-l` flags (a generated autoconf script is skipped — its `configure.ac` already said it) |
+| Cargo | `*-sys` crates, `pkg_config::probe` in `build.rs` |
+| setuptools | `libraries=[…]`, `find_library`, `pkgconfig` calls |
+| any C/C++ | `#include` directives, against a 130-entry header map |
+
+SCons and Bazel are detected but not scraped; the report says so rather than
+implying the project has no dependencies.
 
 **Repository scanning is inference too.** A CMake option you never enable is
 indistinguishable, statically, from one you always do — so an optional

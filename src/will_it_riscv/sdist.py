@@ -119,11 +119,12 @@ BUILD_REQUIRE_SIGNALS = {
 
 #: Tools each build system needs present on the machine doing the build.
 BUILD_SYSTEM_TOOLS = {
+    "configure": ("make",),
+    "make": ("make",),
     "cmake": ("cmake", "ninja"),
     "meson": ("meson", "ninja"),
     "autotools": ("autoconf", "make"),
     "cargo": ("cargo",),
-    "make": ("make",),
     "scons": ("scons",),
 }
 
@@ -189,8 +190,15 @@ def strip_library_filename(raw: str) -> str:
     return match.group("stem") if match else raw
 
 
+#: Header files and single letters reach the scrapers from argument lists
+#: like `require bs2b libbs2b bs2b.h bs2b_open`.
+_HEADER_SUFFIX = (".h", ".hpp", ".hxx", ".hh", ".inc", ".in")
+
+
 def _is_plausible_name(raw: str) -> bool:
     name = strip_library_filename(raw)
+    if name.lower().endswith(_HEADER_SUFFIX):
+        return False
     if not _PLAUSIBLE_NAME.match(name):
         return False
     return not any(c in name for c in "$/\\{}")
@@ -359,6 +367,8 @@ class Recorder:
         known = self._db.lookup(stem, kind)
         if known is None:
             return
+        if len(stem) < 3 and self._db.is_guess(known):
+            return
         self.declare(
             SystemRequirement(
                 name=known.name,
@@ -476,8 +486,23 @@ def scan_members(
                 profile.build_systems.add("cargo")
                 profile.languages.add("rust")
                 _scan_build_rs(_decode(read()), path, record)
-        elif base == "sconstruct" and depth == 0:
-            profile.build_systems.add("scons")
+        elif base in ("makefile", "gnumakefile") or base.endswith(".mk"):
+            if owns_build:
+                profile.build_systems.add("make")
+                _scan_makefile(_decode(read()), path, record)
+        elif base == "configure" and depth == 0:
+            text = _decode(read())
+            if not is_generated_configure(text):
+                profile.build_systems.add("configure")
+                profile.evidence.add(Evidence.BUILD_CONFIG)
+                _scan_configure_script(text, path, record)
+        elif base == "sconstruct" or base == "sconscript":
+            if owns_build:
+                profile.build_systems.add("scons")
+                profile.notes.append(
+                    f"{path}: SCons builds are not scraped; its dependencies are "
+                    "not in this report"
+                )
         elif base == "setup.py" and (depth == 0 or not policy.root_only_setup_py):
             if not vendored:
                 _scan_setup_py(_decode(read()), path, record, profile)
@@ -551,13 +576,21 @@ _CMAKE_FIND_LIBRARY = re.compile(
 )
 
 
-#: A CMake comment runs from an unquoted # to end of line. Left in, the prose
-#: inside a command body gets tokenised as library names.
-_CMAKE_COMMENT = re.compile(r"(?<!\\)#[^\n]*")
+#: A CMake bracket comment: #[[ ... ]] or #[==[ ... ]==], spanning lines.
+#: Every Find module CMake ships opens with one holding pages of prose, so
+#: missing these turns documentation into library names ("library" survives
+#: the lib-prefix strip as "rary").
+_CMAKE_BRACKET_COMMENT = re.compile(r"#\[(=*)\[.*?\]\1\]", re.DOTALL)
+#: A line comment runs from an unquoted # to end of line.
+_CMAKE_LINE_COMMENT = re.compile(r"(?<!\\)#[^\n]*")
+
+
+def strip_cmake_comments(text: str) -> str:
+    return _CMAKE_LINE_COMMENT.sub("", _CMAKE_BRACKET_COMMENT.sub("", text))
 
 
 def _scan_cmake(text: str, path: str, record) -> None:
-    text = _CMAKE_COMMENT.sub("", text)
+    text = strip_cmake_comments(text)
     for name in _CMAKE_FIND_PACKAGE.findall(text):
         record(name, "library", path)
     for regex in (_CMAKE_PKG_CHECK, _CMAKE_FIND_LIBRARY):
@@ -566,12 +599,24 @@ def _scan_cmake(text: str, path: str, record) -> None:
                 record(token, "library", path)
 
 
+#: Suffixes CMake conventionally puts on its own cache variables. A token
+#: ending in one names a variable, not a library: OpenBLAS_HOME, VMD_PATHS.
+_CMAKE_VARIABLE_SUFFIX = re.compile(
+    r"_(HOME|ROOT|ROOT_DIR|DIR|DIRS|PATH|PATHS|LIBRARY|LIBRARIES|LIB|LIBS"
+    r"|INCLUDE_DIR|INCLUDE_DIRS|INCLUDE|FOUND|VERSION|PREFIX|EXECUTABLE"
+    r"|BINARY|SUFFIX|SUFFIXES|REQUIRED_VARS|USE_STATIC_LIBS)$",
+    re.IGNORECASE,
+)
+
+
 def _cmake_tokens(body: str) -> Iterator[str]:
     for token in re.split(r"[\s;]+", body.strip()):
         token = token.strip("\"'")
         if not token or token.startswith("$") or token.startswith("#"):
             continue
         if token.lower() in _CMAKE_KEYWORDS or token.isupper() and "_" in token:
+            continue
+        if _CMAKE_VARIABLE_SUFFIX.search(token):
             continue
         yield token
 
@@ -611,6 +656,81 @@ def _scan_autoconf(text: str, path: str, record) -> None:
                 token = token.strip("[]\"'")
                 if token and not token.startswith("$"):
                     record(token, "library", path)
+
+
+#: Make variables that hold linker arguments.
+_MAKE_LIB_VARIABLE = re.compile(
+    r"^[ \t]*(?:[A-Za-z0-9_]*(?:LIBS|LDFLAGS|LDLIBS|LOADLIBES))[ \t]*[+:?]?=(?P<value>.*)$",
+    re.MULTILINE,
+)
+#: A -l flag, anywhere we have decided to look.
+_DASH_L_FLAG = re.compile(r"(?:^|[\s\"'=])-l([A-Za-z][A-Za-z0-9_+.-]*)")
+#: pkg-config invocations, in a Makefile or a shell script. The module list
+#: is bounded: an unbounded run of words swallows whatever prose follows.
+#: Horizontal whitespace only: \s crosses newlines, so `PKG_CONFIG?=pkg-config`
+#: at the end of a line would otherwise capture the next line's first words.
+_PKG_CONFIG_CALL = re.compile(
+    r"(?<![\w-])pkg[-_]config[ \t]+(?:--\S+[ \t]+)*"
+    r"(?P<modules>[A-Za-z][\w.+-]*(?:[ \t]+[A-Za-z][\w.+-]*){0,3})"
+)
+
+#: A shell or Makefile comment. Same trap as CMake: "# Detect libzstd via
+#: pkg-config, fall back to -lzstd" otherwise contributes "fall", "back"
+#: and "to" as library names.
+_HASH_COMMENT = re.compile(r"(?<!\$)(?<!\\)#[^\n]*")
+
+
+def strip_hash_comments(text: str) -> str:
+    return _HASH_COMMENT.sub("", text)
+
+
+def _scan_makefile(text: str, path: str, record) -> None:
+    """Read linker flags out of a Makefile.
+
+    Only lines assigning to a *LIBS / *LDFLAGS style variable are considered.
+    A -l flag can appear almost anywhere in a large Makefile, and taking them
+    all produces far more noise than signal.
+    """
+    text = strip_hash_comments(text)
+    for match in _MAKE_LIB_VARIABLE.finditer(text):
+        for name in _DASH_L_FLAG.findall(match.group("value")):
+            record(name, "library", path)
+    _scan_pkg_config_calls(text, path, record)
+
+
+def _scan_pkg_config_calls(text: str, path: str, record) -> None:
+    for match in _PKG_CONFIG_CALL.finditer(text):
+        for module in match.group("modules").split():
+            if module.startswith("-") or "$" in module:
+                continue
+            record(module, "library", path)
+
+
+#: FFmpeg and its imitators drive a hand-written configure with a small DSL:
+#: `require_pkg_config <feature> <module>` and
+#: `require <feature> <header> <symbol> -lfoo`.
+_CONFIGURE_PKG_CONFIG = re.compile(
+    r"\b(?:require|check|use)_pkg_config[ \t]+\S+[ \t]+(?P<modules>[A-Za-z][\w.+-]*)"
+)
+
+
+def _scan_configure_script(text: str, path: str, record) -> None:
+    """Scrape a hand-written configure script (FFmpeg, nginx and friends)."""
+    text = strip_hash_comments(text)
+    for match in _CONFIGURE_PKG_CONFIG.finditer(text):
+        record(match.group("modules"), "library", path)
+    for name in _DASH_L_FLAG.findall(text):
+        record(name, "library", path)
+    _scan_pkg_config_calls(text, path, record)
+
+
+#: The banner autoconf writes into a script it generated. A configure script
+#: carrying it says nothing its configure.ac did not already say.
+_AUTOCONF_GENERATED = re.compile(r"Generated by GNU Autoconf|# *Guess values for system")
+
+
+def is_generated_configure(text: str) -> bool:
+    return bool(_AUTOCONF_GENERATED.search(text[:8192]))
 
 
 def _scan_cargo(raw: bytes, path: str, record) -> None:

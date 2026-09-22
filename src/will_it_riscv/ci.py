@@ -81,6 +81,10 @@ _THIRD_PARTY_SOURCE = re.compile(
     re.IGNORECASE,
 )
 
+_RPM_VERSION_RELEASE = re.compile(r"-\d+\.[\d.]*\d(?:-[\w.+]+)?$")
+#: A shell comment: a # that starts a word. Keeps URL fragments (http://x#y)
+#: and shell expansions (${#arr}) intact.
+_SHELL_COMMENT = re.compile(r"(?m)(?<![\S$])#.*$")
 _LINE_CONTINUATION = re.compile(r"\\\s*\n")
 _FLAG = re.compile(r"^-{1,2}")
 _QUOTED_ITEM = re.compile(r"['\"]([^'\"]+)['\"]")
@@ -92,11 +96,17 @@ def _clean_package(token: str) -> Optional[str]:
     if not token or _FLAG.match(token):
         return None
     # Strip a version pin: libpq-dev=16.1 or libpq-dev>=16
+    token = token.split("/", 1)[0]  # apt's pkg/suite syntax
     token = re.split(r"[=<>]", token, maxsplit=1)[0].strip()
+    # Strip an rpm-style version-release, which must carry a dot so that a
+    # soname suffix (libpng16-16) survives: libcurl-devel-7.61.1-34.el8 .
+    token = _RPM_VERSION_RELEASE.sub("", token)
     if not token or "$" in token or "{" in token or "`" in token:
         return None
     if token in ("&&", "||", "\\", "-", "install", "apt", "apt-get", "sudo"):
         return None
+    if "//" in token or token.endswith(":"):
+        return None  # a URL caught by an install command on the same line
     if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.+:-]*$", token):
         return None
     return token
@@ -142,7 +152,13 @@ def _packages_from_install(tail: str, arrays: dict[str, list[str]]) -> list[str]
 
 def scan_text(text: str, path: str, findings: CiFindings) -> None:
     """Pull declared packages and third-party sources out of one file."""
-    text = _LINE_CONTINUATION.sub(" ", text)
+    # Comments first, then continuations. A Dockerfile puts comments *between*
+    # continued lines, so joining first folds the prose into the command:
+    #     zstd-libs \
+    #     # libturbojpeg.so is not used by GDAL. Only libjpeg.so*
+    #     && rm -f ...
+    # which is how "Only" becomes a package name.
+    text = _LINE_CONTINUATION.sub(" ", _SHELL_COMMENT.sub("", text))
     arrays = _bash_arrays(text)
 
     for pattern in (_APT_INSTALL, _DNF_INSTALL, _APK_ADD):
@@ -209,6 +225,7 @@ def _apt_txt(text: str, path: str, findings: CiFindings) -> None:
 
 def scan_ci_configuration(root: Path, record) -> CiFindings:
     """Walk a repository's CI and container definitions."""
+    from .sdist import _is_vendored
     from .source import IGNORED_DIRS
 
     root = Path(root)
@@ -223,6 +240,10 @@ def scan_ci_configuration(root: Path, record) -> CiFindings:
             except ValueError:  # pragma: no cover - defensive
                 continue
             if not _is_ci_file(relative):
+                continue
+            if _is_vendored(relative):
+                # Redis vendors hiredis; hiredis's workflow describes how to
+                # build hiredis on its own, not how to build Redis.
                 continue
             if findings.files_read >= MAX_CI_FILES:
                 findings.notes.append(
@@ -251,7 +272,17 @@ _UNINTERESTING = frozenset({
     "software-properties-common", "apt-transport-https", "sudo", "tzdata",
     "locales", "openssh-client", "unzip", "zip", "xz-utils", "bzip2", "less",
     "vim", "nano", "procps", "rsync", "jq", "tar", "gzip", "file", "patch",
-    "pipx", "ghostscript", "netbase", "dirmngr",
+    "pipx", "ghostscript", "netbase", "dirmngr", "bash", "coreutils",
+    "findutils", "diffutils", "grep", "sed", "gawk", "which", "gettext",
+    # C runtime and compiler support: pulled in by the compiler, never chosen
+    "libc6", "libc-dev", "libc6-dev", "libc6-dbg", "libc-bin", "musl", "musl-dev",
+    "libgcc", "libgcc1", "libgcc-s1", "libstdc++", "libstdc++6", "glibc",
+    "libstdc++-dev", "linux-libc-dev", "libc6-dev-i386", "libc6-amd64",
+    "libstdc++-devel", "libstdc++-static", "lib64stdc++6", "libstdc++5",
+    "glibc-devel", "glibc-headers", "glibc-static", "musl-libc", "libc-devel",
+    "dpkg-dev", "rpm-build", "epel-release", "build-base", "gcc-multilib",
+    "g++-multilib", "python-is-python3", "python3-pip", "ca-certificates-bundle",
+    "gcc", "g++", "clang", "make", "pkg-config", "pkgconf", "build-essential",
 })
 
 
@@ -271,7 +302,13 @@ def _record_packages(findings: CiFindings, record) -> None:
         if known is not None:
             record(known.name, known.kind, f"declared in {path}")
             continue
-        kind = "library" if package.startswith("lib") else "tool"
+        # -dev / -devel packages exist to be linked against, whatever they
+        # are called; everything else unrecognised is treated as a tool.
+        kind = (
+            "library"
+            if package.startswith("lib") or package.endswith(("-dev", "-devel"))
+            else "tool"
+        )
         record.declare(
             SystemRequirement(
                 name=package,

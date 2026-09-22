@@ -62,7 +62,8 @@ class SysLibDatabase:
                 if body.get("pkgconfig"):
                     keys.append(body["pkgconfig"])
                 for key in keys:
-                    self._entries.setdefault(normalize(key), req)
+                    for variant in _variants(normalize(key)):
+                        self._entries.setdefault(variant, req)
                 # CI files name distro packages, not libraries. Index them
                 # backwards so "libssl-dev" and a scraped "OpenSSL" converge
                 # on one entry instead of being reported twice.
@@ -108,8 +109,49 @@ class SysLibDatabase:
         )
 
     def by_distro_package(self, package: str) -> Optional[SystemRequirement]:
-        """Resolve a distro package name (``libssl-dev``) to a known library."""
-        return self._by_package.get(package.strip().lower())
+        """Resolve a distro package name (``libssl-dev``) to a known library.
+
+        CI files install runtime packages as well as development ones, so
+        ``libtiff6`` is tried again as ``libtiff-dev``: the same library,
+        and worth converging rather than reporting twice.
+        """
+        key = package.strip().lower()
+        hit = self._by_package.get(key)
+        if hit is not None:
+            return hit
+        # A runtime package is the same library as its -dev counterpart, and
+        # the soname may sit at the end (libtiff6, libpng16-16) or just
+        # before the suffix (libtiff5-dev). Peel one soname at a time.
+        embedded = re.match(r"^(?P<base>lib.+?)[0-9.]*(?:t64)?(?P<dev>-dev(?:el)?)$", key)
+        if embedded:
+            hit = self._by_package.get(embedded.group("base") + embedded.group("dev"))
+            if hit is not None:
+                return hit
+
+        # Alpine and Fedora spell the development package differently
+        # (brotli-dev, curl-devel). Strip the suffix and ask the library
+        # alias table, so they converge with the Debian name.
+        bare = re.sub(r"-(dev|devel|headers|static)$", "", key)
+        if bare != key:
+            for variant in _variants(bare):
+                hit = self._entries.get(variant)
+                if hit is not None:
+                    return hit
+
+        stem = key
+        for _ in range(4):
+            for suffix in ("-dev", "-devel", "t64-dev"):
+                hit = self._by_package.get(stem + suffix)
+                if hit is not None:
+                    return hit
+            peeled = re.sub(r"[-_]?[0-9.]*(t64)?$", "", stem).rstrip("-_.")
+            if not peeled or peeled == stem:
+                break
+            stem = peeled
+            hit = self._by_package.get(stem)
+            if hit is not None:
+                return hit
+        return None
 
     def header(self, include_path: str) -> Optional[str]:
         """Map a ``#include`` path to a curated library name, if we know it.
@@ -141,9 +183,31 @@ def normalize(name: str) -> str:
     name = _DECORATION.sub("", name.strip())
     name = name.strip().strip("\"'").lower()
     name = re.sub(r"^-l", "", name)
-    # Drop a trailing soname/ABI digit run: libpng16 -> libpng, icu-uc stays.
-    name = re.sub(r"(?<=[a-z])\d+$", "", name)
     return name.strip("-_. ")
+
+
+#: A soname/ABI digit run, as in libpng16. Only stripped when it is short and
+#: leaves a substantial stem behind -- otherwise dc1394 becomes "dc" and x264
+#: becomes "x", which is how a camera library turns into nonsense.
+_SONAME_DIGITS = re.compile(r"^(?P<stem>[a-z][a-z_+.-]{3,})\d{1,2}$")
+
+#: Link-variant suffixes CMake enumerates alongside the real name.
+_LINK_VARIANT = re.compile(r"[-_](static|shared|imp|import|mt|md)$")
+
+
+def _variants(key: str) -> list[str]:
+    """Alternative spellings of one candidate, most specific first."""
+    out = [key]
+    without_variant = _LINK_VARIANT.sub("", key)
+    if without_variant != key and len(without_variant) > 2:
+        out.append(without_variant)
+    for candidate in list(out):
+        match = _SONAME_DIGITS.match(candidate)
+        if match:
+            out.append(match.group("stem").rstrip("-_."))
+        if candidate.startswith("lib") and len(candidate) > 4:
+            out.append(candidate[3:])
+    return out
 
 
 def _candidates(raw_name: str) -> list[str]:
@@ -158,14 +222,11 @@ def _candidates(raw_name: str) -> list[str]:
         key = normalize(part)
         if not key:
             continue
-        variants = [key]
+        variants = _variants(key)
         # pkg-config names carry an API version: glib-2.0, libxml-2.0, dbus-1.
         bare = _PKGCONFIG_VERSION.sub("", key)
         if bare and bare != key:
-            variants.append(bare)
-        for variant in list(variants):
-            if variant.startswith("lib") and len(variant) > 4:
-                variants.append(variant[3:])
+            variants.extend(_variants(bare))
         for variant in variants:
             if variant and variant not in out:
                 out.append(variant)

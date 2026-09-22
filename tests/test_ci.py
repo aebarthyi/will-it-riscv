@@ -148,3 +148,58 @@ def test_declared_packages_are_never_guesses(tmp_path):
     found: dict = {}
     scan_ci_configuration(tmp_path, make_recorder(found))
     assert not database().is_guess(found["some-obscure-lib-dev"])
+
+
+def test_rpm_version_release_is_stripped():
+    f = scan("dnf install -y libcurl-devel-7.61.1-34.el8_10.11")
+    assert sorted(f.packages) == ["libcurl-devel"]
+
+
+def test_soname_suffix_survives_version_stripping():
+    """libpng16-16 is a package name; the 16 is not a version to strip."""
+    f = scan("apt-get install -y libpng16-16")
+    assert sorted(f.packages) == ["libpng16-16"]
+
+
+def test_urls_on_an_install_line_are_not_packages():
+    f = scan("apt-get install -y https://example.invalid/x.deb libssl-dev")
+    assert sorted(f.packages) == ["libssl-dev"]
+
+
+def test_runtime_packages_resolve_to_their_library(tmp_path):
+    from will_it_riscv.sdist import make_recorder
+
+    (tmp_path / "Dockerfile").write_text(
+        "RUN apt-get install -y libtiff6 libtiff5-dev libpng16-16 libssl3 libcurl4\n"
+    )
+    found: dict = {}
+    scan_ci_configuration(tmp_path, make_recorder(found))
+    assert set(found) == {"libtiff", "libpng", "openssl", "libcurl"}
+
+
+def test_alpine_and_fedora_dev_suffixes_converge(tmp_path):
+    from will_it_riscv.sdist import make_recorder
+
+    (tmp_path / "Dockerfile").write_text(
+        "RUN apk add brotli-dev openssl-dev\nRUN dnf install -y curl-devel\n"
+    )
+    found: dict = {}
+    scan_ci_configuration(tmp_path, make_recorder(found))
+    assert set(found) == {"brotli", "openssl", "libcurl"}
+
+
+def test_comments_between_line_continuations_are_not_packages():
+    """GDAL's Dockerfile comments sit inside a continued RUN command."""
+    f = scan(
+        "RUN apk add \\\n"
+        "        zstd-libs \\\n"
+        "    # libturbojpeg.so is not used by GDAL. Only libjpeg.so*\n"
+        "    && rm -f /usr/lib/libturbojpeg.so*\n",
+        "docker/Dockerfile",
+    )
+    assert sorted(f.packages) == ["zstd-libs"]
+
+
+def test_url_fragments_and_shell_expansions_survive_comment_stripping():
+    f = scan('RUN apt-get install -y libssl-dev  # see http://example.invalid#notes')
+    assert sorted(f.packages) == ["libssl-dev"]

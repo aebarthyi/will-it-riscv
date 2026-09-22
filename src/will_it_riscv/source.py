@@ -48,11 +48,13 @@ INTERESTING_SUFFIXES = (
     ".c", ".h", ".cc", ".cpp", ".cxx", ".c++", ".hpp", ".hxx",
     ".pyx", ".pxd", ".pxi", ".rs", ".f", ".f77", ".f90", ".f95", ".f03",
     ".for", ".go", ".zig", ".cmake", ".toml", ".cfg", ".ac", ".am", ".build",
+    ".mk",
 )
 INTERESTING_NAMES = frozenset({
     "cmakelists.txt", "meson.build", "meson_options.txt", "meson.options",
     "configure.ac", "configure.in", "makefile.am", "cargo.toml", "build.rs",
-    "sconstruct", "setup.py", "setup.cfg", "pyproject.toml", "pkg-info",
+    "sconstruct", "sconscript", "setup.py", "setup.cfg", "pyproject.toml",
+    "pkg-info", "makefile", "gnumakefile", "configure",
 })
 
 MAX_FILES = 60000

@@ -83,7 +83,10 @@ def _project_section(analysis: Analysis, console: Console) -> None:
     console.print(Text("This project", style="bold"))
     builds = ", ".join(sorted(profile.languages | profile.build_systems)) or "nothing"
     console.print(f"  builds   {builds}   ({analysis.files_scanned} files scanned)")
-    build_only = [r for r in profile.system_requirements if r.purpose == "build"]
+    build_only = [
+        r for r in profile.system_requirements
+        if r.purpose == "build" and not r.optional
+    ]
     libs = [r for r in build_only if r.kind == "library"]
     tools = [r for r in build_only if r.kind == "tool"]
     if libs:
@@ -162,8 +165,9 @@ def _package_table(
 def _system_packages(
     analysis: Analysis, console: Console, distro: Optional[DistroIndex]
 ) -> None:
-    requirements = analysis.all_system_requirements("build")
+    requirements = analysis.required_system_requirements()
     if not requirements:
+        _optional_section(analysis, console, distro)
         _other_purposes(analysis, console, distro)
         return
     db = database()
@@ -237,7 +241,37 @@ def _system_packages(
             style="dim",
         )
     console.print()
+    _optional_section(analysis, console, distro)
     _other_purposes(analysis, console, distro)
+
+
+def _optional_section(
+    analysis: Analysis, console: Console, distro: Optional[DistroIndex]
+) -> None:
+    """Dependencies a default build does not reach.
+
+    A big CMake project spends most of its find_package calls on backends
+    nobody enables. Listing them as requirements is how a project that needs
+    LLVM and a compiler looks like it needs three vendor GPU stacks.
+    """
+    optional = analysis.optional_system_requirements()
+    if not optional:
+        return
+    console.print(
+        Text(f"Optional — not built unless you ask for it ({len(optional)})",
+             style="bold blue")
+    )
+    for req in sorted(optional.values(), key=lambda r: r.name):
+        gate = f"  ← {req.gate}" if req.gate else ""
+        packages = " / ".join(p for p in req.debian if p != req.name)
+        label = f"{req.name:<24} {packages}" if packages else req.name
+        console.print(f"    • {label.rstrip()}{gate}", highlight=False)
+    console.print(
+        "    left out of the install line above; a default build does not "
+        "reach these",
+        style="dim",
+    )
+    console.print()
 
 
 _PURPOSE_HEADINGS = {
@@ -378,6 +412,12 @@ def to_dict(analysis: Analysis) -> dict:
         "all_system_requirements": [
             _requirement_dict(r) for r in analysis.all_system_requirements().values()
         ],
+        "required_system_requirements": [
+            _requirement_dict(r) for r in analysis.required_system_requirements().values()
+        ],
+        "optional_system_requirements": [
+            _requirement_dict(r) for r in analysis.optional_system_requirements().values()
+        ],
         "system_requirements_by_purpose": {
             purpose: [
                 _requirement_dict(r)
@@ -398,6 +438,8 @@ def _requirement_dict(r) -> dict:
         "fedora": list(r.fedora),
         "declared": r.declared,
         "purpose": r.purpose,
+        "optional": r.optional,
+        "enabled_by": r.gate,
         "required_by": sorted(r.found_in),
     }
 
@@ -446,7 +488,7 @@ def render_markdown(analysis: Analysis, distro: Optional[DistroIndex] = None) ->
             )
         out.append("")
 
-    requirements = analysis.all_system_requirements("build")
+    requirements = analysis.required_system_requirements()
     if requirements:
         db = database()
         known = sorted(
@@ -466,6 +508,17 @@ def render_markdown(analysis: Analysis, distro: Optional[DistroIndex] = None) ->
             out.append("")
             out.extend(f"- `{name}`" for name in guessed)
             out.append("")
+
+    optional = analysis.optional_system_requirements()
+    if optional:
+        out.append("## Optional — not built unless you ask for it")
+        out.append("")
+        out.append("| dependency | system package | enabled by |")
+        out.append("| --- | --- | --- |")
+        for req in sorted(optional.values(), key=lambda r: r.name):
+            listed = " / ".join(f"`{p}`" for p in req.debian) or "—"
+            out.append(f"| `{req.name}` | {listed} | {req.gate or '—'} |")
+        out.append("")
 
     for purpose in ("test", "docs"):
         extra = analysis.all_system_requirements(purpose)

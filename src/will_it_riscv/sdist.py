@@ -328,6 +328,9 @@ class ScanPolicy:
     read_python_metadata: bool = True
     max_header_files: int = MAX_HEADER_FILES
     root_only_setup_py: bool = True
+    cmake_symbols: object = None
+    """Option defaults gathered across the whole tree, so a switch declared
+    in one file can gate a find_package in another."""
 
     @classmethod
     def for_sdist(cls) -> ScanPolicy:
@@ -358,7 +361,13 @@ class Recorder:
         self._db = database()
 
     def __call__(
-        self, raw_name: str, kind: str, source: str, purpose: str = "build"
+        self,
+        raw_name: str,
+        kind: str,
+        source: str,
+        purpose: str = "build",
+        optional: bool = False,
+        gate: Optional[str] = None,
     ) -> None:
         if not _is_plausible_name(raw_name):
             return
@@ -380,6 +389,8 @@ class Recorder:
                 fedora=known.fedora,
                 found_in=(source,),
                 purpose=purpose,
+                optional=optional,
+                gate=gate,
             )
         )
 
@@ -467,7 +478,7 @@ def scan_members(
             if owns_build:
                 profile.build_systems.add("cmake")
                 profile.evidence.add(Evidence.BUILD_CONFIG)
-                _scan_cmake(_decode(read()), path, record)
+                _scan_cmake(_decode(read()), path, record, policy.cmake_symbols)
         elif base in ("meson.build", "meson_options.txt", "meson.options"):
             if owns_build:
                 profile.build_systems.add("meson")
@@ -592,14 +603,25 @@ def strip_cmake_comments(text: str) -> str:
     return _CMAKE_LINE_COMMENT.sub("", _CMAKE_BRACKET_COMMENT.sub("", text))
 
 
-def _scan_cmake(text: str, path: str, record) -> None:
-    text = strip_cmake_comments(text)
-    for name in _CMAKE_FIND_PACKAGE.findall(text):
-        record(name, "library", path)
-    for regex in (_CMAKE_PKG_CHECK, _CMAKE_FIND_LIBRARY):
-        for body in regex.findall(text):
-            for token in _cmake_tokens(body):
-                record(token, "library", path)
+def _scan_cmake(text: str, path: str, record, symbols=None) -> None:
+    """Read a CMake file, noting which finds a default build actually reaches.
+
+    Most `find_package` calls in a large project sit inside a branch nobody
+    enables. Walking the if/else structure separates "needed to build" from
+    "needed only if you ask for the CUDA backend".
+    """
+    from .cmake_conditions import Tri, analyze
+
+    analysis = analyze(text, symbols)
+    for finding in analysis.findings:
+        record(
+            finding.name,
+            "library",
+            path,
+            optional=finding.optional,
+            gate=finding.gate
+            or (None if finding.reachable is not Tri.FALSE else "disabled by default"),
+        )
 
 
 #: Suffixes CMake conventionally puts on its own cache variables. A token
@@ -624,7 +646,12 @@ def _cmake_tokens(body: str) -> Iterator[str]:
         yield token
 
 
-_MESON_DEPENDENCY = re.compile(r"\bdependency\s*\(\s*['\"]([^'\"]+)['\"]")
+#: `dependency('x', required: false)` -- meson says so itself, and the
+#: keyword may sit anywhere in the call.
+_MESON_DEPENDENCY = re.compile(
+    r"\bdependency\s*\(\s*['\"](?P<name>[^'\"]+)['\"](?P<rest>[^)]*)\)"
+)
+_MESON_NOT_REQUIRED = re.compile(r"required\s*:\s*(false|get_option)", re.IGNORECASE)
 _MESON_FIND_LIBRARY = re.compile(r"\.find_library\s*\(\s*['\"]([^'\"]+)['\"]")
 _MESON_PROJECT_LANGS = re.compile(r"\bproject\s*\([^)]*?\[([^\]]*)\]", re.DOTALL)
 _MESON_ADD_LANGS = re.compile(r"\badd_languages\s*\(\s*([^)]*)\)")
@@ -634,9 +661,15 @@ _MESON_LANG_MAP = {"c": "c", "cpp": "c++", "c++": "c++", "fortran": "fortran", "
 
 
 def _scan_meson(text: str, path: str, record, profile: BuildProfile) -> None:
-    for regex in (_MESON_DEPENDENCY, _MESON_FIND_LIBRARY):
-        for name in regex.findall(text):
-            record(name, "library", path)
+    for match in _MESON_DEPENDENCY.finditer(text):
+        optional = bool(_MESON_NOT_REQUIRED.search(match.group("rest")))
+        record(
+            match.group("name"), "library", path,
+            optional=optional,
+            gate="meson: required: false" if optional else None,
+        )
+    for name in _MESON_FIND_LIBRARY.findall(text):
+        record(name, "library", path)
     for regex in (_MESON_PROJECT_LANGS, _MESON_ADD_LANGS):
         for body in regex.findall(text):
             for name in _QUOTED.findall(body):
@@ -717,14 +750,49 @@ _CONFIGURE_PKG_CONFIG = re.compile(
 )
 
 
+#: FFmpeg writes `enabled libx264 && require_pkg_config libx264 x264 ...`,
+#: and libx264 is off unless you pass --enable-libx264. The same line shape
+#: covers `enabled_all`, `enabled_any` and the `disabled` negation.
+_CONFIGURE_GATE = re.compile(
+    r"^[ \t]*(?:enabled|enabled_all|enabled_any)[ \t]+(?P<feature>[A-Za-z0-9_]+)"
+    r"[ \t]*&&",
+    re.MULTILINE,
+)
+
+
+def _configure_gates(text: str) -> list[tuple[int, int, str]]:
+    """Line spans that sit behind an `enabled <feature> &&` guard."""
+    spans = []
+    for match in _CONFIGURE_GATE.finditer(text):
+        end = text.find("\n", match.end())
+        spans.append((match.start(), len(text) if end < 0 else end, match.group("feature")))
+    return spans
+
+
+def _gate_at(spans: list[tuple[int, int, str]], offset: int) -> Optional[str]:
+    for start, end, feature in spans:
+        if start <= offset <= end:
+            return f"--enable-{feature}"
+    return None
+
+
 def _scan_configure_script(text: str, path: str, record) -> None:
     """Scrape a hand-written configure script (FFmpeg, nginx and friends)."""
     text = strip_hash_comments(text)
+    spans = _configure_gates(text)
+
+    def note(name: str, offset: int) -> None:
+        gate = _gate_at(spans, offset)
+        record(name, "library", path, optional=gate is not None, gate=gate)
+
     for match in _CONFIGURE_PKG_CONFIG.finditer(text):
-        record(match.group("modules"), "library", path)
-    for name in _DASH_L_FLAG.findall(text):
-        record(name, "library", path)
-    _scan_pkg_config_calls(text, path, record)
+        note(match.group("modules"), match.start())
+    for match in re.finditer(_DASH_L_FLAG, text):
+        note(match.group(1), match.start())
+    for match in _PKG_CONFIG_CALL.finditer(text):
+        for module in match.group("modules").split():
+            if not module.startswith("-") and "$" not in module:
+                note(module, match.start())
 
 
 #: The banner autoconf writes into a script it generated. A configure script

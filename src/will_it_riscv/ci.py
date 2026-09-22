@@ -372,6 +372,7 @@ _UNINTERESTING = frozenset({
     "glibc-devel", "glibc-headers", "glibc-static", "musl-libc", "libc-devel",
     "dpkg-dev", "rpm-build", "epel-release", "build-base", "gcc-multilib",
     "g++-multilib", "python-is-python3", "python3-pip", "ca-certificates-bundle",
+    "apt-utils", "gpg", "gpg-agent", "gnupg1", "keyboard-configuration",
     "gcc", "g++", "clang", "make", "pkg-config", "pkgconf", "build-essential",
 })
 
@@ -389,9 +390,14 @@ def _record_packages(findings: CiFindings, record) -> None:
         if package in _UNINTERESTING:
             continue
         purpose = findings.purposes.get(package, "build")
+        optional = db.is_optional_package(package)
+        gate = "an accelerator backend, off by default" if optional else None
         known = db.by_distro_package(package)
         if known is not None:
-            record(known.name, known.kind, f"declared in {path}", purpose)
+            record(
+                known.name, known.kind, f"declared in {path}", purpose,
+                optional=optional, gate=gate,
+            )
             continue
         # -dev / -devel packages exist to be linked against, whatever they
         # are called; everything else unrecognised is treated as a tool.
@@ -408,5 +414,7 @@ def _record_packages(findings: CiFindings, record) -> None:
                 found_in=(f"declared in {path}",),
                 declared=True,
                 purpose=purpose,
+                optional=optional,
+                gate=gate,
             )
         )

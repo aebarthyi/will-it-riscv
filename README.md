@@ -63,6 +63,41 @@ so about, rather than silently reporting nothing. It also flags third-party
 package sources — a PPA or a vendor apt repo that has no builds for your
 architecture is a finding, not a detail.
 
+### Optional dependencies are separated from required ones
+
+Most `find_package` calls in a large project sit inside a branch nobody
+enables. AdaptiveCpp is the clean case: its CUDA, ROCm and Level Zero backends
+each live in `if(WITH_..._BACKEND)`, and those default to whatever
+autodetection found — which on a riscv64 machine is nothing. Reported as
+requirements, a project whose minimal build needs LLVM and a C++ compiler
+looks like it needs three vendor GPU stacks.
+
+So the CMake option defaults are read first, then the `if`/`elseif`/`else`
+structure is walked to decide what a build with **no `-D` flags** reaches.
+Evaluation is three-valued — true, false and *unknown* — and unknown counts as
+reachable, because guessing a real dependency away is the error that matters.
+
+| understood | |
+| --- | --- |
+| `option(X "" OFF)` | and the bare `option(X "")`, which CMake defaults to OFF |
+| `set(X OFF CACHE BOOL …)` | the other way projects declare a switch |
+| `set(X ${CUDA_FOUND} CACHE …)` | defaults to autodetection, so off unless asked for |
+| `if(CUDA_FOUND)` | false when the package has no build for the target at all |
+| `NOT` / `AND` / `OR`, nesting, `elseif`, `else` | three-valued throughout |
+| `WIN32`, `APPLE`, `MSVC` | false for a Linux target, so those branches are dead |
+| `find_package(X QUIET)` without `REQUIRED` | a probe, not a requirement |
+| `STREQUAL`, `MATCHES`, `DEFINED`, `EXISTS` | *unknown* — kept, not guessed away |
+
+Beyond CMake: Meson's `dependency('x', required: false)` says so outright, and
+FFmpeg-style `enabled libx264 && require_pkg_config …` reports the
+`--enable-libx264` that would turn it on. Accelerator packages a CI job
+installs (`rocm-dev`, `nvidia-cuda-toolkit`, `intel-oneapi-*`) are treated the
+same way — the same judgement, for the half of the evidence that has no
+conditions to walk.
+
+Required anywhere beats optional elsewhere: a dependency found unconditionally
+in one file is required, whatever another file does with it.
+
 ### Build, test and documentation dependencies are separated
 
 CI installs more than a build needs. The install line covers only what is

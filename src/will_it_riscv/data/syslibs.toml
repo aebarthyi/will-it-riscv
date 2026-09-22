@@ -38,6 +38,8 @@ names = [
   # Intel VTune's ITT API and VMD's molfile plugins: opt-in, proprietary,
   # and not packaged by any distro.
   "ittnotify", "ittapi", "vmd", "xyzplugin", "vmdplugin", "molfile",
+  # Intel's vector maths runtime: shipped with their compiler, x86 only
+  "svml", "intlc", "amath", "imf", "irng", "intel-oneapi", "libmmd",
   # other language ecosystems and linters, common in polyglot CMake projects
   "java", "jni", "jvm", "ant", "flake", "flake", "pylint", "matlab", "octave",
   "halide", "openvino", "ade", "tengine", "nvcc", "cuda", "cudnn", "cublas",
@@ -264,6 +266,16 @@ debian = ["libnetcdf-dev"]
 fedora = ["netcdf-devel"]
 
 # ------------------------------------------------------------- HPC / MPI
+
+[library.llvm]
+aliases = ["llvm-core", "llvmsupport", "clang", "clang-cpp", "libclang"]
+debian = ["llvm-dev", "libclang-dev"]
+fedora = ["llvm-devel", "clang-devel"]
+
+[library.sleef]
+aliases = ["sleefgnuabi", "sleefdft"]
+debian = ["libsleef-dev"]
+fedora = ["sleef-devel"]
 
 [library.hwloc]
 aliases = ["libhwloc"]
@@ -888,6 +900,25 @@ docs = [
   "breathe", "linkchecker", "epubcheck", "ghostscript", "imagemagick-doc",
   "python3-sphinx-rtd-theme", "python3-myst-parser", "help2man", "man-db",
   "texinfo", "info",
+]
+
+# Accelerator and vendor-GPU packages. These are real distro packages, so
+# they are reported rather than ignored -- but a build only needs them when
+# the corresponding backend is switched on, which no default build does.
+optional = [
+  "rocm-dev", "rocm-libs", "rocm-hip-sdk", "hip-dev", "hipcc", "rocblas",
+  "rocfft", "rocsparse", "rocthrust", "miopen-hip",
+  "nvidia-cuda-toolkit", "nvidia-cuda-dev", "cuda-toolkit", "cuda-nvcc",
+  "libcudnn8", "libcudnn9", "libnccl-dev", "libcublas-dev",
+  "intel-oneapi-compiler-dpcpp-cpp", "intel-oneapi-mkl-devel",
+  "intel-basekit", "intel-hpckit", "intel-opencl-icd",
+  "ocl-icd-opencl-dev", "ocl-icd-libopencl1", "opencl-headers",
+  "mesa-vulkan-drivers", "vulkan-tools", "libvulkan-dev", "vulkan-validationlayers",
+  "level-zero-dev", "libze-dev", "libze-loader",
+]
+optional_prefixes = [
+  "rocm-", "hip-", "hsa-", "cuda-", "nvidia-", "libcu", "libnv",
+  "intel-oneapi-", "intel-level-zero", "intel-opencl", "intel-igc",
 ]
 
 # Prefix matches, for package families.

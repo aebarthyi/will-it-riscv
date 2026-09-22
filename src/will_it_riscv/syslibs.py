@@ -42,6 +42,10 @@ class SysLibDatabase:
         for kind in ("test", "docs"):
             for name in purpose.get(kind, []):
                 self._purpose.setdefault(name.lower(), kind)
+        self._optional_packages = {n.lower() for n in purpose.get("optional", [])}
+        self._optional_prefixes = tuple(
+            n.lower() for n in purpose.get("optional_prefixes", [])
+        )
         self._purpose_prefixes = tuple(
             (prefix.lower(), kind)
             for kind in ("test", "docs")
@@ -147,6 +151,19 @@ class SysLibDatabase:
         if stem and stem != key:
             return self._purpose.get(stem)
         return None
+
+    def is_optional_package(self, package: str) -> bool:
+        """True for accelerator and vendor-GPU packages.
+
+        A CI job installs these to build *with* a backend that is off by
+        default, so they belong in the optional list rather than the install
+        line -- the same judgement the CMake condition walk makes, for the
+        half of the evidence that has no conditions to walk.
+        """
+        key = package.strip().lower()
+        if key in self._optional_packages:
+            return True
+        return key.startswith(self._optional_prefixes)
 
     def by_distro_package(self, package: str) -> Optional[SystemRequirement]:
         """Resolve a distro package name (``libssl-dev``) to a known library.

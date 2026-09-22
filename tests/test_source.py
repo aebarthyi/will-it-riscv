@@ -344,3 +344,107 @@ def test_test_packages_are_kept_out_of_the_build_set(tmp_path):
     assert set(analysis.all_system_requirements("test")) == {"valgrind", "tclx"}
     assert set(analysis.all_system_requirements("docs")) == {"doxygen"}
     assert "valgrind" not in analysis.all_system_requirements("build")
+
+
+# -- optional dependencies --------------------------------------------------
+
+
+def optional_names(inspection):
+    return sorted(r.name for r in inspection.profile.system_requirements if r.optional)
+
+
+def required_names(inspection):
+    return sorted(
+        r.name for r in inspection.profile.system_requirements
+        if not r.optional and r.kind == "library"
+    )
+
+
+def test_cmake_gated_backends_are_optional(tmp_path):
+    """AdaptiveCpp's shape: the backend switch defaults to autodetection."""
+    build_repo(tmp_path, {
+        "CMakeLists.txt": (
+            "project(demo)\n"
+            "find_package(CUDA QUIET)\n"
+            'set(WITH_CUDA_BACKEND ${CUDA_FOUND} CACHE BOOL "CUDA support")\n'
+            'option(WITH_VULKAN "Vulkan support" OFF)\n'
+            "find_package(ZLIB REQUIRED)\n"
+            "if(WITH_CUDA_BACKEND)\n  find_package(HDF5 REQUIRED)\nendif()\n"
+            "if(WITH_VULKAN)\n  find_package(OpenSSL REQUIRED)\nendif()\n"
+        ),
+        "main.cpp": "",
+    })
+    inspection = inspect_repository(tmp_path, scan_ci=False)
+    assert "zlib" in required_names(inspection)
+    assert "hdf5" not in required_names(inspection)
+    assert "openssl" not in required_names(inspection)
+    assert {"hdf5", "openssl"} <= set(optional_names(inspection))
+
+
+def test_options_gate_across_files(tmp_path):
+    build_repo(tmp_path, {
+        "CMakeLists.txt": 'option(WITH_EXTRA "" OFF)\nfind_package(ZLIB REQUIRED)\n',
+        "src/CMakeLists.txt": "if(WITH_EXTRA)\n  find_package(HDF5)\nendif()\n",
+    })
+    inspection = inspect_repository(tmp_path, scan_ci=False)
+    assert "zlib" in required_names(inspection)
+    assert "hdf5" in optional_names(inspection)
+
+
+def test_unknown_gate_keeps_a_dependency_required(tmp_path):
+    build_repo(tmp_path, {
+        "CMakeLists.txt": "if(SOMETHING_UNKNOWABLE)\n  find_package(ZLIB)\nendif()\n",
+    })
+    assert "zlib" in required_names(inspect_repository(tmp_path, scan_ci=False))
+
+
+def test_meson_required_false_is_optional(tmp_path):
+    build_repo(tmp_path, {
+        "meson.build": (
+            "project('demo', 'c')\n"
+            "zlib = dependency('zlib')\n"
+            "curl = dependency('libcurl', required: false)\n"
+        ),
+    })
+    inspection = inspect_repository(tmp_path, scan_ci=False)
+    assert "zlib" in required_names(inspection)
+    assert "libcurl" in optional_names(inspection)
+
+
+def test_configure_enable_gates_are_optional(tmp_path):
+    """FFmpeg: `enabled libx264 && require_pkg_config libx264 x264 ...`."""
+    build_repo(tmp_path, {
+        "configure": (
+            "#!/bin/sh\n"
+            "require_pkg_config zlib zlib\n"
+            "enabled libx264 && require_pkg_config libx264 x264\n"
+        ),
+        "main.c": "",
+    })
+    inspection = inspect_repository(tmp_path, scan_ci=False)
+    assert "zlib" in required_names(inspection)
+    x264 = next(r for r in inspection.profile.system_requirements if r.name == "x264")
+    assert x264.optional and x264.gate == "--enable-libx264"
+
+
+def test_accelerator_packages_from_ci_are_optional(tmp_path):
+    """A CI job installing ROCm builds a backend nobody enables by default."""
+    build_repo(tmp_path, {
+        "CMakeLists.txt": "find_package(ZLIB REQUIRED)\n",
+        ".github/workflows/ci.yml":
+            "run: apt-get install -y libssl-dev rocm-dev nvidia-cuda-toolkit\n",
+    })
+    inspection = inspect_repository(tmp_path, scan_ci=True)
+    assert {"zlib", "openssl"} <= set(required_names(inspection))
+    assert {"rocm-dev", "nvidia-cuda-toolkit"} <= set(optional_names(inspection))
+
+
+def test_required_anywhere_beats_optional_elsewhere(tmp_path):
+    build_repo(tmp_path, {
+        "CMakeLists.txt": (
+            'option(EXTRA "" OFF)\n'
+            "if(EXTRA)\n  find_package(ZLIB)\nendif()\n"
+            "find_package(ZLIB REQUIRED)\n"
+        ),
+    })
+    assert "zlib" in required_names(inspect_repository(tmp_path, scan_ci=False))

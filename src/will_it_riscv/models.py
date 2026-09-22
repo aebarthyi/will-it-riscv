@@ -84,12 +84,20 @@ class SystemRequirement:
     purpose: str = "build"
     """``build``, ``test`` or ``docs``. Only ``build`` packages are needed to
     compile the project; the others run its tests or render its manual."""
+    optional: bool = False
+    """True when a build with no ``-D`` flags would not need this at all --
+    the reference sits inside a branch gated by an option that is off by
+    default."""
+    gate: Optional[str] = None
+    """The option or condition that would turn an optional dependency on."""
 
     def merged_with(self, other: SystemRequirement) -> SystemRequirement:
         # "build" wins a disagreement. Something scraped from a build file and
         # also installed by a test job is still needed to build, and dropping
         # a real build dependency is a far worse error than keeping a test one.
         purpose = "build" if "build" in (self.purpose, other.purpose) else self.purpose
+        # Referenced unconditionally anywhere means it is not optional.
+        optional = self.optional and other.optional
         return SystemRequirement(
             name=self.name,
             kind=self.kind,
@@ -99,6 +107,8 @@ class SystemRequirement:
             found_in=tuple(dict.fromkeys(self.found_in + other.found_in)),
             declared=self.declared or other.declared,
             purpose=purpose,
+            optional=optional,
+            gate=(self.gate or other.gate) if optional else None,
         )
 
 
@@ -195,6 +205,21 @@ class Analysis:
         if purpose is not None:
             merged = {k: v for k, v in merged.items() if v.purpose == purpose}
         return dict(sorted(merged.items()))
+
+    def required_system_requirements(self) -> dict[str, SystemRequirement]:
+        """What a default build needs: build purpose, not gated off."""
+        return {
+            k: v
+            for k, v in self.all_system_requirements("build").items()
+            if not v.optional
+        }
+
+    def optional_system_requirements(self) -> dict[str, SystemRequirement]:
+        return {
+            k: v
+            for k, v in self.all_system_requirements("build").items()
+            if v.optional
+        }
 
     def add_warning(self, message: str) -> None:
         """Record a warning once. CI files repeat themselves a great deal."""

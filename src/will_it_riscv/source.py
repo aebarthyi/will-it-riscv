@@ -225,6 +225,27 @@ def check_submodules(root: Path) -> list[str]:
     return warnings
 
 
+def _cmake_symbols(members: list) -> object:
+    """Learn every CMake option default before judging any condition.
+
+    Options are routinely declared in one file and tested in another, so a
+    single pass would call half of them unknown.
+    """
+    from .cmake_conditions import collect_symbols
+    from .sdist import _is_skipped, _is_vendored
+
+    def texts():
+        for path, read in members:
+            name = path.rsplit("/", 1)[-1].lower()
+            if name != "cmakelists.txt" and not name.endswith(".cmake"):
+                continue
+            if _is_skipped(path) or _is_vendored(path):
+                continue
+            yield read().decode("utf-8", errors="replace")
+
+    return collect_symbols(texts())
+
+
 def inspect_repository(
     root: Path,
     policy: Optional[ScanPolicy] = None,
@@ -244,6 +265,8 @@ def inspect_repository(
     result = SdistInspection(profile=inspection.profile)
     members = list(iter_directory(root))
     inspection.files_scanned = len(members)
+    if policy.cmake_symbols is None:
+        policy.cmake_symbols = _cmake_symbols(members)
     scan_members(members, result, record, policy)
 
     if scan_ci:

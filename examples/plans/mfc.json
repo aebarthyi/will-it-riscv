@@ -141,6 +141,15 @@
       "evidence": [
         {"at": "toolchain/mfc/build.py:585", "quote": "SYSCHECK = MFCTarget(\"syscheck\", [\"-DMFC_SYSCHECK=ON\"]"}
       ]
+    },
+    {
+      "id": "build",
+      "kind": "python-run",
+      "after": ["toolchain"],
+      "note": "what ./mfc.sh build hands over to, once the toolchain is installed: it configures, builds and installs every default target and the dependencies they need",
+      "script": "toolchain/main.py",
+      "args": ["build", "-j", "1"],
+      "evidence": [{"at": "mfc.sh:93", "quote": "python3 \"$(pwd)/toolchain/main.py\" \"$@\""}]
     }
   ],
   "unsure": [

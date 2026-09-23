@@ -460,13 +460,13 @@ def _run_plan(
             if args.quiet:
                 result = planrun.execute(
                     plan, root, index=index, target=target, distro=distro,
-                    timeout=args.pseudobuild_timeout,
+                    timeout=args.pseudobuild_timeout, pip_cache=cache.root / "pip",
                 )
             else:
                 with stderr.status(f"running {plan.repo}'s plan…") as status:
                     result = planrun.execute(
                         plan, root, index=index, target=target, distro=distro,
-                        timeout=args.pseudobuild_timeout,
+                        timeout=args.pseudobuild_timeout, pip_cache=cache.root / "pip",
                         progress=lambda what: status.update(f"{plan.repo}: {what}"),
                     )
         except IndexError_ as exc:

@@ -7,6 +7,8 @@ answered the cheapest way that is still honest:
   system-packages   looked up in the distro's riscv64 archive
   cmake-configure   configured for real, confined to an empty sysroot that
                     grows a stub for whatever the configure insists on
+  python-run        the project's own build driver, run on the host with its
+                    build tools shimmed, to see which packages it imports
 
 Every step's asks land in one graph, keyed by ecosystem so that PyPI's numpy
 and Debian's python3-numpy stay two things. A requirement that an earlier
@@ -23,11 +25,20 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 from packaging.utils import canonicalize_name
 
+from . import drive
 from . import graph as depgraph
 from .analyze import Analyzer
 from .inputs import load
 from .models import Verdict
-from .plan import CMAKE_CONFIGURE, PYTHON_INSTALL, SYSTEM_PACKAGES, Plan, Step, check_evidence
+from .plan import (
+    CMAKE_CONFIGURE,
+    PYTHON_INSTALL,
+    PYTHON_RUN,
+    SYSTEM_PACKAGES,
+    Plan,
+    Step,
+    check_evidence,
+)
 from .pseudobuild import PseudoBuild
 from .pseudobuild import run as run_pseudobuild
 
@@ -72,6 +83,12 @@ class DepNode:
     """The distro package that provides it for the target, when one does."""
     provided_by: Optional[str] = None
     """The id of the step that makes it exist, when the plan does."""
+    usage: Optional[str] = None
+    """For a Python package, once the build driver has run: ``imported`` by
+    the build, ``declared`` by something it imports but never loaded itself,
+    or ``unused``. None when nothing ran that could tell."""
+    declared_by: list[str] = field(default_factory=list)
+    """The imported packages that bring it in, when its usage is declared."""
 
 
 @dataclass
@@ -84,6 +101,9 @@ class StepResult:
     analysis: Optional[Analysis] = None
     pseudobuild: Optional[PseudoBuild] = None
     graph: Optional[depgraph.Graph] = None
+    trace: Optional[drive.DriverTrace] = None
+    plan_check: list[str] = field(default_factory=list)
+    """For a python-run: how the configures it ran compare with the plan's."""
 
 
 @dataclass
@@ -92,7 +112,13 @@ class PlanAnswer:
     """``yes``, ``yes-after-source-builds``, ``probably``, ``no`` or ``unknown``."""
     headline: str
     blockers: list[str] = field(default_factory=list)
+    """Nothing for the target, and the build needs it -- or nothing ran to say."""
+    as_written: list[str] = field(default_factory=list)
+    """Nothing for the target, installed as the plan is written, and never
+    imported by the build: jaxlib, which MFC's pyrometheus declares."""
     from_source: list[str] = field(default_factory=list)
+    unused_from_source: list[str] = field(default_factory=list)
+    """To build from source only because the install brings them; never used."""
     install: list[str] = field(default_factory=list)
 
 
@@ -106,6 +132,8 @@ class PlanResult:
     """``(from, to)``: from a step (``step:<id>``) or a node, to a node."""
     evidence_problems: list[str] = field(default_factory=list)
     answer: Optional[PlanAnswer] = None
+    used_as_provided: set = field(default_factory=set)
+    """Python packages a later step used for what they provide: fypp."""
 
     def why(self, node_id: str) -> list[str]:
         """The shortest chain from a step to this node: step, ..., node."""
@@ -139,6 +167,7 @@ def execute(
     distro: Optional[DistroIndex] = None,
     timeout: int = 600,
     progress: Optional[Callable[[str], None]] = None,
+    pip_cache: Optional[Path] = None,
 ) -> PlanResult:
     """Run every step, in order, and join what they need into one graph."""
     root = Path(root)
@@ -152,6 +181,8 @@ def execute(
             outcome = _python_install(step, root, index, target, distro, result)
         elif step.kind == SYSTEM_PACKAGES:
             outcome = _system_packages(step, distro, result)
+        elif step.kind == PYTHON_RUN:
+            outcome = _python_run(step, root, result, timeout, pip_cache, progress)
         else:
             assert step.kind == CMAKE_CONFIGURE
             outcome = _cmake_configure(
@@ -164,6 +195,8 @@ def execute(
             for name in outcome.analysis.packages:
                 provided.setdefault(_normal(name), step.id)
 
+    _plan_check(result)
+    _usage(result)
     result.answer = _answer(result)
     return result
 
@@ -268,6 +301,151 @@ def _system_packages(
     return StepResult(step, "done", detail)
 
 
+def _python_run(
+    step: Step, root: Path, result: PlanResult, timeout: int,
+    pip_cache: Optional[Path], progress: Optional[Callable[[str], None]],
+) -> StepResult:
+    """The project's own build driver, run on the host with its tools shimmed."""
+    assert step.script is not None
+    if not (root / step.script).is_file():
+        return StepResult(step, "failed", f"no {step.script} in the repository")
+    dists = {n.name: n.version for n in result.nodes.values() if n.ecosystem == "pypi"}
+    trace = drive.trace(
+        root, step.script, step.args, dists, timeout=timeout, pip_cache=pip_cache,
+        progress=progress,
+    )
+    here = f"step:{step.id}"
+    known = {canonicalize_name(name) for name in dists}
+    for dist in sorted(trace.imported & known):
+        _edge(result, here, f"pypi:{dist}")
+    status = "stopped" if trace.error else "done"
+    detail = (
+        f"imported {len(trace.imported & known)} of the {len(known)} packages the plan "
+        f"installs; called build tools {len(trace.commands)} times"
+    )
+    if trace.error:
+        detail += f"; {trace.error}"
+    elif trace.returncode not in (0, None):
+        detail += f"; the driver exited with {trace.returncode}"
+    return StepResult(step, status, detail, trace=trace)
+
+
+def _traced(outcome: StepResult) -> bool:
+    """A driver run that went to the end: only then is "never imported" true."""
+    trace = outcome.trace
+    return trace is not None and not trace.error and trace.returncode == 0
+
+
+def _usage(result: PlanResult) -> None:
+    """Which Python packages the build uses, from what its driver imported.
+
+    Imported is used. Declared by something imported, and never loaded, is
+    installed as written but not needed by the build: pyrometheus brings
+    jaxlib, and MFC's build never touches it. Anything else is unused -- but
+    only once a driver run went to the end; a run that stopped early proves
+    nothing about what it would have imported next.
+    """
+    runs = [s for s in result.steps if s.trace is not None]
+    if not runs:
+        return
+    imported = {f"pypi:{d}" for s in runs if s.trace is not None for d in s.trace.imported}
+    imported |= {
+        n.id for n in result.nodes.values()
+        if n.ecosystem == "pypi" and n.id in result.used_as_provided
+    }
+    children: dict[str, list[str]] = {}
+    for source, target in result.edges:
+        if source.startswith("pypi:") and target.startswith("pypi:"):
+            children.setdefault(source, []).append(target)
+    declared: dict[str, list[str]] = {}
+    for origin in sorted(imported):
+        frontier = list(children.get(origin, []))
+        seen: set = set()
+        while frontier:
+            node_id = frontier.pop()
+            if node_id in seen or node_id in imported:
+                continue
+            seen.add(node_id)
+            declared.setdefault(node_id, [])
+            if origin not in declared[node_id]:
+                declared[node_id].append(origin)
+            frontier += children.get(node_id, [])
+    complete = all(_traced(s) for s in runs)
+    for node in result.nodes.values():
+        if node.ecosystem != "pypi":
+            continue
+        if node.id in imported:
+            node.usage = "imported"
+        elif node.id in declared:
+            node.usage = "declared"
+            node.declared_by = [
+                result.nodes[d].name for d in declared[node.id] if d in result.nodes
+            ]
+        elif complete:
+            node.usage = "unused"
+
+
+def _plan_check(result: PlanResult) -> None:
+    """Hold the configures the driver actually ran up against the plan's.
+
+    The plan says MFC's post_process target is configured with
+    -DMFC_POST_PROCESS=ON; the driver either did that or it did not.
+    """
+    planned = [s for s in result.plan.steps if s.kind == CMAKE_CONFIGURE]
+    for outcome in result.steps:
+        trace = outcome.trace
+        if trace is None:
+            continue
+        observed = [_configure_of(argv) for tool, argv in trace.commands if tool == "cmake"]
+        configures = [c for c in observed if c is not None]
+        matched: set = set()
+        unplanned: list[str] = []
+        for source, defines in configures:
+            hits = [
+                s.id for s in planned
+                if _same_source(s.source, source)
+                and all(defines.get(k) == v for k, v in s.defines.items())
+            ]
+            if hits:
+                matched.update(hits)
+            else:
+                flags = " ".join(f"-D{k}={v}" for k, v in sorted(defines.items()) if "MFC_" in k
+                                 or k == "CMAKE_BUILD_TYPE")
+                unplanned.append(f"{source} {flags}".strip())
+        checks = [f"ran {len(configures)} configure{'s' if len(configures) != 1 else ''}; "
+                  f"{len(matched)} of the plan's {len(planned)} cmake steps match"]
+        checks += [f"the plan has {s.id!r}, which the driver never configured"
+                   for s in planned if s.id not in matched]
+        checks += [f"the driver configured {u}, which no plan step does" for u in unplanned]
+        outcome.plan_check = checks
+
+
+def _configure_of(argv: list[str]) -> Optional[tuple[str, dict]]:
+    """``(source, -D flags)`` for a cmake configure; None for --build and friends."""
+    if not argv or argv[0].startswith(("--build", "--install", "-E", "--version", "-P")):
+        return None
+    source = None
+    defines: dict[str, str] = {}
+    for index, arg in enumerate(argv):
+        if arg == "-S" and index + 1 < len(argv):
+            source = argv[index + 1]
+        elif arg.startswith("-S") and len(arg) > 2:
+            source = arg[2:]
+        elif arg.startswith("-D") and "=" in arg:
+            name, value = arg[2:].split("=", 1)
+            defines[name.split(":", 1)[0]] = value
+    if source is None:
+        return None
+    return source, defines
+
+
+def _same_source(planned: str, observed: str) -> bool:
+    def norm(path: str) -> str:
+        path = path.strip().rstrip("/")
+        return "." if path in ("", ".", "./") else path.removeprefix("./")
+    return norm(planned) == norm(observed)
+
+
 def _cmake_configure(
     step: Step, plan: Plan, root: Path, target: Target, distro: Optional[DistroIndex],
     timeout: int, provided: dict[str, str], result: PlanResult,
@@ -287,7 +465,12 @@ def _cmake_configure(
         node.required = node.required or needed
         if step.id not in node.steps:
             node.steps.append(step.id)
-        _settle(node, *_cmake_tier(gnode, provided))
+        tier, detail, by = _cmake_tier(gnode, provided)
+        _settle(node, tier, detail, by)
+        if tier == PROVIDED and needed:
+            for name in [gnode.key, gnode.name, *gnode.aliases]:
+                if f"pypi:{canonicalize_name(name)}" in result.nodes:
+                    result.used_as_provided.add(f"pypi:{canonicalize_name(name)}")
         if node.tier == BINARY:
             node.package = node.package or gnode.available
     for parent, child in graph.edges:
@@ -324,11 +507,21 @@ def _cmake_tier(
 
 def _answer(result: PlanResult) -> PlanAnswer:
     required = [n for n in result.nodes.values() if n.required]
-    blockers = sorted(n.id for n in required if n.tier == NONE)
-    from_source = sorted(n.id for n in required if n.tier == SOURCE)
+    stuck = sorted(n.id for n in required if n.tier == NONE)
+    # A package the build never imports blocks the install as written, not
+    # the build: say which, and why, rather than folding it into "no".
+    as_written = [b for b in stuck if result.nodes[b].usage in ("declared", "unused")]
+    blockers = [b for b in stuck if b not in as_written]
+    source = sorted(n.id for n in required if n.tier == SOURCE)
+    unused_from_source = [n for n in source if result.nodes[n].usage == "unused"]
+    from_source = [n for n in source if n not in unused_from_source]
     unknown = sorted(n.id for n in required if n.tier == UNKNOWN)
     install = sorted({n.package for n in required if n.tier == BINARY and n.package})
     stopped = [s for s in result.steps if s.status in ("stopped", "failed")]
+    lists: dict = {
+        "blockers": blockers, "as_written": as_written, "from_source": from_source,
+        "unused_from_source": unused_from_source, "install": install,
+    }
     if blockers:
         names = ", ".join(result.nodes[b].name for b in blockers[:5])
         more = f" and {len(blockers) - 5} more" if len(blockers) > 5 else ""
@@ -336,33 +529,44 @@ def _answer(result: PlanResult) -> PlanAnswer:
             "no",
             f"{names}{more}: required, and nothing for the target in the index or "
             "archive checked",
-            blockers, from_source, install,
+            **lists,
+        )
+    if as_written:
+        reasons = "; ".join(_why_unneeded(result.nodes[b]) for b in as_written[:3])
+        return PlanAnswer(
+            "no-as-written",
+            f"the install fails on {', '.join(result.nodes[b].name for b in as_written[:5])}, "
+            f"which has nothing for the target — but the build never imports it: {reasons}",
+            **lists,
         )
     if stopped:
         first = stopped[0]
         return PlanAnswer(
-            "unknown",
-            f"step {first.step.id!r} {first.status}: {first.detail}",
-            blockers, from_source, install,
+            "unknown", f"step {first.step.id!r} {first.status}: {first.detail}", **lists
         )
     if from_source:
         return PlanAnswer(
             "yes-after-source-builds",
             f"every step completes, once {len(from_source)} "
             f"package{'s' if len(from_source) != 1 else ''} are built from source",
-            blockers, from_source, install,
+            **lists,
         )
     if unknown:
         return PlanAnswer(
             "probably",
             f"every step completes; {len(unknown)} requirement"
             f"{'s' if len(unknown) != 1 else ''} could not be checked",
-            blockers, from_source, install,
+            **lists,
         )
     return PlanAnswer(
-        "yes", "every step completes, and everything it needs exists for the target",
-        blockers, from_source, install,
+        "yes", "every step completes, and everything it needs exists for the target", **lists
     )
+
+
+def _why_unneeded(node: DepNode) -> str:
+    if node.usage == "declared" and node.declared_by:
+        return f"{', '.join(node.declared_by)} declares it"
+    return "nothing the build imports needs it"
 
 
 # ------------------------------------------------------------------- output
@@ -373,7 +577,8 @@ _TIER_STYLE = {
 }
 _VERDICT_STYLE = {
     "yes": "bold green", "yes-after-source-builds": "bold yellow",
-    "probably": "bold yellow", "no": "bold red", "unknown": "bold magenta",
+    "probably": "bold yellow", "no": "bold red", "no-as-written": "bold red",
+    "unknown": "bold magenta",
 }
 
 
@@ -395,6 +600,17 @@ def render_text(result: PlanResult, console) -> None:
         line.append(f" {outcome.step.kind:<16} ")
         line.append(outcome.detail)
         console.print(line, highlight=False)
+    for outcome in result.steps:
+        for check in outcome.plan_check:
+            console.print(f"    plan check: {check}", style="dim", highlight=False)
+        trace = outcome.trace
+        if trace is not None and trace.not_in_plan:
+            console.print(
+                "    imported, and nothing in the plan provides it (stubbed): "
+                + ", ".join(trace.not_in_plan),
+                style="dim yellow",
+                highlight=False,
+            )
     for problem in result.evidence_problems:
         console.print(f"  evidence: {problem}", style="yellow", highlight=False)
     console.print()
@@ -415,10 +631,18 @@ def render_text(result: PlanResult, console) -> None:
             node = result.nodes[node_id]
             chain = " → ".join(_label(result, n) for n in result.why(node_id))
             console.print(f"    • {node.id:<28} {node.detail}", highlight=False)
-            console.print(f"      {chain}", style="dim", highlight=False)
+            console.print(f"      {chain}{_usage_note(node)}", style="dim", highlight=False)
 
     show("nothing public for the target", answer.blockers, "bold red")
+    show("nothing public, but the build never imports it", answer.as_written, "bold red")
     show("to build from source", answer.from_source, "bold yellow")
+    if answer.unused_from_source:
+        names = ", ".join(result.nodes[n].name for n in answer.unused_from_source)
+        console.print(
+            Text(f"  installed but never imported by the build ({len(answer.unused_from_source)})",
+                 style="bold"),
+        )
+        console.print(f"    {names}", style="dim", highlight=False)
     unknown = sorted(n.id for n in result.nodes.values() if n.required and n.tier == UNKNOWN)
     show("not settled", unknown, "bold magenta")
     provided = sorted(n.id for n in result.nodes.values() if n.required and n.tier == PROVIDED)
@@ -435,6 +659,16 @@ def render_text(result: PlanResult, console) -> None:
         style="dim",
     )
     console.print()
+
+
+def _usage_note(node: DepNode) -> str:
+    if node.usage == "imported":
+        return "   · imported by the build"
+    if node.usage == "declared":
+        return f"   · never imported; declared by {', '.join(node.declared_by)}"
+    if node.usage == "unused":
+        return "   · never imported by the build"
+    return ""
 
 
 def _label(result: PlanResult, node_id: str) -> str:
@@ -454,7 +688,9 @@ def to_dict(result: PlanResult) -> dict:
                 "verdict": answer.verdict,
                 "headline": answer.headline,
                 "blockers": answer.blockers,
+                "as_written": answer.as_written,
                 "from_source": answer.from_source,
+                "unused_from_source": answer.unused_from_source,
                 "install": answer.install,
             }
             if answer else None
@@ -468,6 +704,20 @@ def to_dict(result: PlanResult) -> dict:
                 "detail": s.detail,
                 "hard_requirements": (
                     [s.graph.nodes[k].name for k in s.graph.order] if s.graph else []
+                ),
+                "plan_check": s.plan_check,
+                "trace": (
+                    {
+                        "imported": sorted(s.trace.imported),
+                        "installed_for_the_host": s.trace.installed,
+                        "not_in_plan": s.trace.not_in_plan,
+                        "stubbed": s.trace.stubbed,
+                        "made": s.trace.made,
+                        "rounds": s.trace.rounds,
+                        "returncode": s.trace.returncode,
+                        "commands": [{"tool": t, "argv": a} for t, a in s.trace.commands],
+                    }
+                    if s.trace else None
                 ),
             }
             for s in result.steps
@@ -484,6 +734,8 @@ def to_dict(result: PlanResult) -> dict:
                 "steps": n.steps,
                 "package": n.package,
                 "provided_by": n.provided_by,
+                "usage": n.usage,
+                "declared_by": n.declared_by,
                 "why": result.why(n.id),
             }
             for n in sorted(result.nodes.values(), key=lambda n: n.id)
@@ -524,9 +776,11 @@ def to_dot(result: PlanResult, required_only: bool = True) -> str:
             continue
         label = f"{node.name}\n{node.ecosystem}" + (f" {node.version}" if node.version else "")
         font = ', fontcolor="white"' if node.tier == NONE else ""
+        faded = ', style="rounded,filled,dashed", color="#9a9a9a"' if node.usage == "unused" else ""
+        tip = f"{node.tier}: {node.detail}" + (f" · {node.usage}" if node.usage else "")
         lines.append(
             f"  {_quote(node.id)} [label={_quote(label)}, fillcolor=\"{_FILL[node.tier]}\""
-            f"{font}, tooltip={_quote(f'{node.tier}: {node.detail}')}];"
+            f"{font}{faded}, tooltip={_quote(tip)}];"
         )
     for step in result.plan.steps:
         for before in step.after:

@@ -231,16 +231,23 @@ Steps
   ...
   ✓ simulation               cmake-configure  4 rounds: fypp → MPI → FFTW
   ✓ post_process             cmake-configure  7 rounds: fypp → MPI → SILO → HDF5 → FFTW → LAPACK
+  ✓ build                    python-run       imported 14 of the 115 packages the plan installs;
+                                              called build tools 24 times
+    plan check: ran 8 configures; 8 of the plan's 8 cmake steps match
 
-  Will it riscv?  NO — jaxlib: required, and nothing for the target in the index or archive checked
+  Will it riscv?  NO-AS-WRITTEN — the install fails on jaxlib, which has nothing for the target —
+                  but the build never imports it: pyrometheus declares it
 
-  nothing public for the target (1)
+  nothing public, but the build never imports it (1)
     • pypi:jaxlib    publishes binary wheels, but none for riscv64 (...)
-      toolchain → pyrometheus → jaxlib
-  to build from source (18)
+      toolchain → pyrometheus → jaxlib   · never imported; declared by pyrometheus
+  to build from source (6)
     • pypi:numpy     publishes binary wheels, but none for riscv64 (...); Debian 13 (trixie)
                      ships python3-numpy for riscv64
+      toolchain → numpy   · imported by the build
     ...
+  installed but never imported by the build (12)
+    contourpy, ffmt, h5py, imageio-ffmpeg, matplotlib, orjson, pandas, pillow, ...
   provided by the plan itself (5)
     • FFTW           provided by step 'dep-fftw'
     • fypp           provided by step 'toolchain'
@@ -252,6 +259,7 @@ Steps
 | `python-install` | resolved against the index for the target's wheel tags — never installed |
 | `system-packages` | looked up in the distro's riscv64 archive |
 | `cmake-configure` | configured for real, with the plan's `-D` flags, confined to an empty sysroot that grows a stub for whatever the configure insists on |
+| `python-run` | the project's own build driver, run on the host from a copy-on-write clone, with its build tools shimmed and every import it makes recorded |
 
 **Nothing is emulated.** The sandbox is a pretend environment: whatever a
 configure looks for, it is made to see, and whatever it complains about next
@@ -268,6 +276,25 @@ installs; it wants FFTW, which the dependency target builds from source — is
 resolved to that step rather than looked for in the archive, and it stays off
 the install line. `-f dot` draws it: a node per dependency, coloured by how it
 can be had, with a dashed edge from whichever step provides it.
+
+**What the build imports is what it needs.** `./mfc.sh build` installs 115
+Python packages and then hands over to `toolchain/main.py`, which loads its
+modules lazily. So whether MFC needs jax to build has an exact answer: run
+the driver and watch. It runs in a copy-on-write clone of the repository,
+with `HOME` in scratch, and with cmake, make, the compilers and MPI wrappers
+replaced by shims that record their arguments and report success — nothing
+is compiled. An import it cannot satisfy is installed for the host at the
+version the plan resolved, or, if the plan provides nothing for it, stubbed;
+then it runs again, the way a configure is unblocked. It sees only the
+standard library and what it was given, never this tool's own packages.
+
+MFC's build imports 14 of the 115 — pyrometheus among them, which it uses to
+generate chemistry code — and never jax or jaxlib. Its driver ran exactly
+the 8 configures the plan lists, with the same `-DMFC_*` flags. So the
+verdict splits: jaxlib blocks the install as written, because pyrometheus
+declares it, but not the build, which never loads it. A package is only ever
+called unused after a driver run that went to the end; one that stopped
+early proves nothing about what it would have imported next.
 
 A plan is what a model is for. Reading a README, a CI workflow and a
 bootstrap script, and writing down what they run, needs no knowledge of

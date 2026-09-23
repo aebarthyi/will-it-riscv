@@ -27,11 +27,12 @@ PLAN_VERSION = 1
 PYTHON_INSTALL = "python-install"
 SYSTEM_PACKAGES = "system-packages"
 CMAKE_CONFIGURE = "cmake-configure"
-STEP_KINDS = (PYTHON_INSTALL, SYSTEM_PACKAGES, CMAKE_CONFIGURE)
+PYTHON_RUN = "python-run"
+STEP_KINDS = (PYTHON_INSTALL, SYSTEM_PACKAGES, CMAKE_CONFIGURE, PYTHON_RUN)
 
 _STEP_FIELDS = {
     "id", "kind", "evidence", "after", "note", "provides",
-    "manifest", "extras", "packages", "source", "defines",
+    "manifest", "extras", "packages", "source", "defines", "script", "args",
 }
 _PLAN_FIELDS = {"version", "repo", "entry", "steps", "unsure"}
 _EVIDENCE = re.compile(r"^(?P<path>[^:]+):(?P<start>\d+)(?:-(?P<end>\d+))?$")
@@ -80,6 +81,10 @@ class Step:
     """cmake-configure: the source directory, relative to the repository."""
     defines: dict[str, str] = field(default_factory=dict)
     """cmake-configure: the -D flags the build itself passes."""
+    script: Optional[str] = None
+    """python-run: the project's own build driver, relative to the repository."""
+    args: list[str] = field(default_factory=list)
+    """python-run: what it is run with -- MFC's ``build -j 1``."""
 
 
 @dataclass
@@ -214,6 +219,13 @@ def _step(raw: Any, index: int, problems: list[str]) -> Optional[Step]:
         step.packages = _strings(raw.get("packages", []), f"{where}: 'packages'", problems)
         if not step.packages:
             problems.append(f"{where}: a system-packages step lists its 'packages'")
+    elif kind == PYTHON_RUN:
+        script = raw.get("script")
+        if not isinstance(script, str) or not script:
+            problems.append(f"{where}: a python-run names its 'script'")
+        else:
+            step.script = script
+        step.args = _strings(raw.get("args", []), f"{where}: 'args'", problems)
     else:
         source = raw.get("source", ".")
         if not isinstance(source, str):
@@ -375,6 +387,8 @@ PLAN_SCHEMA: dict = {
                         "type": "object",
                         "additionalProperties": {"type": ["string", "boolean", "number"]},
                     },
+                    "script": {"type": "string"},
+                    "args": {"type": "array", "items": {"type": "string"}},
                 },
             },
         },

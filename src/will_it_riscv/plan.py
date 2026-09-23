@@ -32,8 +32,12 @@ STEP_KINDS = (PYTHON_INSTALL, SYSTEM_PACKAGES, CMAKE_CONFIGURE, PYTHON_RUN)
 
 _STEP_FIELDS = {
     "id", "kind", "evidence", "after", "note", "provides", "optional", "enabled_by",
-    "manifest", "extras", "packages", "source", "defines", "script", "args",
+    "manifest", "section", "extras", "packages", "source", "defines", "script", "args",
 }
+#: What a python-install resolves: a project's dependencies, or what its
+#: build needs -- [build-system].requires, which recursion into a fetched
+#: package cares about.
+SECTIONS = ("dependencies", "build-system")
 _PLAN_FIELDS = {"version", "repo", "entry", "steps", "unsure"}
 _EVIDENCE = re.compile(r"^(?P<path>[^:]+):(?P<start>\d+)(?:-(?P<end>\d+))?$")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -81,6 +85,9 @@ class Step:
     """What turns an optional step on: ``./mfc.sh build --gpu acc``."""
     manifest: Optional[str] = None
     """python-install: the pyproject.toml or requirements file installed."""
+    section: str = "dependencies"
+    """python-install: ``dependencies``, or ``build-system`` for what building
+    the project needs -- its [build-system].requires."""
     extras: list[str] = field(default_factory=list)
     packages: list[str] = field(default_factory=list)
     """system-packages: distro package names."""
@@ -241,11 +248,22 @@ def _step(raw: Any, index: int, problems: list[str]) -> Optional[Step]:
             problems.append(f"{where}: a python-install names its 'manifest'")
         else:
             step.manifest = manifest
+        section = raw.get("section", "dependencies")
+        if section not in SECTIONS:
+            problems.append(f"{where}: 'section' must be one of {', '.join(SECTIONS)}")
+        else:
+            step.section = section
         step.extras = _strings(raw.get("extras", []), f"{where}: 'extras'", problems)
     elif kind == SYSTEM_PACKAGES:
         step.packages = _strings(raw.get("packages", []), f"{where}: 'packages'", problems)
         if not step.packages:
             problems.append(f"{where}: a system-packages step lists its 'packages'")
+        for spec in step.packages:
+            if package_spec(spec) is None:
+                problems.append(
+                    f"{where}: {spec!r} is not a package name, or a name and a version "
+                    "it must be at least ('bazel-bootstrap>=8.7.0')"
+                )
     elif kind == PYTHON_RUN:
         script = raw.get("script")
         if not isinstance(script, str) or not script:
@@ -261,6 +279,20 @@ def _step(raw: Any, index: int, problems: list[str]) -> Optional[Step]:
             step.source = source
         step.defines = _defines(raw.get("defines", {}), where, problems)
     return step
+
+
+_PACKAGE_SPEC = re.compile(r"^([a-z0-9][a-z0-9+.-]*)\s*(?:(>=|==)\s*(\d[\w.+~-]*))?$")
+
+
+def package_spec(spec: str) -> Optional[tuple[str, Optional[str], Optional[str]]]:
+    """``bazel-bootstrap>=8.7.0`` as (name, operator, version).
+
+    A bare name comes back as (name, None, None).
+    """
+    match = _PACKAGE_SPEC.match(spec.strip())
+    if not match:
+        return None
+    return match.group(1), match.group(2), match.group(3)
 
 
 def _strings(value: Any, where: str, problems: list[str]) -> list[str]:
@@ -407,6 +439,7 @@ PLAN_SCHEMA: dict = {
                     "note": {"type": "string"},
                     "provides": {"type": "array", "items": {"type": "string"}},
                     "manifest": {"type": "string"},
+                    "section": {"enum": list(SECTIONS)},
                     "extras": {"type": "array", "items": {"type": "string"}},
                     "packages": {"type": "array", "items": {"type": "string"}},
                     "source": {"type": "string"},

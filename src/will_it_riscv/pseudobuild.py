@@ -37,6 +37,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 
+from .hostpython import HostPython
+
 TIMEOUT_SECONDS = 600
 
 #: Commands whose execution means the project asked the system for something.
@@ -123,6 +125,11 @@ class PseudoBuild:
     say, as ``(name, confirmed)``. Confirmed means the error moved once the
     suspect existed, which makes it a hard requirement shown by experiment."""
     notes: list = field(default_factory=list)
+    python_installed: list = field(default_factory=list)
+    """Build requirements put in for the host's interpreter because the
+    configure imported them, as ``name==version``."""
+    python_stubbed: list = field(default_factory=list)
+    """Modules the configure imported that were stubbed instead, with why."""
     narration: str = ""
     """The configure's own output, kept so the next round can read what it
     asked for. Not part of the report."""
@@ -187,6 +194,8 @@ _VAR_STEM = re.compile(
 _REQUIRED_FIND = re.compile(
     r"Could not find ([A-Za-z_][A-Za-z0-9_]*) using the following names:\s*([^\n]+)"
 )
+#: find_package(Boost 1.70 CONFIG REQUIRED), and nothing to find: cantera's.
+_NO_CONFIG = re.compile(r'Could not find a package configuration file provided by\s+"([^"]+)"')
 #: An error raised from inside a package's own Find module or config file is
 #: that package's error, even when its message never names it.
 _ERROR_FILE = re.compile(r"^\s*CMake Error at (\S+?):\d+")
@@ -240,6 +249,7 @@ def _stanza_blockers(stanza: str) -> list[str]:
     for match in _REQUIRED_FIND.finditer(stanza):
         first = match.group(2).split(",")[0].strip()
         names.append(first or match.group(1))
+    names += _NO_CONFIG.findall(re.sub(r"\s+", " ", stanza))
     if names:
         return names
     listing = False
@@ -570,6 +580,8 @@ def run(
     arch: str = "riscv64",
     confine: bool = True,
     defines: Optional[dict] = None,
+    python_dists: Optional[dict] = None,
+    pip_cache: Optional[Path] = None,
 ) -> Optional[PseudoBuild]:
     """Configure the project in a scratch directory, unblocking as it goes.
 
@@ -581,8 +593,10 @@ def run(
 
     ``timeout`` bounds the whole loop, not each round. ``defines`` are -D
     flags the build itself passes -- MFC's -DMFC_MPI=ON -- and are never
-    stubbed over. Returns None when there is nothing to do (no CMakeLists.txt
-    at the root).
+    stubbed over. ``python_dists`` is what the plan installs, name to
+    version: a configure that imports one of them from the interpreter it is
+    given gets it, for the host (see :mod:`hostpython`). Returns None when
+    there is nothing to do (no CMakeLists.txt at the root).
     """
     root = Path(root)
     if not (root / "CMakeLists.txt").exists():
@@ -604,8 +618,20 @@ def run(
         for directory in ("include", "lib/pkgconfig", "bin"):
             (sysroot / directory).mkdir(parents=True, exist_ok=True)
         env = _environment(scratch_path, deny_pkg_config, sysroot)
-        toolchain = _toolchain(scratch_path, sysroot, arch) if confine else None
+        toolchain = _toolchain(scratch_path, sysroot, arch, root) if confine else None
         aggregate.platform = f"linux/{arch}" if toolchain else "host"
+        # What the build fetches for itself, fetched once for every round:
+        # cantera would download eigen, yaml-cpp and SUNDIALS each time round.
+        given = {
+            "FETCHCONTENT_BASE_DIR": str(scratch_path / "_deps"),
+            "FETCHCONTENT_UPDATES_DISCONNECTED": "ON",
+        }
+        # The build host's Python, pinned from the start the way
+        # scikit-build-core pins it, so every import a configure makes of it
+        # is seen -- and answered.
+        interpreter = HostPython.create(scratch_path / "python", python_dists, pip_cache)
+        for prefix in ("Python", "Python3", "PYTHON"):
+            given[f"{prefix}_EXECUTABLE"] = str(interpreter.executable)
 
         for attempt in range(1, max_rounds + 1):
             left = timeout - (time.monotonic() - started)
@@ -614,14 +640,14 @@ def run(
                 break
             remaining = max(1, int(left))
             outcome = _configure(
-                root, scratch_path, {**overrides, **fixed}, env, remaining,
+                root, scratch_path, {**given, **overrides, **fixed}, env, remaining,
                 f"build-{attempt}", toolchain,
             )
             if attempt == 1 and toolchain and not outcome.completed and not outcome.probes:
                 # It would not even start as a cross build. A host answer is
                 # worse than a target one, but much better than none.
                 host = _configure(
-                    root, scratch_path, {**overrides, **fixed}, env, remaining,
+                    root, scratch_path, {**given, **overrides, **fixed}, env, remaining,
                     "build-host", None,
                 )
                 if host.completed or host.probes:
@@ -688,11 +714,32 @@ def run(
             fresh, created = _synthesize(
                 outcome.blocking, outcome.narration, sysroot, written,
                 shared_suffix=suffix, lookups=outcome.lookups,
+                interpreter=str(interpreter.executable),
             )
+            imported = interpreter.provide()
+            if imported and aggregate.round_blockers[-1] is None:
+                # Nothing CMake looked for stopped it: its own interpreter
+                # did, on an import. That is a build requirement, not a
+                # dependency of the target.
+                aggregate.round_blockers[-1] = f"import {imported[0]}"
+            if _OLD_POLICY.search(outcome.narration) and POLICY_MINIMUM not in fixed:
+                # CMake 4 dropped compatibility with projects that ask for
+                # less than 3.5; Debian 13's CMake is 3.31 and still has it.
+                # This is the host's CMake being newer, not a dependency.
+                fresh[POLICY_MINIMUM] = "3.5"
+                if aggregate.round_blockers[-1] is None:
+                    aggregate.round_blockers[-1] = "CMake < 3.5"
+                note = (
+                    f"{_policy_culprit(outcome.error)} asks for a CMake older than 3.5, "
+                    "which this host's CMake no longer accepts; it was configured "
+                    f"with -D{POLICY_MINIMUM}=3.5, as CMake itself suggests"
+                )
+                if note not in aggregate.notes:
+                    aggregate.notes.append(note)
             fresh = {
                 k: v for k, v in fresh.items() if overrides.get(k) != v and k not in fixed
             }
-            if not fresh and not created:
+            if not fresh and not created and not imported:
                 # The configure died without naming anything this can fake.
                 # Blame by experiment: stub the likeliest suspect and see.
                 trial = _next_trial(
@@ -705,6 +752,9 @@ def run(
             overrides.update(fresh)
             written.update(created)
             aggregate.unblocked = sorted(overrides)
+
+        aggregate.python_installed = list(interpreter.installed)
+        aggregate.python_stubbed = list(interpreter.stubbed)
 
     aggregate.blocking = aggregate.blockers[0] if aggregate.blockers else None
     # A blocker that a later round walked past is still a hard requirement,
@@ -923,6 +973,27 @@ def _stub_config_package(name: str, sysroot: Path, suffix: str) -> list[str]:
     return [str(config), str(version), str(library)]
 
 
+def _add_imported_target(config: Path, target: str, sysroot: Path, suffix: str) -> bool:
+    """Give a stub package config the imported target something links to."""
+    text = config.read_text()
+    if f"add_library({target} " in text:
+        return False
+    library = sysroot / "lib" / f"lib{target.split('::')[-1].lower()}{suffix}"
+    try:
+        library.touch()
+        config.write_text(
+            text
+            + f"if(NOT TARGET {target})\n"
+            + f"  add_library({target} UNKNOWN IMPORTED)\n"
+            + f'  set_target_properties({target} PROPERTIES IMPORTED_LOCATION "{library}"\n'
+            + f'    INTERFACE_INCLUDE_DIRECTORIES "{sysroot.as_posix()}/include")\n'
+            + "endif()\n"
+        )
+    except OSError:
+        return False
+    return True
+
+
 #: Just enough of omp.h for a check program to compile against.
 _OMP_H = """\
 /* stub emitted by will-it-riscv */
@@ -990,6 +1061,64 @@ _MPIF_H = """\
 """
 
 
+_PYTHON_PACKAGES = {"python", "python3", "pythonlibs", "python2"}
+
+
+def _stub_python(
+    narration: str, sysroot: Path, suffix: str, interpreter: Optional[str] = None
+) -> tuple[dict, list]:
+    """The target's Python headers and library, for one pinned interpreter.
+
+    A scikit-build-core package needs Development.Module: Python.h for the
+    target. Confined, there is none -- and FindPython recomputes its include
+    directories itself, so the way past is to give it the artifacts it looks
+    for. It also insists the interpreter it finds matches their version, so
+    the interpreter is pinned -- this one, as scikit-build-core pins the one
+    running the build -- and the headers are written at its version. A build
+    that wants NumPy's headers (cantera does) gets an include directory for
+    them too: numpy is one of its build requirements, which the plan resolves.
+    The interpreter is ``interpreter`` when given: this one, holding what the
+    configure imports (see :mod:`hostpython`).
+    """
+    import sys
+
+    major, minor, micro = (str(p) for p in sys.version_info[:3])
+    include = sysroot / "include" / f"python{major}.{minor}"
+    library = sysroot / "lib" / f"libpython{major}.{minor}{suffix}"
+    numpy_include = sysroot / "include" / "numpy-stub"
+    patchlevel = (
+        "/* stub emitted by will-it-riscv */\n"
+        f"#define PY_MAJOR_VERSION {major}\n#define PY_MINOR_VERSION {minor}\n"
+        f"#define PY_MICRO_VERSION {micro}\n"
+        f'#define PY_VERSION "{major}.{minor}.{micro}"\n'
+    )
+    stubs = {
+        include / "patchlevel.h": patchlevel,
+        include / "Python.h": '#include "patchlevel.h"\n',
+        # FindPython greps the ABI flags out of it; none set is CPython's default.
+        include / "pyconfig.h": "/* stub emitted by will-it-riscv */\n",
+    }
+    wants_numpy = "NumPy" in narration
+    if wants_numpy:
+        stubs[numpy_include / "numpy" / "arrayobject.h"] = "/* stub */\n"
+        stubs[numpy_include / "numpy" / "numpyconfig.h"] = "#define NPY_API_VERSION 0x00000013\n"
+    try:
+        for path, text in stubs.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        library.touch()
+    except OSError:
+        return {}, []
+    overrides: dict[str, str] = {}
+    for prefix in ("Python", "Python3", "PYTHON"):
+        overrides[f"{prefix}_EXECUTABLE"] = interpreter or sys.executable
+        overrides[f"{prefix}_INCLUDE_DIR"] = str(include)
+        overrides[f"{prefix}_LIBRARY"] = str(library)
+        if wants_numpy:
+            overrides[f"{prefix}_NumPy_INCLUDE_DIR"] = str(numpy_include)
+    return overrides, [*(str(p) for p in stubs), str(library)]
+
+
 def _stub_mpi(sysroot: Path, suffix: str) -> tuple[dict, list]:
     """MPI, answered the way FindMPI asks its own questions.
 
@@ -1025,7 +1154,11 @@ TOOLCHAIN = """\
 # nothing but what this scratch sysroot holds.
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR {arch})
-set(CMAKE_FIND_ROOT_PATH "{sysroot}")
+# The scratch tree and the source tree are roots too, but only so that a path
+# already inside one is searched as written: what the build fetched or made
+# for itself, and what the repository ships, is on the target's side. SUNDIALS
+# builds a Fortran library in its build tree and then looks for it there.
+set(CMAKE_FIND_ROOT_PATH "{sysroot};{scratch};{source}")
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
@@ -1042,13 +1175,16 @@ set(CMAKE_CROSSCOMPILING_EMULATOR "{emulator}")
 """
 
 
-def _toolchain(scratch: Path, sysroot: Path, arch: str) -> Path:
+def _toolchain(scratch: Path, sysroot: Path, arch: str, source: Path) -> Path:
     emulator = scratch / "run-on-host"
     emulator.write_text('#!/bin/sh\nexec "$@"\n')
     emulator.chmod(0o755)
     path = scratch / "toolchain.cmake"
     path.write_text(
-        TOOLCHAIN.format(arch=arch, sysroot=sysroot.as_posix(), emulator=emulator.as_posix())
+        TOOLCHAIN.format(
+            arch=arch, sysroot=sysroot.as_posix(), emulator=emulator.as_posix(),
+            scratch=scratch.as_posix(), source=Path(source).resolve().as_posix(),
+        )
     )
     return path
 
@@ -1082,8 +1218,10 @@ def _configure(
     command += [f"-D{key}={value}" for key, value in sorted(overrides.items())]
 
     try:
+        # No stdin: nothing a configure runs may sit waiting for input.
         process = subprocess.run(
-            command, capture_output=True, text=True, timeout=timeout, env=env
+            command, capture_output=True, text=True, timeout=timeout, env=env,
+            stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
         probes, traced = _parse_trace(trace, root)
@@ -1230,6 +1368,7 @@ def _synthesize(
     already: set,
     shared_suffix: Optional[str] = None,
     lookups: Optional[dict] = None,
+    interpreter: Optional[str] = None,
 ) -> tuple[dict, list]:
     """Work out what to fake so the next round gets further.
 
@@ -1251,6 +1390,11 @@ def _synthesize(
         variables: list[str] = []
         named = _ANY_MISS.search(stanza)
         package = named.group(1) if named else None
+        if package and package.lower() in _PYTHON_PACKAGES:
+            stubbed, files = _stub_python(narration, sysroot, suffix, interpreter)
+            overrides.update(stubbed)
+            created += [f for f in files if f not in already]
+            continue
         if package and package.split("_", 1)[0].lower() == "mpi":
             # FPHSA's "(missing: MPI_Fortran_FOUND Fortran)" names results,
             # not inputs; faking those gets nowhere. Answer FindMPI instead.
@@ -1279,9 +1423,22 @@ def _synthesize(
         # 1a. The variable a find_*(... REQUIRED) could not fill.
         for match in _REQUIRED_FIND.finditer(stanza):
             variables.append(match.group(1))
-        # 1b. The same, for a component a try_compile tried to link.
+        # 1b. The same, for a component a try_compile tried to link -- or,
+        #     for a package that is here as a stub config, the imported
+        #     target itself: Boost::headers, which cantera links.
         for match in _TARGET_NOT_FOUND.finditer(stanza):
-            variables += _component_variables(match.group(1), match.group(2))
+            package, component = match.group(1), match.group(2)
+            config = sysroot / "lib" / "cmake" / package / f"{package}Config.cmake"
+            if config.is_file():
+                if _add_imported_target(config, f"{package}::{component}", sysroot, suffix):
+                    created.append(f"{config}#{package}::{component}")
+            else:
+                variables += _component_variables(package, component)
+        # 1c. A config-mode package required and nowhere to be found.
+        for name in _NO_CONFIG.findall(re.sub(r"\s+", " ", stanza)):
+            config = sysroot / "lib" / "cmake" / name / f"{name}Config.cmake"
+            if not config.is_file():
+                created += _stub_config_package(name, sysroot, suffix)
         # 2. NOTFOUND variables the generate step refused.
         if _NOTFOUND_HEADER in stanza:
             for line in stanza.splitlines()[1:]:
@@ -1346,6 +1503,22 @@ def _component_variables(package: str, component: str) -> list[str]:
         f"{package}_{component.upper()}_LIBRARY",
     ]
     return list(dict.fromkeys(spellings))
+
+
+#: The escape hatch CMake 4 names when a project asks for a CMake < 3.5.
+POLICY_MINIMUM = "CMAKE_POLICY_VERSION_MINIMUM"
+_OLD_POLICY = re.compile(r"Compatibility with CMake < 3\.5 has been removed")
+
+
+def _policy_culprit(error: Optional[str]) -> str:
+    """Which project's cmake_minimum_required it was: yaml-cpp, fetched."""
+    match = re.search(r"/_deps/([A-Za-z0-9_.+-]+?)-src/", error or "")
+    if match:
+        return f"{match.group(1)} (fetched by the build)"
+    match = re.search(r"CMake Error at (?:\S*/)?([^/\s]+)/CMakeLists\.txt:\d+", error or "")
+    if match:
+        return f"its {match.group(1)}/ subdirectory"
+    return "the project"
 
 
 def _host_gaps(narration: str) -> list[str]:

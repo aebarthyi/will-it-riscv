@@ -253,7 +253,7 @@ def trace(
                 process = subprocess.run(
                     [sys.executable, "-S", str(bootstrap), str(tree / script), *args],
                     cwd=tree, env=env, capture_output=True, text=True,
-                    timeout=max(1, int(left)),
+                    timeout=max(1, int(left)), stdin=subprocess.DEVNULL,
                 )
                 result.returncode = process.returncode
                 result.tail = "\n".join(
@@ -393,11 +393,15 @@ def _write_shims(directory: Path) -> None:
         path.chmod(0o755)
 
 
-def _pip_install(spec: str, site: Path, cache: Optional[Path]) -> bool:
+def _pip_install(
+    spec: str, site: Path, cache: Optional[Path], wheels_only: bool = False
+) -> bool:
     command = [
         sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check",
         "--no-input", "--target", str(site), spec,
     ]
+    if wheels_only:
+        command.insert(-1, "--only-binary=:all:")
     env = dict(os.environ)
     if cache is not None:
         env["PIP_CACHE_DIR"] = str(cache)

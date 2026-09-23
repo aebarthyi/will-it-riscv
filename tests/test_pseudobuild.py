@@ -731,3 +731,123 @@ def test_an_error_summary_keeps_all_of_a_wrapped_message():
         "-- Configuring incomplete, errors occurred!\n"
     )
     assert _first_error(out, "").endswith("Please use NVIDIA or Cray compilers.")
+
+
+def test_python_is_answered_at_the_interpreters_version(tmp_path):
+    """FindPython holds the headers' version against the interpreter it found."""
+    overrides, created = synth(
+        "CMake Error at /usr/share/cmake/Modules/FindPackageHandleStandardArgs.cmake:290 "
+        "(message):\n"
+        "  Could NOT find Python (missing: Python_INCLUDE_DIRS Development.Module)\n"
+        '  (found version "3.14.3")\n',
+        tmp_path,
+    )
+    include = Path(overrides["Python_INCLUDE_DIR"])
+    assert include.name == "python3.14"
+    assert '#define PY_VERSION "3.14.3"' in (include / "patchlevel.h").read_text()
+    assert overrides["Python3_LIBRARY"].endswith("libpython3.14.so") or overrides[
+        "Python3_LIBRARY"].endswith("libpython3.14.dylib")
+    assert "Python_INCLUDE_DIRS" not in overrides   # FindPython's result, not its input
+
+
+# -- what a fetched package's configure needs --------------------------------
+
+
+@needs_cmake
+def test_a_config_mode_package_is_stubbed_with_the_targets_it_is_linked_by(tmp_path):
+    """cantera's Boost: config mode, REQUIRED, then linked as Boost::headers."""
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(demo NONE)\n"
+        "find_package(WirBoost CONFIG REQUIRED)\n"
+        "add_library(demo INTERFACE)\n"
+        "target_link_libraries(demo INTERFACE WirBoost::headers)\n"
+        "add_custom_target(uses ALL)\n"
+        "add_dependencies(uses demo)\n"
+    )
+    result = run(tmp_path, timeout=120)
+    assert result.completed, result.error
+    assert result.blockers == ["WirBoost"]
+
+
+def _cmake_major():
+    out = subprocess.run(["cmake", "--version"], capture_output=True, text=True).stdout
+    return int(out.split()[2].split(".")[0])
+
+
+@needs_cmake
+def test_an_old_cmake_minimum_is_the_hosts_cmake_not_a_dependency(tmp_path):
+    """CMake 4 refuses cmake_minimum_required(VERSION 2.8); Debian 13's 3.31 does not."""
+    if _cmake_major() < 4:
+        pytest.skip("this CMake still accepts old minimums")
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\nproject(demo NONE)\nadd_subdirectory(old)\n"
+    )
+    (tmp_path / "old").mkdir()
+    (tmp_path / "old" / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 2.8)\nproject(old NONE)\n"
+    )
+    result = run(tmp_path, timeout=120)
+    assert result.completed, result.error
+    assert result.blockers == []
+    assert "CMAKE_POLICY_VERSION_MINIMUM" in result.unblocked
+    assert any("old/ subdirectory" in note for note in result.notes)
+    assert result.round_blockers == ["CMake < 3.5", None]
+
+
+@needs_cmake
+def test_what_the_build_made_for_itself_can_be_found(tmp_path):
+    """SUNDIALS builds a library in its build tree and then looks for it there."""
+    (tmp_path / "vendored").mkdir()
+    (tmp_path / "vendored" / "vendored.h").write_text("")
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(demo NONE)\n"
+        'file(WRITE "${CMAKE_BINARY_DIR}/made/libflib.a" "")\n'
+        'find_library(FLIB flib "${CMAKE_BINARY_DIR}/made" NO_DEFAULT_PATH)\n'
+        'find_path(VENDORED vendored.h PATHS "${CMAKE_SOURCE_DIR}/vendored" NO_DEFAULT_PATH)\n'
+        'if(NOT FLIB OR NOT VENDORED)\n  message(FATAL_ERROR "${FLIB} ${VENDORED}")\nendif()\n'
+        "find_library(Z_LIB NAMES z c System)\n"
+        'if(Z_LIB)\n  message(FATAL_ERROR "found ${Z_LIB} on the host")\nendif()\n'
+    )
+    result = run(tmp_path, timeout=120)
+    assert result.completed, result.error
+    assert result.blockers == []
+
+
+_IMPORTS = (
+    "cmake_minimum_required(VERSION 3.18)\n"
+    "project(demo NONE)\n"
+    "find_package(Python REQUIRED COMPONENTS Interpreter)\n"
+    'execute_process(COMMAND "${Python_EXECUTABLE}" -c\n'
+    '  "import wirtestmod; print(wirtestmod.get_include())"\n'
+    "  OUTPUT_VARIABLE OUT COMMAND_ERROR_IS_FATAL ANY)\n"
+)
+
+
+@needs_cmake
+def test_what_a_configure_imports_with_no_plan_is_stubbed(tmp_path):
+    """ml-dtypes asks its interpreter for numpy's include directory."""
+    (tmp_path / "CMakeLists.txt").write_text(_IMPORTS)
+    result = run(tmp_path, timeout=120)
+    assert result.completed, result.error
+    assert result.python_stubbed == ["wirtestmod (no plan says which version)"]
+    assert result.round_blockers[0] == "import wirtestmod"
+
+
+@needs_cmake
+def test_what_a_configure_imports_is_installed_at_the_plans_version(tmp_path, monkeypatch):
+    from will_it_riscv import hostpython
+
+    def install(spec, site, cache, wheels_only=False):
+        (site / "wirtestmod.py").write_text("def get_include():\n    return '/inc'\n")
+        return True
+
+    monkeypatch.setattr(hostpython, "_pip_install", install)
+    (tmp_path / "CMakeLists.txt").write_text(
+        _IMPORTS + 'if(NOT OUT MATCHES "/inc")\n  message(FATAL_ERROR "got ${OUT}")\nendif()\n'
+    )
+    result = run(tmp_path, timeout=120, python_dists={"wirtestmod": "1.0"})
+    assert result.completed, result.error
+    assert result.python_installed == ["wirtestmod==1.0"]
+    assert result.python_stubbed == []

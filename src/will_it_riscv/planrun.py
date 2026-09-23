@@ -28,7 +28,7 @@ from packaging.utils import canonicalize_name
 from . import drive
 from . import graph as depgraph
 from .analyze import Analyzer
-from .inputs import load
+from .inputs import RootRequirements, load
 from .models import Verdict
 from .plan import (
     CMAKE_CONFIGURE,
@@ -38,6 +38,7 @@ from .plan import (
     Plan,
     Step,
     check_evidence,
+    package_spec,
 )
 from .pseudobuild import PseudoBuild
 from .pseudobuild import run as run_pseudobuild
@@ -64,6 +65,29 @@ NONE = "none"
 
 #: Provided beats everything: when the plan builds FFTW itself, the build does
 #: not use the distro's, whatever the archive has.
+#: When the archive lacks a tool, or has it too old: where else it can be had
+#: for the target. Curated, and kept short: checked September 2026.
+#:
+#: The Rust project's own releases include riscv64 toolchains (tier 2 with
+#: host tools), installed by rustup -- so Debian 13's rustc 1.85 being too
+#: old for a crate that wants 1.95 is not the end of it.
+UPSTREAM_BINARIES = {
+    "rustc": ("rustup", {"riscv64": "riscv64gc-unknown-linux-gnu",
+                         "aarch64": "aarch64-unknown-linux-gnu",
+                         "x86_64": "x86_64-unknown-linux-gnu"}),
+    "cargo": ("rustup", {"riscv64": "riscv64gc-unknown-linux-gnu",
+                         "aarch64": "aarch64-unknown-linux-gnu",
+                         "x86_64": "x86_64-unknown-linux-gnu"}),
+}
+#: Tools whose source is public but which publish no binaries for riscv64:
+#: they would have to be built from source first.
+UPSTREAM_SOURCE = {
+    "bazel-bootstrap": (
+        "Bazel publishes no riscv64 binaries; it has to be bootstrapped from its "
+        "source (github.com/bazelbuild/bazel) with a JDK"
+    ),
+}
+
 _RANK = {PROVIDED: -1, BINARY: 0, TOOLCHAIN: 0, SOURCE: 1, UNKNOWN: 2, NONE: 3}
 
 
@@ -194,7 +218,7 @@ def execute(
         else:
             assert step.kind == CMAKE_CONFIGURE
             outcome = _cmake_configure(
-                step, plan, root, target, distro, timeout, provided, result
+                step, plan, root, target, distro, timeout, provided, result, pip_cache
             )
         result.steps.append(outcome)
         for name in step.provides:
@@ -265,6 +289,15 @@ def _python_install(
         roots = load(root / step.manifest, tuple(step.extras))
     except (OSError, ValueError) as exc:
         return StepResult(step, "failed", f"{step.manifest}: {exc}")
+    if step.section == "build-system":
+        # What building it needs: its [build-system].requires, installed
+        # the way pip's build isolation would.
+        roots = RootRequirements(
+            source=roots.source, project_name=roots.project_name,
+            runtime=list(roots.build), warnings=roots.warnings,
+        )
+        if not roots.runtime:
+            return StepResult(step, "done", "declares no build requirements")
     analysis = Analyzer(index, target).run(roots)
     here = f"step:{step.id}"
     for report in analysis.packages.values():
@@ -298,20 +331,36 @@ def _system_packages(
 ) -> StepResult:
     checked = distro is not None and distro.available
     missing = 0
-    for package in step.packages:
+    for spec in step.packages:
+        parsed = package_spec(spec)
+        assert parsed is not None   # parse_plan checked
+        package, operator, wanted = parsed
         node = _node(result, f"debian:{package}", "debian", package)
         _need(node, step)
         node.steps.append(step.id)
         _edge(result, f"step:{step.id}", node.id)
-        if not checked:
+        if not checked or distro is None:
             _settle(node, UNKNOWN, "archive not checked")
-        elif distro is not None and distro.has(package):
-            _settle(node, BINARY, f"in {distro.spec.label} for {distro.arch}")
-            node.package = package
-        else:
-            missing += 1
-            label = distro.spec.label if distro is not None else "the archive"
-            _settle(node, NONE, f"not in {label} for {distro.arch if distro else 'the target'}")
+            continue
+        where = f"{distro.spec.label} for {distro.arch}"
+        have = distro.version(package) if wanted and distro.has(package) else None
+        shortfall = None
+        if not distro.has(package):
+            shortfall = f"not in {where}"
+        elif wanted and not _satisfies(have, operator, wanted):
+            # The name is there; the version the build pins is not.
+            shortfall = (
+                f"{where} has {have or 'an unknown version'}; the build wants "
+                f"{operator} {wanted}"
+            )
+        if shortfall is not None:
+            tier, detail = _elsewhere(package, distro.arch, shortfall)
+            if tier == NONE:
+                missing += 1
+            _settle(node, tier, detail)
+            continue
+        _settle(node, BINARY, f"in {where}" + (f", {have}" if have and wanted else ""))
+        node.package = package
     count = len(step.packages)
     detail = f"{count} package{'s' if count != 1 else ''}" + (
         f", {missing} missing" if missing else ""
@@ -469,12 +518,46 @@ def _same_source(planned: str, observed: str) -> bool:
     return norm(planned) == norm(observed)
 
 
+def _elsewhere(package: str, arch: str, shortfall: str) -> tuple[str, str]:
+    """Where a tool the archive cannot supply can be had instead, if anywhere."""
+    upstream = UPSTREAM_BINARIES.get(package)
+    if upstream is not None and arch in upstream[1]:
+        installer, triples = upstream
+        return BINARY, f"{shortfall}; {installer} ships {triples[arch]} toolchains"
+    if package in UPSTREAM_SOURCE:
+        return SOURCE, f"{shortfall}; {UPSTREAM_SOURCE[package]}"
+    return NONE, shortfall
+
+
+def _satisfies(have: Optional[str], operator: Optional[str], wanted: str) -> bool:
+    """Whether a Debian version meets ``>= wanted`` (or ``== wanted``)."""
+    from packaging.version import InvalidVersion, Version
+
+    from .distro import upstream_version
+
+    upstream = upstream_version(have) if have else None
+    if upstream is None:
+        return False
+    try:
+        mine, theirs = Version(upstream), Version(upstream_version(wanted) or wanted)
+    except InvalidVersion:
+        return False
+    return mine == theirs if operator == "==" else mine >= theirs
+
+
 def _cmake_configure(
     step: Step, plan: Plan, root: Path, target: Target, distro: Optional[DistroIndex],
     timeout: int, provided: dict[str, str], result: PlanResult,
+    pip_cache: Optional[Path] = None,
 ) -> StepResult:
     source = root / step.source
-    outcome = run_pseudobuild(source, timeout=timeout, arch=target.arch, defines=step.defines)
+    # What earlier steps installed is what the configure's interpreter can
+    # import: numpy, when a build requirement put it there.
+    dists = {n.name: n.version for n in result.nodes.values() if n.ecosystem == "pypi"}
+    outcome = run_pseudobuild(
+        source, timeout=timeout, arch=target.arch, defines=step.defines,
+        python_dists=dists, pip_cache=pip_cache,
+    )
     if outcome is None:
         return StepResult(step, "failed", f"no CMakeLists.txt in {step.source}")
     if outcome.error and not outcome.probes and not outcome.completed:
@@ -504,6 +587,8 @@ def _cmake_configure(
     status = "completed" if outcome.completed else "stopped"
     chain = " → ".join(graph.nodes[k].name for k in graph.order) or "nothing required"
     detail = f"{outcome.rounds} round{'s' if outcome.rounds != 1 else ''}: {chain}"
+    if outcome.python_installed:
+        detail += "; its interpreter imported " + ", ".join(outcome.python_installed)
     if not outcome.completed and outcome.error:
         detail += f"; stopped at {outcome.error}"
     return StepResult(step, status, detail, pseudobuild=outcome, graph=graph)

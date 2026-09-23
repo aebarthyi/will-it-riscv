@@ -37,7 +37,13 @@ UNKNOWN = "unknown"
 """Asked about, but the configure never finished, so its fate is open."""
 
 #: Provided by the target's compiler rather than by a package of its own.
-TOOLCHAIN = {"openmp": "the compiler (GCC's libgomp)"}
+TOOLCHAIN = {
+    "openmp": "the compiler (GCC's libgomp)",
+    # The target's own Python headers: python3-dev, wherever there is Python.
+    "python": "the target's Python (python3-dev)",
+    "python3": "the target's Python (python3-dev)",
+    "pythonlibs": "the target's Python (python3-dev)",
+}
 
 #: FindOpenMP, FindMPI and friends report per language: OpenMP_CXX is OpenMP.
 _LANGUAGE_SUFFIX = re.compile(r"_(C|CXX|Fortran|CUDA|HIP)$")

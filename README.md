@@ -136,6 +136,7 @@ Everything is driven by what the configure itself said:
 | `Could not find FYPP_EXE using the following names: fypp` | a runnable `fypp` — `find_program(… REQUIRED)`, and the same for libraries and paths |
 | `(missing: … SSL Crypto)`, or `links to: OpenSSL::SSL but the target was not found` | the component's `OPENSSL_SSL_LIBRARY` |
 | `The following required packages were not found: - libpsl` | a `libpsl.pc` in the only directory pkg-config may search |
+| `Could not find a package configuration file provided by "Boost"` | a `BoostConfig.cmake` in the sysroot, which then grows each imported target the build links: `Boost::headers` |
 | `file failed to open for reading: …/proj.h` | that header, carrying every common spelling of a version macro |
 | `… are set to NOTFOUND … FOO_LIBRARY linked by target` | the variable a target links |
 | `linux/fs.h header not found` | the header — reported as a **host gap**, not a dependency: every riscv64 Linux system has it; the Mac SDK does not |
@@ -322,6 +323,104 @@ say what the plan claims is reported before anything runs. `plan.PLAN_SCHEMA`
 is the same shape as a JSON Schema, for constraining whatever writes one.
 `examples/plans/mfc.json` is written by hand; every citation in it holds.
 
+### Recursion: down the tree, and back up
+
+A plan's answer stops at its frontier: what the default build requires that
+has only source, or nothing at all, for riscv64. `--recurse` gives each of
+those the root's treatment. It fetches the source at the version the plan
+resolved: the sdist, or, when there is none (jaxlib publishes only wheels),
+the repository the package's metadata names, checked out at the release tag.
+It plans the build from the package's own files, runs that plan in the same
+pretend environment, and repeats for whatever that leaves unresolved. Then
+it builds the answer back up from the leaves.
+
+```console
+$ will-it-riscv ~/src/MFC --plan examples/plans/mfc.json --recurse
+```
+```
+Recursion
+  fetched 19 packages and configured 2, in 42s
+  MFC
+  ├─ ~ cantera 3.2.0  probably — its configure completed; numpy could only be read   [sdist cantera-3.2.0.tar.gz]
+  │  │    installed first: libboost-all-dev, libhdf5-dev, liblapack-dev, libopenblas-dev, the target's Python (python3-dev)
+  │  └─ ~ numpy 2.5.3  probably — read, not configured: builds with meson   [sdist numpy-2.5.3.tar.gz]
+  ├─ ~ contourpy 1.4.0  probably — read, not configured: builds with meson   [sdist contourpy-1.4.0.tar.gz]
+  ├─ ...
+  ├─ ? jaxlib 0.11.2  unknown — needs bazel-bootstrap, which the target has only as source   [git https://github.com/jax-ml/jax@jax-v0.11.2]
+  │  └─ ? bazel-bootstrap  unknown — source only: Debian 13 (trixie) for riscv64 has 4.2.3+ds-11; the build
+  │                        wants >= 8.7.0; Bazel publishes no riscv64 binaries; it has to be bootstrapped from its
+  │                        source (github.com/bazelbuild/bazel) with a JDK (not recursed into yet)
+  ├─ ~ ml-dtypes 0.6.0  probably — its configure completed; numpy could only be read   [sdist ml_dtypes-0.6.0.tar.gz]
+  │  │    installed first: the target's Python (python3-dev)
+  │  └─ ~ numpy 2.5.3  (above)
+  ├─ ...
+  ├─ ~ orjson 3.12.0  probably — read, not configured: builds with cargo   [sdist orjson-3.12.0.tar.gz]
+  │       installed first: cargo, rustc (rustup)
+  ├─ ~ ruff 0.6.5  probably — read, not configured: builds with cargo   [sdist ruff-0.6.5.tar.gz]
+  │       installed first: cargo, rustc
+  ...
+
+  build order, dependencies first:
+    numpy 2.5.3 → cantera 3.2.0 → contourpy 1.4.0 → ffmt 0.4.5 → h5py 3.16.0 → imageio-ffmpeg 0.6.0 → jaxlib 0.11.2 → ...
+
+  Will it riscv, all the way down?  UNKNOWN — jaxlib could not be settled: jaxlib → bazel-bootstrap (...)
+```
+
+| status | meaning |
+| --- | --- |
+| `buildable` ✓ | its own configure ran to the end, and everything under it is buildable |
+| `probably` ~ | its build could only be read (Meson, Cargo and setuptools builds are not configured yet), and nothing under it is blocked |
+| `blocked` ✗ | something it requires has nothing public for the target |
+| `unknown` ? | a configure stopped, a fetch failed, a bootstrap cycle, or the budget ran out |
+
+The build order is a post-order walk of the tree, dependencies first, and
+that order is the port plan. *Installed first* is what each package's own
+plan found it needs before it can be built, beyond the Python packages
+already in the tree. That means archive packages, the target's Python, and
+any tool the archive has too old. orjson and typos declare `rust-version =
+"1.95"` and Debian 13 has rustc 1.85, so those two get rustc from rustup.
+ruff asks for 1.76, and Debian's rustc is enough.
+
+A fetched package's configure is where the pretend environment has to be
+most accommodating, because these configures lean on what pip's build
+isolation would have given them:
+
+- **Their Python is the build host's.** scikit-build-core pins the
+  interpreter running the build, and a configure asks it questions:
+  ml-dtypes runs `import numpy; print(numpy.get_include())` and stops if
+  that fails. So every configure is given this host's interpreter, run
+  without its own site-packages. When an import kills it, the module is
+  installed for the host at the version the plan resolved (from wheels
+  only, so no fetched `setup.py` ever runs), or stubbed if nothing says
+  which version. Then the configure runs again. An import the configure
+  catches and does without is left alone. This is a build tool on the
+  build host; nothing is run for riscv64.
+- **What they fetch is theirs.** cantera's configure fetches yaml-cpp,
+  Eigen and SUNDIALS with FetchContent. Each is downloaded once per run,
+  not once per round. yaml-cpp asks for a CMake older than 3.5, which
+  CMake 4 refuses and Debian 13's CMake 3.31 still accepts. That is a gap
+  in the host's CMake, not a dependency, so the configure is rerun with
+  `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` (CMake's own suggested fix) and a
+  note says so.
+- **What they build is on the target's side.** Confinement re-roots every
+  search into the empty sysroot. A path that already points into the
+  build tree or the source tree is searched as written, though. SUNDIALS
+  compiles a Fortran library in its build tree to work out name mangling,
+  then looks for it there; the host's own libraries stay out of reach.
+
+With those, cantera's configure goes Python → Boost → BLAS → HDF5 →
+completed in six rounds, and ml-dtypes' goes Python → numpy → completed.
+Both are only "probably" because numpy, which both build against, builds
+with Meson. jaxlib is where the answer stays open: jax pins Bazel 8.7.0 in
+`.bazelversion`, Debian 13 has 4.2.3 for riscv64, and Bazel publishes no
+riscv64 binaries. Bazel would have to be bootstrapped from source first, and
+the recursion does not follow a distro tool's source yet.
+
+**This runs the configures of everything it fetches.** They are third-party
+build scripts, run on this host: confined to a scratch sysroot, never
+compiled, never emulated, but run. `--recurse` is opt-in and bounded by
+`--recurse-depth` (3) and `--recurse-limit` (40 packages).
+
 ### Meson projects are asked, not guessed at
 
 `meson introspect --scan-dependencies` walks a project's `meson.build` files,
@@ -472,6 +571,9 @@ $ will-it-riscv --pseudobuild -f dot | dot -Tsvg > deps.svg
 # run a whole build plan, and draw the one graph all its steps make
 $ will-it-riscv ~/src/MFC --plan examples/plans/mfc.json -f dot | dot -Tsvg > mfc.svg
 
+# then fetch and configure whatever it needs from source, all the way down
+$ will-it-riscv ~/src/MFC --plan examples/plans/mfc.json --recurse
+
 # just the names of everything that is not pure Python
 $ will-it-riscv -f list
 ```
@@ -529,6 +631,10 @@ static inference from reading the archive. That is a deliberate trade: it runs
 anywhere in seconds, needs no emulator, and cannot execute a hostile `setup.py`.
 It also means a package reported as buildable can still fail on a detail no
 static read would catch. Treat the output as a work list, not a guarantee.
+`--pseudobuild`, `--plan` and `--recurse` go further. They run configures
+and build drivers, and `--recurse` runs those of every package it fetches.
+Nothing is compiled or emulated, but those scripts do run, so use them on
+code you would be willing to configure yourself.
 
 ### Build systems
 

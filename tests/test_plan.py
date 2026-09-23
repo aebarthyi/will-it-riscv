@@ -28,6 +28,7 @@ EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "plans" / "mfc.json
 class FakeDistro:
     def __init__(self, names):
         self.names_ = set(names)
+        self.versions_ = dict(names) if isinstance(names, dict) else {}
         self.spec = SimpleNamespace(label="Debian 13 (trixie)", id="debian:trixie")
         self.arch = "riscv64"
         self.available = True
@@ -37,6 +38,9 @@ class FakeDistro:
 
     def has(self, package):
         return package in self.names_
+
+    def version(self, package):
+        return self.versions_.get(package)
 
     def python_package(self, name):
         return None
@@ -243,6 +247,51 @@ def test_what_the_plan_builds_itself_is_not_installed(tmp_path, target):
     planrun._settle(node, planrun.PROVIDED, "provided by step 'dep-silo'", "dep-silo")
     assert (node.tier, node.package) == (planrun.PROVIDED, None)
     assert planrun._answer(result).install == []
+
+
+def test_a_tool_the_archive_has_too_old_is_source_only_when_upstream_ships_none(
+    tmp_path, target
+):
+    """jax pins Bazel 8.7.0; Debian 13's bazel-bootstrap is 4.2.3, and Bazel
+    publishes no riscv64 binaries -- it has to be bootstrapped from source."""
+    result = run_plan(tmp_path, target, plan({
+        "id": "tools", "kind": "system-packages", "packages": ["bazel-bootstrap>=8.7.0"],
+        "evidence": [],
+    }), distro=FakeDistro({"bazel-bootstrap": "4.2.3+ds-11"}))
+    node = result.nodes["debian:bazel-bootstrap"]
+    assert node.tier == planrun.SOURCE
+    assert "has 4.2.3+ds-11; the build wants >= 8.7.0" in node.detail
+    assert "bootstrapped from its source" in node.detail
+    assert result.answer.verdict == "yes-after-source-builds"
+
+
+def test_a_tool_the_archive_has_too_old_is_fine_when_upstream_ships_it(tmp_path, target):
+    """Debian 13's rustc is 1.85; orjson wants 1.95; rustup ships riscv64 toolchains."""
+    result = run_plan(tmp_path, target, plan({
+        "id": "tools", "kind": "system-packages", "packages": ["rustc>=1.95", "cargo"],
+        "evidence": [],
+    }), distro=FakeDistro({"rustc": "1.85.1+dfsg1-1", "cargo": "1.85.1+dfsg1-1"}))
+    rustc = result.nodes["debian:rustc"]
+    assert rustc.tier == planrun.BINARY
+    assert "rustup ships riscv64gc-unknown-linux-gnu" in rustc.detail
+    assert result.answer.install == ["cargo"]   # rustup is not apt
+
+
+def test_a_package_the_archive_has_too_old_and_nobody_else_ships_is_missing(tmp_path, target):
+    result = run_plan(tmp_path, target, plan({
+        "id": "tools", "kind": "system-packages", "packages": ["frobnicate>=9"],
+        "evidence": [],
+    }), distro=FakeDistro({"frobnicate": "2.0-1"}))
+    assert result.nodes["debian:frobnicate"].tier == planrun.NONE
+    assert result.answer.verdict == "no"
+
+
+def test_a_package_at_a_new_enough_version_is_fine(tmp_path, target):
+    result = run_plan(tmp_path, target, plan({
+        "id": "tools", "kind": "system-packages", "packages": ["rustc>=1.80"],
+        "evidence": [],
+    }), distro=FakeDistro({"rustc": "1.85.0+dfsg1-1"}))
+    assert result.nodes["debian:rustc"].tier == planrun.BINARY
 
 
 def test_a_plan_result_serialises(tmp_path, target):

@@ -101,6 +101,7 @@ class DistroIndex:
         self.spec = spec
         self.arch = arch
         self._names: Optional[set[str]] = None
+        self._versions: Optional[dict[str, str]] = None
         self.error: Optional[str] = None
 
     @property
@@ -112,13 +113,37 @@ class DistroIndex:
             return self._names
         if self.error is not None:
             return None
-        key = f"{self.spec.id}/{self.arch}/{','.join(self.spec.components)}"
-        cached = self.cache.get("distro", key, ttl=LONG_TTL)
+        cached = self.cache.get("distro", self._key, ttl=LONG_TTL)
         if cached is not None:
             self._names = set(cached.decode("utf-8").split("\n"))
             return self._names
+        self._download()
+        return self._names
 
+    def version(self, package: str) -> Optional[str]:
+        """The version the archive has, for a real package; None for a virtual one.
+
+        A name being there is not always enough: jax pins Bazel 8.7.0, and
+        Debian 13's bazel-bootstrap is 4.2.3.
+        """
+        if self._versions is None:
+            cached = self.cache.get("distro", self._key + "/versions", ttl=LONG_TTL)
+            if cached is not None:
+                self._versions = dict(
+                    line.split("\t", 1)
+                    for line in cached.decode("utf-8").split("\n") if "\t" in line
+                )
+            elif self.error is None:
+                self._download()
+        return (self._versions or {}).get(package)
+
+    @property
+    def _key(self) -> str:
+        return f"{self.spec.id}/{self.arch}/{','.join(self.spec.components)}"
+
+    def _download(self) -> None:
         collected: set[str] = set()
+        versions: dict[str, str] = {}
         suite = self.spec.id.split(":", 1)[1]
         for component in self.spec.components:
             url = (
@@ -129,33 +154,44 @@ class DistroIndex:
                 response = self.client.get(url, timeout=120.0, follow_redirects=True)
             except httpx.HTTPError as exc:
                 self.error = f"{url}: {exc}"
-                return None
+                return
             if response.status_code != 200:
                 if component == self.spec.components[0]:
                     self.error = (
                         f"{self.spec.label} has no {self.arch} port "
                         f"(HTTP {response.status_code} for {component})"
                     )
-                    return None
+                    return
                 continue
             try:
                 raw = gzip.decompress(response.content)
             except (OSError, EOFError) as exc:
                 self.error = f"{url}: {exc}"
-                return None
+                return
             collected.update(m.decode("utf-8") for m in _PACKAGE_LINE.findall(raw))
             for line in _PROVIDES_LINE.findall(raw):
                 for virtual in line.decode("utf-8").split(","):
                     name = virtual.strip().split(" ")[0]
                     if name:
                         collected.add(name)
+            current = None
+            for line in raw.split(b"\n"):
+                if line.startswith(b"Package: "):
+                    current = line[9:].strip().decode("utf-8")
+                elif line.startswith(b"Version: ") and current is not None:
+                    versions.setdefault(current, line[9:].strip().decode("utf-8"))
+                    current = None
 
         if not collected:
             self.error = f"{self.spec.label}: empty package index for {self.arch}"
-            return None
-        self.cache.put("distro", key, "\n".join(sorted(collected)).encode("utf-8"))
+            return
+        self.cache.put("distro", self._key, "\n".join(sorted(collected)).encode("utf-8"))
+        self.cache.put(
+            "distro", self._key + "/versions",
+            "\n".join(f"{k}\t{v}" for k, v in sorted(versions.items())).encode("utf-8"),
+        )
         self._names = collected
-        return self._names
+        self._versions = versions
 
     def has(self, package: str) -> bool:
         names = self.names()
@@ -191,6 +227,18 @@ class DistroIndex:
                 if candidate in names:
                     return candidate
         return None
+
+
+def upstream_version(debian_version: str) -> Optional[str]:
+    """The upstream part of a Debian version, comparable with PEP 440.
+
+    ``1:4.2.3+ds-11`` is 4.2.3: drop the epoch, the Debian revision, and any
+    repacking suffix after the leading dotted number.
+    """
+    text = debian_version.split(":", 1)[-1]
+    text = text.rsplit("-", 1)[0] if "-" in text else text
+    match = re.match(r"^(\d+(?:\.\d+)*)", text)
+    return match.group(1) if match else None
 
 
 def resolve_spec(identifier: str) -> DistroSpec:

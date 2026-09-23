@@ -118,6 +118,21 @@ def build_parser() -> argparse.ArgumentParser:
         "into one graph. RUNS THE CONFIGURE STEPS IT LISTS. See examples/plans/.",
     )
     scope.add_argument(
+        "--recurse", action="store_true",
+        help="with --plan: fetch the source of everything the default build requires "
+        "that has no binary for the target, plan it from its own build files, "
+        "configure it in the same pretend environment, and so on down -- then "
+        "build the answer back up. RUNS THE CONFIGURES OF EVERY PACKAGE IT FETCHES.",
+    )
+    scope.add_argument(
+        "--recurse-depth", type=int, default=3, metavar="N",
+        help="how far down to go (default: %(default)s)",
+    )
+    scope.add_argument(
+        "--recurse-limit", type=int, default=40, metavar="N",
+        help="the most packages to fetch and configure (default: %(default)s)",
+    )
+    scope.add_argument(
         "--pseudobuild-timeout", type=int, default=600, metavar="SECONDS",
         help="time allowed for the whole unblock-and-rerun loop "
         "(default: %(default)s)",
@@ -328,6 +343,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             free_threaded=True,
         )
 
+    if args.recurse and not args.plan:
+        raise SystemExit("--recurse needs --plan: it recurses from a plan's answer")
     if args.plan:
         return _run_plan(args, target, cache, stderr)
 
@@ -441,6 +458,9 @@ def _run_plan(
         return 2
     if args.format not in ("text", "json", "dot"):
         raise SystemExit("--plan reports as text, json or dot")
+    from . import recurse as recursion
+
+    walk = None
 
     with httpx.Client(
         timeout=args.timeout,
@@ -469,26 +489,55 @@ def _run_plan(
                         timeout=args.pseudobuild_timeout, pip_cache=cache.root / "pip",
                         progress=lambda what: status.update(f"{plan.repo}: {what}"),
                     )
+            if args.recurse:
+                recurse_options: dict = {
+                    "index": index, "target": target, "distro": distro,
+                    "cache_root": cache.root / "sources",
+                    "max_depth": args.recurse_depth, "max_packages": args.recurse_limit,
+                    "timeout": args.pseudobuild_timeout, "pip_cache": cache.root / "pip",
+                }
+                if args.quiet:
+                    walk = recursion.recurse(result, **recurse_options)
+                else:
+                    with stderr.status("recursing…") as status:
+                        walk = recursion.recurse(
+                            result, **recurse_options,
+                            progress=lambda what: status.update(what),
+                        )
         except IndexError_ as exc:
             stderr.print(f"[red]index error:[/red] {exc}")
             return 3
 
+    code = planrun.exit_code(result) if walk is None else _recursion_exit_code(walk)
     if args.format == "json":
-        payload = json.dumps(planrun.to_dict(result), indent=2)
+        data = planrun.to_dict(result)
+        if walk is not None:
+            data = {"plan": data, "recursion": recursion.to_dict(walk)}
+        payload = json.dumps(data, indent=2)
     elif args.format == "dot":
-        payload = planrun.to_dot(result)
+        payload = planrun.to_dot(result) if walk is None else recursion.to_dot(walk)
     else:
+        def render(console: Console) -> None:
+            planrun.render_text(result, console)
+            if walk is not None:
+                recursion.render_text(walk, console)
         if args.output:
             with open(args.output, "w", encoding="utf-8") as handle:
-                planrun.render_text(result, Console(file=handle, width=120))
+                render(Console(file=handle, width=120))
         else:
-            planrun.render_text(result, Console())
-        return 0 if args.exit_zero else planrun.exit_code(result)
+            render(Console())
+        return 0 if args.exit_zero else code
     if args.output:
         Path(args.output).write_text(payload + "\n", encoding="utf-8")
     else:
         sys.stdout.write(payload + "\n")
-    return 0 if args.exit_zero else planrun.exit_code(result)
+    return 0 if args.exit_zero else code
+
+
+def _recursion_exit_code(walk) -> int:
+    if walk.verdict == "yes":
+        return 1 if walk.order else 0   # something is built from source either way
+    return 1 if walk.verdict == "probably" else 2
 
 
 def _emit(args: argparse.Namespace, analysis: Analysis, distro: Optional[DistroIndex]) -> None:

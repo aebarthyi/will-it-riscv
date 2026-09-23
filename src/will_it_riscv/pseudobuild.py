@@ -182,6 +182,11 @@ _VAR_STEM = re.compile(
     r"EXECUTABLE|PROGRAM)(_[A-Z]+)?$",
     re.IGNORECASE,
 )
+#: find_program/find_library/find_path(... REQUIRED), CMake 3.18+: "Could not
+#: find FYPP_EXE using the following names: fypp". MFC stops on exactly this.
+_REQUIRED_FIND = re.compile(
+    r"Could not find ([A-Za-z_][A-Za-z0-9_]*) using the following names:\s*([^\n]+)"
+)
 #: An error raised from inside a package's own Find module or config file is
 #: that package's error, even when its message never names it.
 _ERROR_FILE = re.compile(r"^\s*CMake Error at (\S+?):\d+")
@@ -231,6 +236,11 @@ def _stanza_blockers(stanza: str) -> list[str]:
             match = _NOTFOUND_VAR.match(line)
             if match and not line.startswith("Please"):
                 names.append(_VAR_STEM.sub("", match.group(1)) or match.group(1))
+        return names
+    for match in _REQUIRED_FIND.finditer(stanza):
+        first = match.group(2).split(",")[0].strip()
+        names.append(first or match.group(1))
+    if names:
         return names
     listing = False
     for line in lines:
@@ -559,6 +569,7 @@ def run(
     max_rounds: int = 12,
     arch: str = "riscv64",
     confine: bool = True,
+    defines: Optional[dict] = None,
 ) -> Optional[PseudoBuild]:
     """Configure the project in a scratch directory, unblocking as it goes.
 
@@ -568,8 +579,10 @@ def run(
     optional. GDAL stops at PROJ and yields 7 proven-optional dependencies;
     two rounds later it completes and yields 55.
 
-    ``timeout`` bounds the whole loop, not each round. Returns None when there
-    is nothing to do (no CMakeLists.txt at the root).
+    ``timeout`` bounds the whole loop, not each round. ``defines`` are -D
+    flags the build itself passes -- MFC's -DMFC_MPI=ON -- and are never
+    stubbed over. Returns None when there is nothing to do (no CMakeLists.txt
+    at the root).
     """
     root = Path(root)
     if not (root / "CMakeLists.txt").exists():
@@ -583,6 +596,7 @@ def run(
     written: set = set()
     trial: Optional[_Trial] = None
     tried: set = set()
+    fixed = {str(k): str(v) for k, v in (defines or {}).items()}
 
     with tempfile.TemporaryDirectory(prefix="will-it-riscv-") as scratch:
         scratch_path = Path(scratch)
@@ -600,14 +614,15 @@ def run(
                 break
             remaining = max(1, int(left))
             outcome = _configure(
-                root, scratch_path, overrides, env, remaining, f"build-{attempt}",
-                toolchain,
+                root, scratch_path, {**overrides, **fixed}, env, remaining,
+                f"build-{attempt}", toolchain,
             )
             if attempt == 1 and toolchain and not outcome.completed and not outcome.probes:
                 # It would not even start as a cross build. A host answer is
                 # worse than a target one, but much better than none.
                 host = _configure(
-                    root, scratch_path, overrides, env, remaining, "build-host", None
+                    root, scratch_path, {**overrides, **fixed}, env, remaining,
+                    "build-host", None,
                 )
                 if host.completed or host.probes:
                     aggregate.notes.append(
@@ -672,9 +687,11 @@ def run(
             suffix = ".so" if toolchain else _library_suffix()
             fresh, created = _synthesize(
                 outcome.blocking, outcome.narration, sysroot, written,
-                shared_suffix=suffix,
+                shared_suffix=suffix, lookups=outcome.lookups,
             )
-            fresh = {k: v for k, v in fresh.items() if overrides.get(k) != v}
+            fresh = {
+                k: v for k, v in fresh.items() if overrides.get(k) != v and k not in fixed
+            }
             if not fresh and not created:
                 # The configure died without naming anything this can fake.
                 # Blame by experiment: stub the likeliest suspect and see.
@@ -806,6 +823,8 @@ def _stub_package(
     """Make a package the configure shrugged off exist after all."""
     if name.lower() == "openmp":
         return _stub_openmp(sysroot, suffix)
+    if name.lower() == "mpi":
+        return _stub_mpi(sysroot, suffix)
     overrides: dict[str, str] = {}
     files: list[str] = _stub_lookups(name, lookups or [], sysroot, suffix)
     wants_config = False
@@ -948,6 +967,58 @@ def _stub_openmp(sysroot: Path, suffix: str) -> tuple[dict, list]:
     return overrides, [str(library), str(header)]
 
 
+#: Just enough of mpi.h and mpif.h for a check to compile against.
+_MPI_H = """\
+/* stub emitted by will-it-riscv */
+#ifndef WILL_IT_RISCV_MPI_H
+#define WILL_IT_RISCV_MPI_H
+typedef int MPI_Comm;
+typedef int MPI_Datatype;
+#define MPI_COMM_WORLD 0
+#define MPI_VERSION 3
+#define MPI_SUBVERSION 1
+int MPI_Init(int *, char ***);
+int MPI_Finalize(void);
+int MPI_Comm_rank(MPI_Comm, int *);
+int MPI_Comm_size(MPI_Comm, int *);
+#endif
+"""
+_MPIF_H = """\
+! stub emitted by will-it-riscv
+      integer MPI_COMM_WORLD, MPI_VERSION, MPI_INTEGER_KIND
+      parameter (MPI_COMM_WORLD=0, MPI_VERSION=3, MPI_INTEGER_KIND=4)
+"""
+
+
+def _stub_mpi(sysroot: Path, suffix: str) -> tuple[dict, list]:
+    """MPI, answered the way FindMPI asks its own questions.
+
+    FindMPI interrogates a compiler wrapper and test-compiles a program per
+    language -- Fortran's needs a real mpi module. Instead, give it the
+    answers it would have cached: a library, a header or module directory
+    per language, and MPI_<LANG>_WORKS, which is what makes it skip the test
+    compile. The wrapper search is skipped too, or an mpicc on the host
+    would answer for the target.
+    """
+    library = sysroot / "lib" / f"libmpi{suffix}"
+    headers = {sysroot / "include" / "mpi.h": _MPI_H, sysroot / "include" / "mpif.h": _MPIF_H}
+    try:
+        library.touch()
+        for path, text in headers.items():
+            path.write_text(text)
+    except OSError:
+        return {}, []
+    include = str(sysroot / "include")
+    overrides = {"MPI_SKIP_COMPILER_WRAPPER": "TRUE", "MPI_mpi_LIBRARY": str(library)}
+    for language in ("C", "CXX", "Fortran"):
+        overrides[f"MPI_{language}_LIB_NAMES"] = "mpi"
+        overrides[f"MPI_{language}_WORKS"] = "TRUE"
+        overrides[f"MPI_{language}_HEADER_DIR"] = include
+    overrides["MPI_Fortran_F77_HEADER_DIR"] = include
+    overrides["MPI_Fortran_MODULE_DIR"] = include
+    return overrides, [str(library), *(str(p) for p in headers)]
+
+
 #: Written into the scratch directory, never the project.
 TOOLCHAIN = """\
 # Written by will-it-riscv: configure as a Linux/{arch} build that can find
@@ -1053,7 +1124,7 @@ FAKE_VERSION_STRING = "99.9.9"
 
 _LIBRARY_VAR = re.compile(r"_(LIBRARY|LIBRARIES|LIB|LIBS)(_[A-Z]+)?$", re.IGNORECASE)
 _INCLUDE_VAR = re.compile(r"_(INCLUDE_DIR|INCLUDE_DIRS|INCLUDEDIR|INCLUDE)$", re.IGNORECASE)
-_PROGRAM_VAR = re.compile(r"_(EXECUTABLE|COMMAND|BINARY|PROGRAM|COMPILER)$", re.IGNORECASE)
+_PROGRAM_VAR = re.compile(r"_(EXECUTABLE|EXE|COMMAND|BINARY|PROGRAM|COMPILER)$", re.IGNORECASE)
 _VERSION_VAR = re.compile(r"_VERSION", re.IGNORECASE)
 #: <Pkg>_DIR is config-mode's hint. Faking it sends CMake looking for a
 #: package config file that is not there, which fails worse than not setting it.
@@ -1158,6 +1229,7 @@ def _synthesize(
     sysroot: Path,
     already: set,
     shared_suffix: Optional[str] = None,
+    lookups: Optional[dict] = None,
 ) -> tuple[dict, list]:
     """Work out what to fake so the next round gets further.
 
@@ -1179,6 +1251,13 @@ def _synthesize(
         variables: list[str] = []
         named = _ANY_MISS.search(stanza)
         package = named.group(1) if named else None
+        if package and package.split("_", 1)[0].lower() == "mpi":
+            # FPHSA's "(missing: MPI_Fortran_FOUND Fortran)" names results,
+            # not inputs; faking those gets nowhere. Answer FindMPI instead.
+            stubbed, files = _stub_mpi(sysroot, suffix)
+            overrides.update(stubbed)
+            created += [f for f in files if f not in already]
+            continue
         # 1. The cache variables FPHSA said were missing. A bare word among
         #    them is a component -- "(missing: ... SSL Crypto)" -- and the
         #    variable behind a component is <PKG>_<COMPONENT>_LIBRARY.
@@ -1188,6 +1267,18 @@ def _synthesize(
                     variables.append(token)
                 elif package and token.isidentifier():
                     variables += _component_variables(package, token)
+        # 0. What the blocker's own Find module looked for this round, put
+        #    where it looked. FindHDF5 recomputes HDF5_INCLUDE_DIRS from its
+        #    own find_path(hdf5.h), so faking the variable gets nowhere --
+        #    but an hdf5.h in the sysroot is found the way the module finds it.
+        for name in _stanza_blockers(stanza):
+            looked_for = (lookups or {}).get(name.lower(), [])
+            for stub in _stub_lookups(name, looked_for, sysroot, suffix):
+                if stub not in already:
+                    created.append(stub)
+        # 1a. The variable a find_*(... REQUIRED) could not fill.
+        for match in _REQUIRED_FIND.finditer(stanza):
+            variables.append(match.group(1))
         # 1b. The same, for a component a try_compile tried to link.
         for match in _TARGET_NOT_FOUND.finditer(stanza):
             variables += _component_variables(match.group(1), match.group(2))
@@ -1269,6 +1360,8 @@ def _host_gaps(narration: str) -> list[str]:
     db = database()
     gaps: list[str] = []
     for stanza in _error_stanzas(narration):
+        if _REQUIRED_FIND.search(stanza):
+            continue   # find_path(... REQUIRED) names its own package's header
         for header in _missing_headers(stanza):
             if db.header(header) is None and header not in gaps:
                 gaps.append(header)

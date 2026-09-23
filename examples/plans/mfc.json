@@ -1,0 +1,149 @@
+{
+  "version": 1,
+  "repo": "MFC",
+  "entry": {
+    "command": "./mfc.sh build -j $(nproc)",
+    "evidence": [{"at": "README.md:73", "quote": "./mfc.sh build -j $(nproc)"}]
+  },
+  "steps": [
+    {
+      "id": "ci-packages",
+      "kind": "system-packages",
+      "note": "what CI's Ubuntu job installs before ./mfc.sh build",
+      "packages": ["cmake", "gcc", "g++", "python3", "python3-dev", "hdf5-tools",
+                   "libfftw3-dev", "libhdf5-dev", "openmpi-bin", "libopenmpi-dev",
+                   "libblas-dev", "liblapack-dev"],
+      "evidence": [{"at": ".github/workflows/test.yml:250-253",
+                    "quote": "sudo apt install -y cmake gcc g++ python3 python3-dev hdf5-tools"}]
+    },
+    {
+      "id": "fortran",
+      "kind": "system-packages",
+      "note": "MFC is Fortran; CI's Ubuntu runners come with gfortran, so no workflow installs it",
+      "packages": ["gfortran"],
+      "evidence": [{"at": "CMakeLists.txt:16", "quote": "project(MFC LANGUAGES C CXX Fortran)"}]
+    },
+    {
+      "id": "toolchain",
+      "kind": "python-install",
+      "note": "mfc.sh sources toolchain/bootstrap/python.sh, which installs toolchain/ into a venv with uv, or pip3 without it",
+      "manifest": "toolchain/pyproject.toml",
+      "evidence": [
+        {"at": "toolchain/bootstrap/python.sh:233", "quote": "uv_install_with_retry \"$(pwd)/toolchain\""},
+        {"at": "toolchain/bootstrap/python.sh:266", "quote": "pip3 install \"$(pwd)/toolchain\""}
+      ]
+    },
+    {
+      "id": "dep-fftw",
+      "kind": "cmake-configure",
+      "after": ["toolchain"],
+      "note": "not found on the system, so MFC downloads FFTW 3.3.10 and builds it",
+      "source": "toolchain/dependencies",
+      "defines": {"MFC_FFTW": true, "CMAKE_BUILD_TYPE": "Release"},
+      "provides": ["fftw3", "fftw"],
+      "evidence": [
+        {"at": "toolchain/mfc/build.py:577", "quote": "FFTW = MFCTarget(\"fftw\", [\"-DMFC_FFTW=ON\"]"},
+        {"at": "toolchain/dependencies/CMakeLists.txt:36-37", "quote": "ExternalProject_Add(fftw"}
+      ]
+    },
+    {
+      "id": "dep-hdf5",
+      "kind": "cmake-configure",
+      "after": ["toolchain"],
+      "source": "toolchain/dependencies",
+      "defines": {"MFC_HDF5": true, "CMAKE_BUILD_TYPE": "Release"},
+      "provides": ["hdf5"],
+      "evidence": [
+        {"at": "toolchain/mfc/build.py:578", "quote": "HDF5 = MFCTarget(\"hdf5\", [\"-DMFC_HDF5=ON\"]"},
+        {"at": "toolchain/dependencies/CMakeLists.txt:58-59", "quote": "ExternalProject_Add(hdf5"}
+      ]
+    },
+    {
+      "id": "dep-silo",
+      "kind": "cmake-configure",
+      "after": ["dep-hdf5"],
+      "source": "toolchain/dependencies",
+      "defines": {"MFC_SILO": true, "CMAKE_BUILD_TYPE": "Release"},
+      "provides": ["silo"],
+      "evidence": [
+        {"at": "toolchain/mfc/build.py:579", "quote": "SILO = MFCTarget(\"silo\", [\"-DMFC_SILO=ON\"]"},
+        {"at": "toolchain/dependencies/CMakeLists.txt:97-98", "quote": "ExternalProject_Add(silo"}
+      ]
+    },
+    {
+      "id": "dep-lapack",
+      "kind": "cmake-configure",
+      "after": ["toolchain"],
+      "source": "toolchain/dependencies",
+      "defines": {"MFC_LAPACK": true, "CMAKE_BUILD_TYPE": "Release"},
+      "provides": ["lapack", "blas"],
+      "evidence": [
+        {"at": "toolchain/mfc/build.py:580", "quote": "LAPACK = MFCTarget(\"lapack\", [\"-DMFC_LAPACK=ON\"]"},
+        {"at": "toolchain/dependencies/CMakeLists.txt:127-128", "quote": "ExternalProject_Add(lapack"}
+      ]
+    },
+    {
+      "id": "pre_process",
+      "kind": "cmake-configure",
+      "after": ["toolchain"],
+      "defines": {
+        "MFC_PRE_PROCESS": true, "CMAKE_BUILD_TYPE": "Release",
+        "MFC_SINGLE_PRECISION": false, "MFC_MIXED_PRECISION": false, "MFC_MPI": true,
+        "MFC_OpenACC": false, "MFC_OpenMP": false, "MFC_GCov": false,
+        "MFC_Unified": false, "MFC_Fastmath": false
+      },
+      "evidence": [
+        {"at": "toolchain/mfc/build.py:582", "quote": "PRE_PROCESS = MFCTarget(\"pre_process\", [\"-DMFC_PRE_PROCESS=ON\"]"},
+        {"at": "toolchain/mfc/build.py:446", "quote": "-DCMAKE_BUILD_TYPE="},
+        {"at": "toolchain/mfc/build.py:471", "quote": "-DMFC_MPI="},
+        {"at": "toolchain/mfc/state.py:15", "quote": "mpi: bool = True"}
+      ]
+    },
+    {
+      "id": "simulation",
+      "kind": "cmake-configure",
+      "after": ["toolchain", "dep-fftw"],
+      "defines": {
+        "MFC_SIMULATION": true, "CMAKE_BUILD_TYPE": "Release",
+        "MFC_SINGLE_PRECISION": false, "MFC_MIXED_PRECISION": false, "MFC_MPI": true,
+        "MFC_OpenACC": false, "MFC_OpenMP": false, "MFC_GCov": false,
+        "MFC_Unified": false, "MFC_Fastmath": false
+      },
+      "evidence": [
+        {"at": "toolchain/mfc/build.py:583", "quote": "SIMULATION = MFCTarget(\"simulation\", [\"-DMFC_SIMULATION=ON\"]"},
+        {"at": "toolchain/mfc/build.py:474-478", "quote": "-DMFC_OpenACC="}
+      ]
+    },
+    {
+      "id": "post_process",
+      "kind": "cmake-configure",
+      "after": ["toolchain", "dep-fftw", "dep-hdf5", "dep-silo", "dep-lapack"],
+      "defines": {
+        "MFC_POST_PROCESS": true, "CMAKE_BUILD_TYPE": "Release",
+        "MFC_SINGLE_PRECISION": false, "MFC_MIXED_PRECISION": false, "MFC_MPI": true,
+        "MFC_OpenACC": false, "MFC_OpenMP": false, "MFC_GCov": false,
+        "MFC_Unified": false, "MFC_Fastmath": false
+      },
+      "evidence": [
+        {"at": "toolchain/mfc/build.py:584", "quote": "POST_PROCESS = MFCTarget(\"post_process\", [\"-DMFC_POST_PROCESS=ON\"]"}
+      ]
+    },
+    {
+      "id": "syscheck",
+      "kind": "cmake-configure",
+      "after": ["toolchain"],
+      "defines": {
+        "MFC_SYSCHECK": true, "CMAKE_BUILD_TYPE": "Release",
+        "MFC_SINGLE_PRECISION": false, "MFC_MIXED_PRECISION": false, "MFC_MPI": true,
+        "MFC_OpenACC": false, "MFC_OpenMP": false, "MFC_GCov": false,
+        "MFC_Unified": false, "MFC_Fastmath": false
+      },
+      "evidence": [
+        {"at": "toolchain/mfc/build.py:585", "quote": "SYSCHECK = MFCTarget(\"syscheck\", [\"-DMFC_SYSCHECK=ON\"]"}
+      ]
+    }
+  ],
+  "unsure": [
+    "whether syscheck is configured on every build or only when asked for (it is marked required)"
+  ]
+}

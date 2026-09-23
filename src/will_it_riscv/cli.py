@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Optional
@@ -109,6 +110,12 @@ def build_parser() -> argparse.ArgumentParser:
         "proven required -- and answers whether the target's distro has "
         "everything it demands. RUNS THE PROJECT'S BUILD SCRIPTS: only do this "
         "for a repository you trust.",
+    )
+    scope.add_argument(
+        "--plan", metavar="PLAN.json",
+        help="run a build plan -- everything the repository's build runs, in "
+        "order -- in the pretend environment, and join what every step needs "
+        "into one graph. RUNS THE CONFIGURE STEPS IT LISTS. See examples/plans/.",
     )
     scope.add_argument(
         "--pseudobuild-timeout", type=int, default=600, metavar="SECONDS",
@@ -321,6 +328,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             free_threaded=True,
         )
 
+    if args.plan:
+        return _run_plan(args, target, cache, stderr)
+
     scan = _scan_source_tree(args, stderr, target.arch)
     roots = _roots(args)
     had_root_manifest = bool(roots)
@@ -410,6 +420,75 @@ def main(argv: Optional[list[str]] = None) -> int:
         _emit(args, analysis, distro)
 
     return 0 if args.exit_zero else analysis.exit_code()
+
+
+def _run_plan(
+    args: argparse.Namespace, target: Target, cache: Cache, stderr: Console
+) -> int:
+    """--plan: run each step in the pretend environment, report one graph."""
+    from . import planrun
+    from .plan import PlanError, load_plan
+
+    root = Path(args.path)
+    if not root.is_dir():
+        raise SystemExit(f"{root}: --plan needs the repository directory")
+    try:
+        plan = load_plan(Path(args.plan))
+    except PlanError as exc:
+        stderr.print(f"[red]{args.plan}: not a plan this can run[/red]")
+        for problem in exc.problems:
+            stderr.print(f"  • {problem}", highlight=False)
+        return 2
+    if args.format not in ("text", "json", "dot"):
+        raise SystemExit("--plan reports as text, json or dot")
+
+    with httpx.Client(
+        timeout=args.timeout,
+        follow_redirects=True,
+        headers={"User-Agent": USER_AGENT},
+        limits=httpx.Limits(max_connections=args.workers * 2),
+    ) as client:
+        index = PackageIndex(client, cache, url=args.index_url)
+        distro: Optional[DistroIndex] = None
+        if not args.no_distro:
+            try:
+                distro = DistroIndex(client, cache, resolve_spec(args.distro), target.arch)
+            except KeyError as exc:
+                raise SystemExit(str(exc)) from exc
+            distro.names()
+        try:
+            if args.quiet:
+                result = planrun.execute(
+                    plan, root, index=index, target=target, distro=distro,
+                    timeout=args.pseudobuild_timeout,
+                )
+            else:
+                with stderr.status(f"running {plan.repo}'s plan…") as status:
+                    result = planrun.execute(
+                        plan, root, index=index, target=target, distro=distro,
+                        timeout=args.pseudobuild_timeout,
+                        progress=lambda what: status.update(f"{plan.repo}: {what}"),
+                    )
+        except IndexError_ as exc:
+            stderr.print(f"[red]index error:[/red] {exc}")
+            return 3
+
+    if args.format == "json":
+        payload = json.dumps(planrun.to_dict(result), indent=2)
+    elif args.format == "dot":
+        payload = planrun.to_dot(result)
+    else:
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as handle:
+                planrun.render_text(result, Console(file=handle, width=120))
+        else:
+            planrun.render_text(result, Console())
+        return 0 if args.exit_zero else planrun.exit_code(result)
+    if args.output:
+        Path(args.output).write_text(payload + "\n", encoding="utf-8")
+    else:
+        sys.stdout.write(payload + "\n")
+    return 0 if args.exit_zero else planrun.exit_code(result)
 
 
 def _emit(args: argparse.Namespace, analysis: Analysis, distro: Optional[DistroIndex]) -> None:

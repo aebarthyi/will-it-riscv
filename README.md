@@ -132,6 +132,8 @@ Everything is driven by what the configure itself said:
 | it said | the stub |
 | --- | --- |
 | `(missing: PROJ_LIBRARY PROJ_INCLUDE_DIR)` | an empty library and an include directory |
+| `Could NOT find HDF5`, however it is worded | whatever HDF5's own Find module looked for this round — `hdf5.h`, `libhdf5.so` — put where it looked |
+| `Could not find FYPP_EXE using the following names: fypp` | a runnable `fypp` — `find_program(… REQUIRED)`, and the same for libraries and paths |
 | `(missing: … SSL Crypto)`, or `links to: OpenSSL::SSL but the target was not found` | the component's `OPENSSL_SSL_LIBRARY` |
 | `The following required packages were not found: - libpsl` | a `libpsl.pc` in the only directory pkg-config may search |
 | `file failed to open for reading: …/proj.h` | that header, carrying every common spelling of a version macro |
@@ -208,6 +210,73 @@ rather than present. Headers the host lacks and any riscv64 Linux system has
 are stubbed and listed as host gaps. If a project will not configure as a
 cross build at all, it is configured for the host instead, and the report
 says so.
+
+### Build plans: everything the build runs, in order
+
+A repository's build is rarely one configure. `./mfc.sh build` installs a
+Python toolchain, builds FFTW, HDF5, SILO and LAPACK from source through
+`toolchain/dependencies`, and then configures three targets with flags that
+`toolchain/mfc/build.py` assembles. `--plan` runs a plan: that sequence written
+down as data, one typed step at a time.
+
+```console
+$ will-it-riscv ~/src/MFC --plan examples/plans/mfc.json
+```
+```
+Steps
+  ✓ ci-packages              system-packages  12 packages
+  ✓ fortran                  system-packages  1 package
+  ✓ toolchain                python-install   115 packages resolved, 1 with nothing for riscv64
+  ✓ dep-fftw                 cmake-configure  1 round: nothing required
+  ...
+  ✓ simulation               cmake-configure  4 rounds: fypp → MPI → FFTW
+  ✓ post_process             cmake-configure  7 rounds: fypp → MPI → SILO → HDF5 → FFTW → LAPACK
+
+  Will it riscv?  NO — jaxlib: required, and nothing for the target in the index or archive checked
+
+  nothing public for the target (1)
+    • pypi:jaxlib    publishes binary wheels, but none for riscv64 (...)
+      toolchain → pyrometheus → jaxlib
+  to build from source (18)
+    • pypi:numpy     publishes binary wheels, but none for riscv64 (...); Debian 13 (trixie)
+                     ships python3-numpy for riscv64
+    ...
+  provided by the plan itself (5)
+    • FFTW           provided by step 'dep-fftw'
+    • fypp           provided by step 'toolchain'
+    ...
+```
+
+| step kind | how it is answered |
+| --- | --- |
+| `python-install` | resolved against the index for the target's wheel tags — never installed |
+| `system-packages` | looked up in the distro's riscv64 archive |
+| `cmake-configure` | configured for real, with the plan's `-D` flags, confined to an empty sysroot that grows a stub for whatever the configure insists on |
+
+**Nothing is emulated.** The sandbox is a pretend environment: whatever a
+configure looks for, it is made to see, and whatever it complains about next
+is added in turn. MPI is answered the way FindMPI asks its own questions — a
+library, a header and a module directory per language, and the
+`MPI_<LANG>_WORKS` it would have cached — rather than by an MPI anyone
+built. HDF5 gets the `hdf5.h` its own `find_path` looked for, where it
+looked.
+
+Every step's asks land in one graph, keyed by ecosystem so that PyPI's numpy
+and Debian's python3-numpy stay two things. A requirement that an earlier
+step provides — the CMake configure wants `fypp`, which the Python toolchain
+installs; it wants FFTW, which the dependency target builds from source — is
+resolved to that step rather than looked for in the archive, and it stays off
+the install line. `-f dot` draws it: a node per dependency, coloured by how it
+can be had, with a dashed edge from whichever step provides it.
+
+A plan is what a model is for. Reading a README, a CI workflow and a
+bootstrap script, and writing down what they run, needs no knowledge of
+riscv64. So the format is strict: typed steps, every one citing the lines it
+came from — `{"at": "toolchain/bootstrap/python.sh:233", "quote":
+"uv_install_with_retry \"$(pwd)/toolchain\""}` — and a citation that does not
+say what the plan claims is reported before anything runs. `plan.PLAN_SCHEMA`
+is the same shape as a JSON Schema, for constraining whatever writes one.
+`examples/plans/mfc.json` is written by hand; every citation in it holds.
 
 ### Meson projects are asked, not guessed at
 
@@ -355,6 +424,9 @@ $ will-it-riscv -f json -o riscv-report.json
 
 # configure it as linux/riscv64 and draw what it asked for
 $ will-it-riscv --pseudobuild -f dot | dot -Tsvg > deps.svg
+
+# run a whole build plan, and draw the one graph all its steps make
+$ will-it-riscv ~/src/MFC --plan examples/plans/mfc.json -f dot | dot -Tsvg > mfc.svg
 
 # just the names of everything that is not pure Python
 $ will-it-riscv -f list

@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -639,3 +640,80 @@ def test_the_trace_says_who_asked_and_from_where(tmp_path):
     assert probes["curl"].site == "CMakeLists.txt:10"
     assert probes["geos"].site == "CMakeLists.txt:12"
     assert probes["pkgconfig"].parent == "CURL"
+
+
+# -- what a plan's configure steps needed -----------------------------------
+
+
+REQUIRED_FIND = (
+    "CMake Error at cmake/Fypp.cmake:6 (find_program):\n"
+    "  Could not find FYPP_EXE using the following names: fypp\n"
+)
+
+
+def test_a_required_find_program_names_the_program():
+    """MFC's first stop: find_program(FYPP_EXE fypp REQUIRED)."""
+    assert _stanza_blockers(REQUIRED_FIND) == ["fypp"]
+
+
+def test_a_required_find_program_gets_a_runnable_stub(tmp_path):
+    overrides, _ = synth(REQUIRED_FIND, tmp_path)
+    stub = Path(overrides["FYPP_EXE"])
+    assert stub.name == "fypp" and stub.stat().st_mode & 0o111
+
+
+def test_a_header_a_required_find_path_names_is_not_a_host_gap():
+    narration = (
+        "CMake Error at FindFoo.cmake:3 (find_path):\n"
+        "  Could not find FOO_INCLUDE_DIR using the following names: foo.h\n"
+    )
+    assert _host_gaps(narration) == []
+
+
+def test_mpi_is_answered_the_way_findmpi_asks(tmp_path):
+    """FPHSA names MPI's results, not its inputs; faking those gets nowhere."""
+    overrides, created = synth(
+        "CMake Error at FindPackageHandleStandardArgs.cmake:290 (message):\n"
+        "  Could NOT find MPI (missing: MPI_Fortran_FOUND Fortran)\n",
+        tmp_path,
+    )
+    assert overrides["MPI_Fortran_WORKS"] == "TRUE"
+    assert overrides["MPI_SKIP_COMPILER_WRAPPER"] == "TRUE"
+    assert "MPI_Fortran_FOUND" not in overrides
+    assert {Path(p).name for p in created} >= {"mpi.h", "mpif.h"}
+
+
+def test_a_blocker_gets_what_its_own_module_looked_for(tmp_path):
+    """FindHDF5 recomputes HDF5_INCLUDE_DIRS from its own find_path(hdf5.h)."""
+    for directory in ("include", "lib/pkgconfig"):
+        (tmp_path / directory).mkdir(parents=True, exist_ok=True)
+    from will_it_riscv.pseudobuild import _synthesize
+
+    _, created = _synthesize(
+        None,
+        "CMake Error at FindPackageHandleStandardArgs.cmake:290 (message):\n"
+        "  Could NOT find HDF5 (missing: HDF5_INCLUDE_DIRS)\n",
+        tmp_path,
+        set(),
+        shared_suffix=".so",
+        lookups={"hdf5": [
+            ("find_path", "HDF5_C_INCLUDE_DIR", ("hdf5.h",)),
+            ("find_library", "HDF5_C_LIBRARY_hdf5", ("hdf5",)),
+        ]},
+    )
+    assert str(tmp_path / "include" / "hdf5.h") in created
+    assert str(tmp_path / "lib" / "libhdf5.so") in created
+
+
+@needs_cmake
+def test_a_plans_defines_are_passed_and_never_stubbed_over(tmp_path):
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.18)\n"
+        "project(demo NONE)\n"
+        'if(NOT DEMO_MPI STREQUAL "ON")\n  message(FATAL_ERROR "DEMO_MPI is ${DEMO_MPI}")\nendif()\n'
+        "find_program(FYPP_EXE NAMES fypp REQUIRED)\n"
+    )
+    result = run(tmp_path, timeout=120, defines={"DEMO_MPI": "ON"})
+    assert result.completed, result.error
+    assert result.blockers == ["fypp"]
+    assert "DEMO_MPI" not in result.unblocked

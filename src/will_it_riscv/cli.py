@@ -203,6 +203,56 @@ def _roots(args: argparse.Namespace) -> RootRequirements:
         raise SystemExit(f"{path}: {exc}") from exc
 
 
+def _adopt_script_installs(
+    roots: RootRequirements,
+    scan: RepositoryInspection,
+    extras: tuple[str, ...] = (),
+    groups: tuple[str, ...] = (),
+) -> list:
+    """Analyse what the project's scripts install, not only what it declares.
+
+    ``./mfc.sh build`` pip-installs toolchain/ before any CMake runs, so that
+    manifest is the first thing the build needs, deep in the tree or not.
+    Returns the installs adopted; ``roots`` is extended in place.
+    """
+    adopted = []
+    for install in scan.script_installs:
+        if install.kind == "requirement":
+            try:
+                roots.runtime.append(Requirement(install.target))
+            except InvalidRequirement:
+                continue
+            adopted.append(install)
+            continue
+        path = scan.root / install.target
+        if roots.source and Path(roots.source).resolve() == path.resolve():
+            continue   # the root manifest, already loaded
+        try:
+            loaded = load(path, tuple(install.extras) + extras, groups)
+        except (OSError, ValueError) as exc:
+            roots.warnings.append(f"{install.target}, installed by {install.via}: {exc}")
+            continue
+        roots.runtime += loaded.runtime
+        roots.build += loaded.build
+        roots.warnings += loaded.warnings
+        adopted.append(install)
+    return adopted
+
+
+def _unanalysed_manifests(scan: RepositoryInspection, adopted: list) -> list[Path]:
+    """Manifests below the root that nothing installs, to offer, not adopt.
+
+    A deep manifest is usually for something else -- documentation,
+    bindings, a test harness. Unless the project's own scripts install it:
+    then it is part of the build, and it was analysed.
+    """
+    installed = {(scan.root / a.target).resolve() for a in adopted if a.kind == "manifest"}
+    return [
+        m for m in scan.manifests
+        if m.parent != scan.root and m.resolve() not in installed
+    ]
+
+
 def _scan_source_tree(
     args: argparse.Namespace, stderr: Console, arch: str = "riscv64"
 ) -> Optional[RepositoryInspection]:
@@ -273,12 +323,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     scan = _scan_source_tree(args, stderr, target.arch)
     roots = _roots(args)
+    had_root_manifest = bool(roots)
+    adopted = (
+        _adopt_script_installs(roots, scan, tuple(args.extra), tuple(args.group))
+        if scan is not None else []
+    )
     deep_manifests: list[Path] = []
-    if scan is not None and not roots and scan.manifests:
-        # Manifests exist, but not at the root. A deep one is usually for
-        # something else -- documentation, bindings, a test harness -- so it
-        # is offered rather than silently adopted.
-        deep_manifests = [m for m in scan.manifests if m.parent != scan.root]
+    if scan is not None and not had_root_manifest and scan.manifests:
+        deep_manifests = _unanalysed_manifests(scan, adopted)
     if not roots and scan is None:
         stderr.print(f"[yellow]{roots.source}: no dependencies declared[/yellow]")
         return 0
@@ -335,6 +387,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             analysis.bundled_libraries = scan.bundled
             analysis.meson_introspect = scan.meson_introspect
             analysis.pseudobuild = scan.pseudobuild
+            analysis.script_installs = adopted
             for warning in scan.warnings:
                 analysis.add_warning(warning)
             analysis.root = scan.name

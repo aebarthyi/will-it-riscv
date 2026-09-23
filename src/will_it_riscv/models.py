@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:  # pragma: no cover - models must not import at runtime
     from .pseudobuild import PseudoBuild
+    from .scripts import ScriptInstall
 
 
 class Verdict(enum.Enum):
@@ -185,6 +186,9 @@ class Analysis:
     """"ok" when Meson reported its own dependencies, else why it could not."""
     pseudobuild: Optional[PseudoBuild] = None
     """The result of configuring the project for real, when asked for."""
+    script_installs: list[ScriptInstall] = field(default_factory=list)
+    """What the project's own scripts install before building, and were
+    therefore analysed along with its declared dependencies."""
     bundled_libraries: set[str] = field(default_factory=set)
     """Libraries the project ships its own copy of, making the system package
     optional rather than required."""

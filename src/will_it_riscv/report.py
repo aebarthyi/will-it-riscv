@@ -287,6 +287,17 @@ def _project_section(analysis: Analysis, console: Console) -> None:
         console.print(f"  links    {', '.join(r.name for r in libs)}", highlight=False)
     if tools:
         console.print(f"  toolchain {', '.join(r.name for r in tools)}", highlight=False)
+    for install in analysis.script_installs:
+        console.print(
+            f"  installs  {install.target}"
+            + (f"[{','.join(install.extras)}]" if install.extras else ""),
+            highlight=False,
+        )
+        console.print(
+            f"            before building, by {install.via} — analysed below",
+            style="dim",
+            highlight=False,
+        )
     if not profile.is_native:
         console.print("  no compiled sources found", style="dim")
     console.print()
@@ -618,6 +629,15 @@ def to_dict(analysis: Analysis, distro: Optional[DistroIndex] = None) -> dict:
             {
                 "files_scanned": analysis.files_scanned,
                 "meson_introspect": analysis.meson_introspect,
+                "script_installs": [
+                    {
+                        "kind": i.kind,
+                        "target": i.target,
+                        "extras": list(i.extras),
+                        "installed_by": list(i.chain),
+                    }
+                    for i in analysis.script_installs
+                ],
                 "languages": sorted(analysis.project_build.languages),
                 "build_systems": sorted(analysis.project_build.build_systems),
                 "system_requirements": [
@@ -684,6 +704,11 @@ def render_markdown(analysis: Analysis, distro: Optional[DistroIndex] = None) ->
     out.append(f"- **Target:** {analysis.target}")
     if distro is not None:
         out.append(f"- **Distro:** {distro.spec.label} / {distro.arch}")
+    for install in analysis.script_installs:
+        out.append(
+            f"- **Installed by the project's scripts:** `{install.target}` "
+            f"({install.via})"
+        )
     out.append(f"- **Packages reached:** {len(analysis.packages)}")
     out.append("")
 

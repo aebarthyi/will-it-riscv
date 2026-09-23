@@ -24,6 +24,7 @@ from .meson_introspect import MesonDependency, MesonScan, scan_dependencies
 from .models import BuildProfile, SystemRequirement
 from .pseudobuild import PseudoBuild
 from .pseudobuild import run as run_pseudobuild
+from .scripts import ScriptInstall, find_script_installs
 from .sdist import (
     ScanPolicy,
     SdistInspection,
@@ -77,6 +78,9 @@ class RepositoryInspection:
     or the reason it could not be used."""
     manifests: list[Path] = field(default_factory=list)
     """Dependency manifests found, for the analyzer to pick up."""
+    script_installs: list[ScriptInstall] = field(default_factory=list)
+    """What the project's own root scripts pip-install, and how each was
+    reached. MFC's toolchain/pyproject.toml is found this way."""
     bundled: set[str] = field(default_factory=set)
     """Libraries the project ships a copy of, so the system package is
     optional. GROMACS bundles sixteen of them."""
@@ -499,5 +503,6 @@ def inspect_repository(
         found.values(), key=lambda r: (r.kind, r.name)
     )
     inspection.manifests = discover_manifests(root)
+    inspection.script_installs = find_script_installs(root)
     inspection.warnings.extend(check_submodules(root))
     return inspection

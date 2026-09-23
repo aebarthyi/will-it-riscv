@@ -296,6 +296,31 @@ not at the repository root usually describes something else — documentation,
 language bindings, a test harness — so it is reported rather than silently
 adopted, and you point at it directly if you want it analysed.
 
+**Unless the project's own scripts install it.** MFC is built with
+`./mfc.sh build`, which sources `toolchain/bootstrap/python.sh`, which
+pip-installs `toolchain/` into a venv before any CMake runs. So the shell
+scripts at the root are read too: `source` chains and invoked scripts are
+followed, the usual spellings of the repository root are resolved (`$(pwd)`,
+`$(dirname "$0")`, `${BASH_SOURCE%/*}`, `git rev-parse --show-toplevel`, and
+variables set from them), and a wrapper function that forwards `"$@"` to
+`pip install` counts as an installer — MFC's goes through two. Whatever they
+install is analysed along with the declared dependencies, and the report says
+how it was reached:
+
+```
+This project
+  installs  toolchain/pyproject.toml
+            before building, by mfc.sh:53 → toolchain/bootstrap/python.sh:233 — analysed below
+
+Nothing installable (1)
+  jaxlib   0.11.2
+```
+
+That is MFC's riscv64 answer, and it is not in CMake: `jaxlib` has no riscv64
+build at all, and both jax and pyrometheus pull it in, so `./mfc.sh build`
+stops at the venv bootstrap. The scripts are read, never run, and conditions
+are not evaluated — an install anywhere in them counts.
+
 [hpccm]: https://github.com/NVIDIA/hpc-container-maker
 
 ## Install

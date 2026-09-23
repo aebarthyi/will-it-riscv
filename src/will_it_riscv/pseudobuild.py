@@ -99,6 +99,14 @@ class PseudoBuild:
     """Headers the configure demanded that belong to no library -- the ones
     a riscv64 Linux system has and the host's SDK lacks, such as
     ``linux/fs.h``. Stubbed to get past them, and not dependencies."""
+    lookups: dict = field(default_factory=dict)
+    """What each package's Find module looked for in the last round, keyed
+    by package: ``(command, variable, names)``. How a suspect gets stubbed
+    exactly the way its own module searches for it."""
+    experiments: list = field(default_factory=list)
+    """Suspects stubbed to find what a configure died of when it did not
+    say, as ``(name, confirmed)``. Confirmed means the error moved once the
+    suspect existed, which makes it a hard requirement shown by experiment."""
     notes: list = field(default_factory=list)
     narration: str = ""
     """The configure's own output, kept so the next round can read what it
@@ -284,9 +292,25 @@ def _read_outcomes(text: str) -> tuple[set, set, list]:
     return found, soft, blockers
 
 
-def _parse_trace(path: Path) -> tuple[dict[str, Probe], int]:
+#: Commands a Find module uses to look for the files a package consists of.
+LOOKUP_COMMANDS = {
+    "find_library", "find_path", "find_file", "pkg_check_modules", "pkg_search_module",
+}
+
+
+def _parse_trace(
+    path: Path, lookups: Optional[dict] = None
+) -> tuple[dict[str, Probe], int]:
+    """Every dependency question in the trace -- and, when asked for, every
+    lookup each package's own Find module ran.
+
+    The json-v1 trace numbers every command's depth in the whole call stack
+    (``global_frame``), so the find_package a find_library is running inside
+    can be read straight off the stack.
+    """
     probes: dict[str, Probe] = {}
     traced = 0
+    stack: list[dict] = []
     try:
         handle = path.open(encoding="utf-8", errors="replace")
     except OSError:
@@ -305,10 +329,26 @@ def _parse_trace(path: Path) -> tuple[dict[str, Probe], int]:
             if not command:
                 continue
             traced += 1
-            if command not in FIND_COMMANDS:
+            depth = event.get("global_frame")
+            if isinstance(depth, int) and depth >= 1:
+                del stack[depth - 1:]
+                ancestors = list(stack)
+                stack.append(event)
+            else:   # CMake < 3.21: no call stack
+                ancestors = []
+            if command not in FIND_COMMANDS and command not in LOOKUP_COMMANDS:
                 continue
             args = [str(a) for a in event.get("args", []) if str(a).strip()]
             if not args:
+                continue
+            if lookups is not None and command in LOOKUP_COMMANDS:
+                owner = _owner(ancestors)
+                if owner:
+                    entry = (command, args[0], tuple(_lookup_names(args[1:])))
+                    listed = lookups.setdefault(owner, [])
+                    if entry not in listed:
+                        listed.append(entry)
+            if command not in FIND_COMMANDS:
                 continue
             upper = [a.upper() for a in args]
             for name in _subjects(command, args):
@@ -323,6 +363,29 @@ def _parse_trace(path: Path) -> tuple[dict[str, Probe], int]:
                 if existing is None or (probe.required and not existing.required):
                     probes[key] = probe
     return probes, traced
+
+
+def _owner(ancestors: list) -> Optional[str]:
+    """The package whose find_package this lookup is running inside."""
+    for caller in reversed(ancestors):
+        if str(caller.get("cmd", "")).lower() in ("find_package", "find_dependency"):
+            asked = (caller.get("args") or [""])[0]
+            return str(asked).lower() or None
+    return None
+
+
+def _lookup_names(args: list[str]) -> list[str]:
+    """The file or module names a lookup was after, up to its first keyword."""
+    names: list[str] = []
+    for arg in args:
+        upper = arg.upper()
+        if upper in _STOP_KEYWORDS:
+            break
+        if upper in _SKIP_KEYWORDS or not arg or arg.startswith(("$", "-", "/", "[")):
+            continue
+        if re.match(r"^[A-Za-z0-9_+.-][A-Za-z0-9_+./<>=-]*$", arg) and ".." not in arg:
+            names.append(arg)
+    return names
 
 
 #: Keywords after which a find command stops naming libraries and starts
@@ -394,6 +457,8 @@ def run(
     aggregate = PseudoBuild(rounds=0)
     overrides: dict[str, str] = {}
     written: set = set()
+    trial: Optional[_Trial] = None
+    tried: set = set()
 
     with tempfile.TemporaryDirectory(prefix="will-it-riscv-") as scratch:
         scratch_path = Path(scratch)
@@ -438,6 +503,27 @@ def run(
             aggregate.completed = outcome.completed
             aggregate.error = outcome.error
 
+            if trial is not None:
+                # Did stubbing the suspect move the error? Then it was what
+                # the previous round died of. If not, it was innocent: take
+                # every trace of it back out, or later rounds would find it.
+                if outcome.completed or _signature(outcome.error) != trial.signature:
+                    if trial.name not in aggregate.blockers:
+                        aggregate.blockers.append(trial.name)
+                    aggregate.round_blockers[-1] = trial.name
+                    aggregate.experiments.append((trial.name, True))
+                    tried = set()
+                else:
+                    for key in trial.overrides:
+                        overrides.pop(key, None)
+                    for path in trial.files:
+                        Path(path).unlink(missing_ok=True)
+                        written.discard(path)
+                    aggregate.experiments.append((trial.name, False))
+                    outcome.narration = trial.narration
+                    aggregate.unblocked = sorted(overrides)
+                trial = None
+
             if outcome.completed:
                 aggregate.error = None
                 aggregate.round_blockers.append(None)
@@ -459,7 +545,15 @@ def run(
             )
             fresh = {k: v for k, v in fresh.items() if overrides.get(k) != v}
             if not fresh and not created:
-                break   # nothing left to try; the configure is stuck here
+                # The configure died without naming anything this can fake.
+                # Blame by experiment: stub the likeliest suspect and see.
+                trial = _next_trial(
+                    outcome, tried, aggregate.blockers, overrides, sysroot, suffix
+                )
+                if trial is None:
+                    break   # nothing left to try; the configure is stuck here
+                tried.add(trial.name)
+                fresh, created = trial.overrides, trial.files
             overrides.update(fresh)
             written.update(created)
             aggregate.unblocked = sorted(overrides)
@@ -472,6 +566,255 @@ def run(
     aggregate.found -= set(aggregate.blockers)
     aggregate.duration = time.monotonic() - started
     return aggregate
+
+
+# --------------------------------------------------------- blame by experiment
+
+#: How many suspects to try at one stuck point before giving up on it.
+MAX_SUSPECTS = 3
+
+_STATUS_MISS_LINE = re.compile(r"^-- +Could NOT find ([A-Za-z0-9_.+-]+)(.*)$")
+
+
+@dataclass
+class _Trial:
+    """A suspect stubbed to see whether the error moves."""
+
+    name: str
+    signature: str
+    overrides: dict
+    files: list
+    narration: str
+    """The stuck round's narration, to pick the next suspect from if this
+    one turns out to be innocent."""
+
+
+def _signature(error: Optional[str]) -> str:
+    """An error with the parts that change on every run taken out."""
+    text = error or ""
+    text = re.sub(r"cmTC_\w+|TryCompile-\w+", "", text)
+    text = re.sub(r"\S*will-it-riscv-[^\s/]+\S*", "", text)
+    return text.strip()
+
+
+def _mentions(message: str, name: str) -> bool:
+    """Whether an error message names this package, as itself or as a lib."""
+    pattern = rf"(?<![a-z0-9])(?:lib)?{re.escape(name.lower())}(?![a-z0-9])"
+    return bool(re.search(pattern, message))
+
+
+def _suspects(narration: str, probes: Optional[dict] = None) -> list[tuple[str, list[str]]]:
+    """Packages the configure missed before it died, likeliest first.
+
+    GROMACS narrates "-- Could NOT find OpenMP" and then fails in its own
+    words -- "does not support OpenMP parallelism". A miss the error message
+    names comes first; after that, the nearer to the error, the likelier.
+    """
+    misses: list[tuple[str, str]] = []
+    for line in narration.splitlines():
+        if line.startswith(("CMake Error", "  CMake Error")):
+            break
+        match = _STATUS_MISS_LINE.match(line)
+        if match:
+            misses.append((match.group(1), match.group(2)))
+    names = {name for name, _ in misses}
+    grouped: dict[str, list[str]] = {}
+    for name, detail in reversed(misses):
+        head = name.split("_", 1)[0]
+        root = head if head != name and head in names else name
+        grouped.setdefault(root, []).append(detail)
+    stanzas = _error_stanzas(narration)
+    message = stanzas[0].lower() if stanzas else ""
+    named = [root for root in grouped if _mentions(message, root)]
+    # A package looked for without FPHSA never says "Could NOT find" at
+    # all -- GROMACS's FindFFTW is silent, and only the project's own error
+    # names it. The trace still saw the find_package.
+    for probe in (probes or {}).values():
+        if probe.command != "find_package" or probe.name in grouped:
+            continue
+        if _mentions(message, probe.name):
+            grouped[probe.name] = []
+            named.append(probe.name)
+    ranked = named + [root for root in grouped if root not in named]
+    return [(root, grouped[root]) for root in ranked]
+
+
+def _next_trial(
+    outcome: PseudoBuild,
+    tried: set,
+    blockers: list,
+    overrides: dict,
+    sysroot: Path,
+    suffix: str,
+) -> Optional[_Trial]:
+    if len(tried) >= MAX_SUSPECTS:
+        return None
+    for name, details in _suspects(outcome.narration, outcome.probes):
+        if name in tried or name in blockers or name in outcome.found:
+            continue
+        stubbed, files = _stub_package(
+            name, details, sysroot, suffix, outcome.lookups.get(name.lower(), [])
+        )
+        stubbed = {k: v for k, v in stubbed.items() if overrides.get(k) != v}
+        if not stubbed and not files:
+            tried.add(name)
+            continue
+        return _Trial(
+            name=name,
+            signature=_signature(outcome.error),
+            overrides=stubbed,
+            files=files,
+            narration=outcome.narration,
+        )
+    return None
+
+
+def _stub_package(
+    name: str, details: list[str], sysroot: Path, suffix: str, lookups: Optional[list] = None
+) -> tuple[dict, list]:
+    """Make a package the configure shrugged off exist after all."""
+    if name.lower() == "openmp":
+        return _stub_openmp(sysroot, suffix)
+    overrides: dict[str, str] = {}
+    files: list[str] = _stub_lookups(name, lookups or [], sysroot, suffix)
+    wants_config = False
+    for detail in details:
+        match = _MISSING_VARS.search(detail)
+        if not match:
+            continue
+        for token in match.group(1).split():
+            if "_" not in token or token.endswith("_FOUND"):
+                continue
+            if _CONFIG_DIR_VAR.match(token) and not _INCLUDE_VAR.search(token):
+                wants_config = True
+                continue
+            value = _stub_variable(token, sysroot, suffix)
+            if value is None:
+                continue
+            overrides[token] = value
+            if value.startswith(str(sysroot)) and Path(value).is_file():
+                files.append(value)
+    if wants_config:
+        files += _stub_config_package(name, sysroot, suffix)
+    return overrides, files
+
+
+def _stub_lookups(name: str, lookups: list, sysroot: Path, suffix: str) -> list[str]:
+    """Put in the sysroot exactly what the package's Find module looked for.
+
+    The find root is the sysroot, so a library at ``<sysroot>/lib`` and a
+    header at ``<sysroot>/include`` are found by the module's own search --
+    no cache variable needed, and nothing to take back but the files.
+    """
+    files: list[str] = []
+
+    def write(path: Path, text: Optional[str] = None) -> None:
+        if path.exists():
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text) if text is not None else path.touch()
+        except OSError:
+            return
+        files.append(str(path))
+
+    for command, _variable, names in lookups:
+        if not names:
+            continue
+        first = names[0]
+        if command == "find_library":
+            base = first[3:] if first.startswith("lib") and len(first) > 3 else first
+            write(sysroot / "lib" / f"lib{base}{suffix}")
+        elif command in ("find_path", "find_file"):
+            write(sysroot / "include" / first, _fake_header(name))
+        else:   # pkg_check_modules / pkg_search_module
+            module = re.split(r"[<>=]", first, maxsplit=1)[0]
+            if module and not (sysroot / "lib" / "pkgconfig" / f"{module}.pc").exists():
+                files += _stub_pkgconfig(module, sysroot, suffix)
+    return files
+
+
+def _stub_config_package(name: str, sysroot: Path, suffix: str) -> list[str]:
+    """A <Name>Config.cmake that claims the package, for config-mode lookups.
+
+    It lives under the sysroot the find root is confined to, so a plain
+    find_package(Name CONFIG) finds it without any hint.
+    """
+    if not re.match(r"^[A-Za-z0-9_+-]+$", name):
+        return []
+    directory = sysroot / "lib" / "cmake" / name
+    library = sysroot / "lib" / f"lib{name.lower()}{suffix}"
+    major, minor, patch = FAKE_VERSION
+    lines = [f"# stub emitted by will-it-riscv for {name}", f"set({name}_FOUND TRUE)"]
+    for prefix in dict.fromkeys([name, name.upper()]):
+        lines += [
+            f'set({prefix}_VERSION "{FAKE_VERSION_STRING}")',
+            f"set({prefix}_VERSION_MAJOR {major})",
+            f"set({prefix}_VERSION_MINOR {minor})",
+            f"set({prefix}_VERSION_PATCH {patch})",
+            f'set({prefix}_INCLUDE_DIRS "{sysroot.as_posix()}/include")',
+            f'set({prefix}_INCLUDE_DIR "{sysroot.as_posix()}/include")',
+            f'set({prefix}_LIBRARIES "{library.as_posix()}")',
+            f'set({prefix}_LIBRARY_DIRS "{sysroot.as_posix()}/lib")',
+        ]
+    config = directory / f"{name}Config.cmake"
+    version = directory / f"{name}ConfigVersion.cmake"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        library.touch()
+        config.write_text("\n".join(lines) + "\n")
+        version.write_text(
+            f'set(PACKAGE_VERSION "{FAKE_VERSION_STRING}")\n'
+            "set(PACKAGE_VERSION_COMPATIBLE TRUE)\n"
+            "set(PACKAGE_VERSION_EXACT FALSE)\n"
+        )
+    except OSError:
+        return []
+    return [str(config), str(version), str(library)]
+
+
+#: Just enough of omp.h for a check program to compile against.
+_OMP_H = """\
+/* stub emitted by will-it-riscv */
+#ifndef WILL_IT_RISCV_OMP_H
+#define WILL_IT_RISCV_OMP_H
+#ifdef __cplusplus
+extern "C" {
+#endif
+int omp_get_num_threads(void);
+int omp_get_max_threads(void);
+int omp_get_thread_num(void);
+int omp_get_num_procs(void);
+void omp_set_num_threads(int);
+double omp_get_wtime(void);
+#ifdef __cplusplus
+}
+#endif
+#endif
+"""
+
+
+def _stub_openmp(sysroot: Path, suffix: str) -> tuple[dict, list]:
+    """OpenMP comes with the target's compiler, so stand in for it.
+
+    GCC on riscv64 ships libgomp; AppleClang ships nothing at all, and takes
+    the flag only when it is smuggled past the driver with -Xclang.
+    """
+    import sys
+
+    flags = "-Xclang -fopenmp" if sys.platform == "darwin" else "-fopenmp"
+    library = sysroot / "lib" / f"libomp{suffix}"
+    header = sysroot / "include" / "omp.h"
+    try:
+        library.touch()
+        header.write_text(_OMP_H)
+    except OSError:
+        return {}, []
+    overrides = {"OpenMP_omp_LIBRARY": str(library)}
+    for language in ("C", "CXX"):
+        overrides[f"OpenMP_{language}_FLAGS"] = flags
+        overrides[f"OpenMP_{language}_LIB_NAMES"] = "omp"
+    return overrides, [str(library), str(header)]
 
 
 #: Written into the scratch directory, never the project.
@@ -550,7 +893,8 @@ def _configure(
     except (OSError, subprocess.SubprocessError) as exc:
         return PseudoBuild(error=f"could not run cmake: {exc}")
 
-    probes, traced = _parse_trace(trace)
+    lookups: dict = {}
+    probes, traced = _parse_trace(trace, lookups=lookups)
     narration = (process.stdout or "") + "\n" + (process.stderr or "")
     found, soft, blockers = _read_outcomes(narration)
     result = PseudoBuild(
@@ -561,6 +905,7 @@ def _configure(
         soft_misses=soft,
         blocking=blockers[0] if blockers else None,
         blockers=blockers,
+        lookups=lookups,
     )
     result.narration = narration
     if not result.completed:
@@ -636,6 +981,9 @@ def _stub_variable(variable: str, sysroot: Path, suffix: str) -> Optional[str]:
         return str(path)
     if _VERSION_VAR.search(variable):
         return FAKE_VERSION_STRING
+    if variable.upper().endswith("_FLAGS"):
+        # Anything put here lands on a compile line, where "1" is a file name.
+        return None
     # FPHSA only checks the variable is set and not *-NOTFOUND.
     return "1"
 
@@ -652,6 +1000,7 @@ def _stub_pkgconfig(module: str, sysroot: Path, suffix: str) -> list[str]:
     library = name[3:] if name.startswith("lib") and len(name) > 3 else name
     lib = sysroot / "lib" / f"lib{library}{suffix}"
     pc = sysroot / "lib" / "pkgconfig" / f"{name}.pc"
+    fresh_library = not lib.exists()
     try:
         lib.touch()
         pc.write_text(
@@ -666,7 +1015,9 @@ def _stub_pkgconfig(module: str, sysroot: Path, suffix: str) -> list[str]:
         )
     except OSError:
         return []
-    return [str(pc)]
+    # The library too, when this made it: an experiment that is taken back
+    # must leave nothing a later find_library could turn up.
+    return [str(pc), str(lib)] if fresh_library else [str(pc)]
 
 
 def _synthesize(

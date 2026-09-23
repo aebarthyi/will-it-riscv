@@ -101,6 +101,16 @@ def _pseudobuild_section(analysis: Analysis, console: Console) -> None:
         f"  {outcome}{rounds} in {result.duration:.0f}s — "
         f"{len(result.probes)} dependency probes observed"
     )
+    if result.experiments:
+        verdicts = ", ".join(
+            f"{name} {'✓' if ok else '✗'}" for name, ok in result.experiments
+        )
+        console.print(
+            f"  blame by experiment: {verdicts}   (✓ the error moved once it existed; "
+            "✗ it did not, so the stub was taken back out)",
+            style="dim",
+            highlight=False,
+        )
     for note in result.notes:
         console.print(f"  note: {note}", style="yellow", highlight=False)
     if result.blockers:
@@ -485,6 +495,10 @@ def to_dict(analysis: Analysis) -> dict:
                 "error": analysis.pseudobuild.error,
                 "platform": analysis.pseudobuild.platform,
                 "host_gaps": list(analysis.pseudobuild.host_gaps),
+                "experiments": [
+                    {"suspect": name, "confirmed": ok}
+                    for name, ok in analysis.pseudobuild.experiments
+                ],
                 "notes": list(analysis.pseudobuild.notes),
             }
             if analysis.pseudobuild is not None

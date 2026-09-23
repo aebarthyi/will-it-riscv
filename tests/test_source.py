@@ -643,3 +643,12 @@ def test_every_blocker_is_required_not_just_the_first(tmp_path, monkeypatch):
     fake_pseudobuild(monkeypatch, completed=True, blockers=["ZLIB", "PNG"])
     inspection = inspect_repository(tmp_path, scan_ci=False, pseudobuild=True)
     assert {"zlib", "libpng"} <= set(required_names(inspection))
+
+
+def test_a_miss_before_a_configure_that_died_proves_nothing(tmp_path, monkeypatch):
+    """AdaptiveCpp misses LLVM, carries on, then dies wanting clang's headers.
+    Carrying on past a miss is not optionality unless the configure finishes."""
+    build_repo(tmp_path, {"CMakeLists.txt": "find_package(LLVM CONFIG)\n"})
+    fake_pseudobuild(monkeypatch, completed=False, soft_misses={"LLVM"})
+    inspection = inspect_repository(tmp_path, scan_ci=False, pseudobuild=True)
+    assert "llvm" in required_names(inspection)

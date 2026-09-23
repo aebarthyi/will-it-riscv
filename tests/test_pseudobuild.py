@@ -499,3 +499,113 @@ def test_a_missing_system_header_is_stubbed_and_reported_as_a_host_gap(tmp_path)
     assert result.completed, result.error
     assert result.host_gaps == ["linux/wirtest.h"]
     assert result.blockers == []
+
+
+# -- blame by experiment ----------------------------------------------------
+
+from will_it_riscv.pseudobuild import (  # noqa: E402
+    _signature,
+    _stub_lookups,
+    _stub_variable,
+    _suspects,
+)
+
+
+def test_a_flags_variable_is_never_filled_with_a_placeholder(tmp_path):
+    """Whatever goes in *_FLAGS lands on a compile line, where "1" is a file."""
+    assert _stub_variable("OpenMP_CXX_FLAGS", tmp_path, ".so") is None
+
+
+def test_a_miss_the_error_names_is_the_first_suspect():
+    narration = (
+        "-- Could NOT find MPI (missing: MPI_CXX_LIBRARIES)\n"
+        "-- Could NOT find OpenMP_CXX (missing: OpenMP_CXX_FLAGS OpenMP_CXX_LIB_NAMES)\n"
+        "-- Could NOT find OpenMP (missing: OpenMP_CXX_FOUND)\n"
+        "-- Could NOT find Python3 (missing: Python3_EXECUTABLE)\n"
+        "CMake Error at cmake/gmxManageOpenMP.cmake:49 (message):\n"
+        "  The compiler you are using does not support OpenMP parallelism\n"
+    )
+    names = [name for name, _ in _suspects(narration)]
+    # Named first; then nearest to the error. OpenMP_CXX folds into OpenMP.
+    assert names == ["OpenMP", "Python3", "MPI"]
+
+
+def test_a_silent_find_package_the_error_names_is_a_suspect():
+    """GROMACS's FindFFTW never says "Could NOT find": only the error names it."""
+    from will_it_riscv.pseudobuild import Probe
+
+    narration = (
+        "CMake Error at cmake/gmxManageFFTLibraries.cmake:70 (message):\n"
+        "  Cannot find FFTW 3 (with correct precision - libfftw3f)\n"
+    )
+    probes = {"fftw": Probe(name="FFTW", command="find_package")}
+    assert [name for name, _ in _suspects(narration, probes)] == ["FFTW"]
+
+
+def test_a_suspect_is_stubbed_the_way_its_module_looked_for_it(tmp_path):
+    lookups = [
+        ("pkg_check_modules", "PC_FFTWF", ("fftw3f",)),
+        ("find_path", "FFTWF_INCLUDE_DIR", ("fftw3.h",)),
+        ("find_library", "FFTWF_LIBRARY", ("fftw3f",)),
+    ]
+    for directory in ("include", "lib/pkgconfig"):
+        (tmp_path / directory).mkdir(parents=True)
+    files = _stub_lookups("FFTW", lookups, tmp_path, ".so")
+    assert (tmp_path / "lib" / "libfftw3f.so").exists()
+    assert (tmp_path / "include" / "fftw3.h").exists()
+    assert (tmp_path / "lib" / "pkgconfig" / "fftw3f.pc").exists()
+    # Every file is listed, so an innocent suspect can be taken back out.
+    assert len(files) == 3
+
+
+def test_an_error_signature_ignores_what_changes_every_run():
+    first = "CMake Error at /var/x/will-it-riscv-abc123/b/TryCompile-q1 cmTC_1: boom"
+    second = "CMake Error at /var/x/will-it-riscv-zzz999/b/TryCompile-r2 cmTC_2: boom"
+    assert _signature(first) == _signature(second)
+
+
+def test_lookups_are_recorded_against_the_package_running_them(tmp_path):
+    events = [
+        {"cmd": "find_package", "args": ["FFTW"], "file": "/p/CMakeLists.txt", "line": 1, "global_frame": 1},
+        {"cmd": "find_path", "args": ["FFTWF_INCLUDE_DIR", "fftw3.h", "HINTS", "/x"], "file": "/p/FindFFTW.cmake", "line": 2, "global_frame": 2},
+    ]
+    trace = tmp_path / "trace.json"
+    trace.write_text("\n".join(json.dumps(e) for e in events))
+    lookups: dict = {}
+    _parse_trace(trace, lookups=lookups)
+    assert lookups == {"fftw": [("find_path", "FFTWF_INCLUDE_DIR", ("fftw3.h",))]}
+
+
+@needs_cmake
+def test_a_miss_the_configure_later_dies_of_is_found_by_experiment(tmp_path):
+    (tmp_path / "cmake").mkdir()
+    (tmp_path / "cmake" / "FindThing.cmake").write_text(FIND_MODULE)
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(demo NONE)\n"
+        "list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake)\n"
+        "find_package(Thing)\n"
+        "if(NOT Thing_FOUND)\n  message(FATAL_ERROR \"cannot go on without Thing\")\nendif()\n"
+    )
+    result = run(tmp_path, timeout=120)
+    assert result.completed, result.error
+    assert result.blockers == ["Thing"]
+    assert result.experiments == [("Thing", True)]
+
+
+@needs_cmake
+def test_an_innocent_suspect_is_taken_back_out(tmp_path):
+    (tmp_path / "cmake").mkdir()
+    (tmp_path / "cmake" / "FindThing.cmake").write_text(FIND_MODULE)
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(demo NONE)\n"
+        "list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake)\n"
+        "find_package(Thing)\n"
+        'message(FATAL_ERROR "something else entirely")\n'
+    )
+    result = run(tmp_path, timeout=120)
+    assert not result.completed
+    assert result.experiments == [("Thing", False)]
+    assert result.blockers == []
+    assert "THING_LIBRARY" not in result.unblocked

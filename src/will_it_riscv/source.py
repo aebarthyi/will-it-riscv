@@ -287,10 +287,11 @@ def _apply_pseudobuild(
 
     Only two of the three outcomes prove anything about necessity:
 
-    * a package the configure could not find and carried on without anyway is
-      optional, and that is a demonstration rather than an inference;
+    * a package the configure could not find and carried on without, all the
+      way to the end, is optional, and that is a demonstration rather than an
+      inference;
     * a package whose absence stopped the configure is required -- every one
-      of them, in every round.
+      of them, in every round, including those shown by experiment.
 
     A package that was *found* proves only that it exists on this machine --
     it says nothing about whether the build would have managed without it --
@@ -314,7 +315,11 @@ def _apply_pseudobuild(
         known = db.lookup(name, "library")
         return known.name if known is not None else None
 
-    for name in sorted(result.soft_misses):
+    # A miss the configure carried on past is optional only if it then ran
+    # to the end. One that stopped later may have stopped *because* of it:
+    # AdaptiveCpp misses LLVM, carries on, and dies wanting clang's headers.
+    shrugged_off = result.soft_misses if result.completed else set()
+    for name in sorted(shrugged_off):
         key = canonical(name)
         current = found.get(key) if key else None
         if current is None:
@@ -394,7 +399,7 @@ def _apply_unreached(result: PseudoBuild, found: dict) -> None:
         probed.add((known.name if known else probe.name).lower())
     probed |= {n.lower() for n in result.found | result.soft_misses}
     # A blocker was asked for, whether or not the trace saw the question: a
-    # header it could not find counts as much.
+    # header it could not find or an experiment's suspect counts as much.
     for blocker in result.blockers:
         known = db.lookup(blocker, "library")
         probed.add((known.name if known else blocker).lower())

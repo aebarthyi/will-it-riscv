@@ -103,7 +103,8 @@ OpenCV, confined, follows its RISC-V branches and checks for RVV.
 
 | the configure said | meaning |
 | --- | --- |
-| `-- Could NOT find X`, then carried on | **X is optional.** Demonstrated, not inferred. |
+| `-- Could NOT find X`, carried on, and **completed** | **X is optional.** Demonstrated, not inferred. |
+| `-- Could NOT find X`, carried on, then stopped | nothing — it may have stopped *because* of X. AdaptiveCpp misses LLVM this way. |
 | `Could NOT find X` inside a `CMake Error` | **X is required**, and it is the first thing that stops the build. |
 | `-- Found X`, confined | a build tool on this host, or a compile-only check fooled — nothing real was there to find |
 
@@ -128,7 +129,18 @@ Everything is driven by what the configure itself said:
 | `… are set to NOTFOUND … FOO_LIBRARY linked by target` | the variable a target links |
 | `linux/fs.h header not found` | the header — reported as a **host gap**, not a dependency: every riscv64 Linux system has it; the Mac SDK does not |
 
-Status misses are never stubbed — faking an optional dependency
+**Blame by experiment.** Some configures die without naming anything.
+GROMACS narrates `-- Could NOT find OpenMP` and then fails in its own words;
+its FindFFTW never says "Could NOT find" at all. So the loop suspects the
+misses nearest the error — first any the error message mentions by name, then
+the find_packages the trace saw it name — and stubs the likeliest the way its
+own Find module looked for it: the trace records every `find_library`,
+`find_path` and `pkg_check_modules` each module ran. If the error moves, the
+suspect is a hard requirement, shown by experiment. If it does not, every
+trace of the stub is taken back out, so a later round cannot find it, and the
+next suspect is tried — at most three per stuck point.
+
+Status misses are never stubbed on sight — faking an optional dependency
 would erase the very evidence that it is one — and nothing is ever written
 outside the scratch directory.
 
@@ -137,6 +149,8 @@ outside the scratch directory.
 | gdal | 297 required / 4 optional | 255 / 46 | **202 / 99** | PROJ |
 | curl | 47 / 1 | 35 / 14 | **30 / 19** | OpenSSL, libpsl |
 | opencv | 60 / 13 | 32 / 41 | **22 / 51** | none — it bundles every codec |
+| gromacs | 20 / 0 | — | **13 / 7** | OpenMP, FFTW — both by experiment |
+| adaptivecpp | 13 / 6 | — | 13 / 6 | stops: it needs clang's own headers |
 
 **This runs the project's build scripts.** Everything else in this tool only
 reads. Use it on repositories you trust, ideally in a container. It is

@@ -102,14 +102,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scope.add_argument(
         "--pseudobuild", action="store_true",
-        help="configure the project for real in a scratch directory and watch "
-        "what it asks for. Finds what static reading cannot -- a dependency "
-        "the configure shrugs off is proven optional, and the one that stops "
-        "it is proven required. RUNS THE PROJECT'S BUILD SCRIPTS: only do this "
+        help="configure the project for real, as a linux build for the target "
+        "architecture confined to an empty scratch sysroot, and watch what it "
+        "asks for. Finds what static reading cannot -- a dependency the "
+        "configure shrugs off is proven optional, and one that stops it is "
+        "proven required. RUNS THE PROJECT'S BUILD SCRIPTS: only do this "
         "for a repository you trust.",
     )
     scope.add_argument(
         "--pseudobuild-timeout", type=int, default=600, metavar="SECONDS",
+        help="time allowed for the whole unblock-and-rerun loop "
+        "(default: %(default)s)",
     )
     scope.add_argument(
         "--no-meson-introspect", action="store_true",
@@ -197,7 +200,7 @@ def _roots(args: argparse.Namespace) -> RootRequirements:
 
 
 def _scan_source_tree(
-    args: argparse.Namespace, stderr: Console
+    args: argparse.Namespace, stderr: Console, arch: str = "riscv64"
 ) -> Optional[RepositoryInspection]:
     """Scan the repository at args.path, unless told not to."""
     if args.package or args.no_scan:
@@ -212,13 +215,15 @@ def _scan_source_tree(
             path, scan_ci=scan_ci, use_meson_introspect=use_meson,
             pseudobuild=args.pseudobuild,
             pseudobuild_timeout=args.pseudobuild_timeout,
+            pseudobuild_arch=arch,
         )
-    label = "configuring" if args.pseudobuild else "scanning"
+    label = f"configuring as linux/{arch}" if args.pseudobuild else "scanning"
     with stderr.status(f"{label} {path}…"):
         return inspect_repository(
             path, scan_ci=scan_ci, use_meson_introspect=use_meson,
             pseudobuild=args.pseudobuild,
             pseudobuild_timeout=args.pseudobuild_timeout,
+            pseudobuild_arch=arch,
         )
 
 
@@ -262,7 +267,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             free_threaded=True,
         )
 
-    scan = _scan_source_tree(args, stderr)
+    scan = _scan_source_tree(args, stderr, target.arch)
     roots = _roots(args)
     deep_manifests: list[Path] = []
     if scan is not None and not roots and scan.manifests:

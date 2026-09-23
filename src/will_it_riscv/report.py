@@ -89,12 +89,20 @@ def _pseudobuild_section(analysis: Analysis, console: Console) -> None:
         console.print()
         return
 
+    where = (
+        f"configured as {result.platform}, confined to an empty sysroot"
+        if result.confined
+        else "configured for this host — its own libraries answered for the target"
+    )
+    console.print(f"  {where}", style="dim")
     outcome = "configure completed" if result.completed else "configure stopped early"
     rounds = "" if result.rounds <= 1 else f" over {result.rounds} rounds"
     console.print(
         f"  {outcome}{rounds} in {result.duration:.0f}s — "
         f"{len(result.probes)} dependency probes observed"
     )
+    for note in result.notes:
+        console.print(f"  note: {note}", style="yellow", highlight=False)
     if result.blockers:
         console.print(
             Text("  hard requirements, in the order the build demanded them:",
@@ -113,9 +121,22 @@ def _pseudobuild_section(analysis: Analysis, console: Console) -> None:
             + ", ".join(sorted(result.soft_misses)),
             highlight=False,
         )
-    if result.found:
+    if result.host_gaps:
         console.print(
-            "  located on this host: " + ", ".join(sorted(result.found)),
+            "  host gaps, stubbed — every riscv64 Linux system has these: "
+            + ", ".join(result.host_gaps),
+            style="dim",
+            highlight=False,
+        )
+    if result.found:
+        # Confined, nothing real can be found but a host program -- or a
+        # compile-only check that was fooled.
+        label = (
+            "found anyway — host programs, or compile-only checks: "
+            if result.confined else "located on this host: "
+        )
+        console.print(
+            "  " + label + ", ".join(sorted(result.found)),
             style="dim",
             highlight=False,
         )
@@ -462,6 +483,9 @@ def to_dict(analysis: Analysis) -> dict:
                 "proven_optional": sorted(analysis.pseudobuild.soft_misses),
                 "blocking": analysis.pseudobuild.blocking,
                 "error": analysis.pseudobuild.error,
+                "platform": analysis.pseudobuild.platform,
+                "host_gaps": list(analysis.pseudobuild.host_gaps),
+                "notes": list(analysis.pseudobuild.notes),
             }
             if analysis.pseudobuild is not None
             else None

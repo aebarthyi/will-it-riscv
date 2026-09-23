@@ -22,44 +22,44 @@ needs_cmake = pytest.mark.skipif(not available(), reason="cmake is not installed
 
 def test_a_status_miss_is_proof_of_optionality():
     """CMake prefixes STATUS with "-- ". The configure shrugged and moved on."""
-    found, soft, blocking = _read_outcomes(
+    found, soft, blockers = _read_outcomes(
         "-- Found ZLIB: /usr/lib/libz.so\n"
         "-- Could NOT find MySQL (missing: MYSQL_LIBRARY)\n"
         "-- Configuring done\n"
     )
     assert found == {"ZLIB"}
     assert soft == {"MySQL"}
-    assert blocking is None
+    assert blockers == []
 
 
 def test_a_miss_inside_an_error_block_is_the_blocker():
-    found, soft, blocking = _read_outcomes(
+    found, soft, blockers = _read_outcomes(
         "-- Found ZLIB: /usr/lib/libz.so\n"
         "CMake Error at FindPackageHandleStandardArgs.cmake:290 (message):\n"
         "  Could NOT find PROJ (missing: PROJ_LIBRARY)\n"
     )
-    assert blocking == "PROJ"
+    assert blockers == ["PROJ"]
     assert found == {"ZLIB"}
 
 
 def test_the_blocker_wins_over_its_own_status_line():
     """GDAL narrates PROJ as a status miss first, then fatals on it."""
-    _, soft, blocking = _read_outcomes(
+    _, soft, blockers = _read_outcomes(
         "-- Could NOT find PROJ (missing: PROJ_DIR)\n"
         "CMake Error at CMakeLists.txt:287 (message):\n"
         "  Could NOT find PROJ\n"
     )
-    assert blocking == "PROJ"
+    assert blockers == ["PROJ"]
     assert "PROJ" not in soft
 
 
 def test_status_output_after_an_error_block_ends_it():
-    _, _, blocking = _read_outcomes(
+    _, _, blockers = _read_outcomes(
         "CMake Error at x.cmake:1 (message):\n"
         "  some unrelated complaint\n"
         "-- Could NOT find Later (missing: X)\n"
     )
-    assert blocking is None
+    assert blockers == []
 
 
 # -- what a find command was actually looking for ---------------------------
@@ -340,3 +340,162 @@ def test_a_file_already_written_is_not_rewritten(tmp_path):
     )
     _, created = synth(narration, tmp_path, already={str(target)})
     assert created == []
+
+
+# -- more shapes of "what stopped it" ---------------------------------------
+
+from will_it_riscv.pseudobuild import _host_gaps, _stanza_blockers  # noqa: E402
+
+
+def test_a_required_pkg_config_module_is_the_blocker():
+    stanza = (
+        "CMake Error at /usr/share/cmake/Modules/FindPkgConfig.cmake:1093 (message):\n"
+        "  The following required packages were not found:\n"
+        "\n"
+        "   - libpsl\n"
+        "   - libfoo>=1.2\n"
+        "\n"
+        "Call Stack (most recent call first):\n"
+    )
+    assert _stanza_blockers(stanza) == ["libpsl", "libfoo"]
+
+
+def test_pkg_search_module_names_its_first_alternative():
+    stanza = "CMake Error at FindPkgConfig.cmake:9 (message):\n  None of the required 'a;b' found\n"
+    assert _stanza_blockers(stanza) == ["a"]
+
+
+def test_a_notfound_variable_a_target_links_is_a_blocker():
+    stanza = (
+        "CMake Error: The following variables are used in this project, but they are set to NOTFOUND.\n"
+        "Please set them or make sure they are set and tested correctly in the CMake files:\n"
+        "FOO_LIBRARY (ADVANCED)\n"
+        '    linked by target "bar" in directory /src\n'
+    )
+    assert _stanza_blockers(stanza) == ["FOO"]
+
+
+def test_a_missing_imported_target_names_its_package():
+    stanza = (
+        "CMake Error at /tmp/x/TryCompile-ab12/CMakeLists.txt:32 (target_link_libraries):\n"
+        '  Target "cmTC_fb258" links to:\n\n    OpenSSL::SSL\n\n'
+        "  but the target was not found.\n"
+    )
+    assert _stanza_blockers(stanza) == ["OpenSSL"]
+
+
+def test_an_error_inside_a_find_module_is_that_packages():
+    stanza = "CMake Error at cmake/modules/FindPROJ.cmake:48 (file):\n  something odd\n"
+    assert _stanza_blockers(stanza) == ["PROJ"]
+
+
+def test_a_missing_library_header_is_its_librarys_blocker():
+    stanza = "CMake Error at CMakeLists.txt:9 (message):\n  zlib.h not found, install zlib\n"
+    assert _stanza_blockers(stanza) == ["zlib"]
+
+
+def test_a_missing_system_header_is_a_host_gap_not_a_dependency():
+    """GDAL demands linux/fs.h, which the Mac SDK lacks and riscv64 has."""
+    narration = (
+        "CMake Error at port/CMakeLists.txt:156 (message):\n"
+        "  linux/fs.h header not found.  Impact will be lack of sparse file detection.\n"
+    )
+    assert _stanza_blockers(narration) == []
+    assert _host_gaps(narration) == ["linux/fs.h"]
+
+
+def test_a_missing_header_is_stubbed_inside_the_sysroot(tmp_path):
+    overrides, created = synth(
+        "CMake Error at port/CMakeLists.txt:156 (message):\n  linux/fs.h header not found.\n",
+        tmp_path,
+    )
+    assert created == [str(tmp_path / "include" / "linux" / "fs.h")]
+
+
+def test_a_component_named_by_fphsa_gets_its_library_variable(tmp_path):
+    overrides, _ = synth(
+        ERROR + "Could NOT find OpenSSL (missing: OPENSSL_CRYPTO_LIBRARY SSL Crypto)\n",
+        tmp_path,
+    )
+    assert "OPENSSL_SSL_LIBRARY" in overrides
+    assert "SSL" not in overrides and "Crypto" not in overrides
+
+
+def test_a_missing_imported_target_gets_its_component_library(tmp_path):
+    overrides, _ = synth(
+        "CMake Error at /tmp/TryCompile-x/CMakeLists.txt:32 (target_link_libraries):\n"
+        '  Target "cmTC_1" links to:\n\n    OpenSSL::SSL\n\n  but the target was not found.\n',
+        tmp_path,
+    )
+    assert "OPENSSL_SSL_LIBRARY" in overrides
+
+
+def test_a_required_pkg_config_module_gets_a_stub_pc_file(tmp_path):
+    _, created = synth(
+        "CMake Error at FindPkgConfig.cmake:1 (message):\n"
+        "  The following required packages were not found:\n\n   - libpsl>=0.16\n\n",
+        tmp_path,
+    )
+    pc = tmp_path / "lib" / "pkgconfig" / "libpsl.pc"
+    assert str(pc) in created
+    assert "Version: 99.9.9" in pc.read_text()
+
+
+# -- confinement, against a real cmake --------------------------------------
+
+
+@needs_cmake
+def test_the_configure_is_run_as_linux_on_the_target(tmp_path):
+    """Not the host: APPLE is false and the processor is the target's."""
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(demo NONE)\n"
+        "if(APPLE OR WIN32)\n  message(FATAL_ERROR \"configured for the host\")\nendif()\n"
+        'if(NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "riscv64")\n'
+        '  message(FATAL_ERROR "wrong processor ${CMAKE_SYSTEM_PROCESSOR}")\nendif()\n'
+    )
+    result = run(tmp_path, timeout=120)
+    assert result.completed, result.error
+    assert result.platform == "linux/riscv64"
+
+
+@needs_cmake
+def test_nothing_on_the_host_can_be_found(tmp_path):
+    """Confined, a host library cannot answer for the target."""
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(demo NONE)\n"
+        "find_library(Z_LIB NAMES z c System)\n"
+        "if(Z_LIB)\n  message(FATAL_ERROR \"found ${Z_LIB} on the host\")\nendif()\n"
+    )
+    result = run(tmp_path, timeout=120)
+    assert result.completed, result.error
+
+
+@needs_cmake
+@pytest.mark.skipif(not pseudobuild.shutil.which("pkg-config"), reason="no pkg-config")
+def test_a_required_pkg_config_module_is_unblocked_with_a_pc_file(tmp_path):
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(demo NONE)\n"
+        "find_package(PkgConfig REQUIRED)\n"
+        "pkg_check_modules(FOO REQUIRED libwirtest>=1.0)\n"
+    )
+    result = run(tmp_path, timeout=120)
+    assert result.completed, result.error
+    assert result.blockers == ["libwirtest"]
+
+
+@needs_cmake
+def test_a_missing_system_header_is_stubbed_and_reported_as_a_host_gap(tmp_path):
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(demo C)\n"
+        "include(CheckIncludeFile)\n"
+        'check_include_file("linux/wirtest.h" HAVE_IT)\n'
+        'if(NOT HAVE_IT)\n  message(FATAL_ERROR "linux/wirtest.h header not found")\nendif()\n'
+    )
+    result = run(tmp_path, timeout=120)
+    assert result.completed, result.error
+    assert result.host_gaps == ["linux/wirtest.h"]
+    assert result.blockers == []

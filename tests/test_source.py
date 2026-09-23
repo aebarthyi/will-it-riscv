@@ -613,3 +613,33 @@ def test_pseudobuild_is_off_unless_asked_for(tmp_path, monkeypatch):
     inspection = inspect_repository(tmp_path, scan_ci=False)
     assert called == []
     assert inspection.pseudobuild is None
+
+
+def test_confined_every_quiet_miss_is_proven_optional(tmp_path, monkeypatch):
+    """Confined to an empty sysroot, a quiet probe that came back empty was
+    as absent as one FPHSA narrated -- and the configure still finished."""
+    _, Probe = fake_pseudobuild(monkeypatch)
+    from will_it_riscv.pseudobuild import PseudoBuild
+
+    build_repo(tmp_path, {
+        "CMakeLists.txt": "find_package(ZLIB REQUIRED)\npkg_check_modules(XML libxml-2.0)\n",
+    })
+    result = PseudoBuild(
+        completed=True,
+        platform="linux/riscv64",
+        probes={"libxml-2.0": Probe(name="libxml-2.0", command="pkg_check_modules")},
+        blockers=["ZLIB"],
+    )
+    from will_it_riscv import source as source_module
+
+    monkeypatch.setattr(source_module, "run_pseudobuild", lambda *a, **k: result)
+    inspection = inspect_repository(tmp_path, scan_ci=False, pseudobuild=True)
+    assert "zlib" in required_names(inspection)
+    assert "libxml2" in optional_names(inspection)
+
+
+def test_every_blocker_is_required_not_just_the_first(tmp_path, monkeypatch):
+    build_repo(tmp_path, {"CMakeLists.txt": "find_package(ZLIB)\nfind_package(PNG)\n"})
+    fake_pseudobuild(monkeypatch, completed=True, blockers=["ZLIB", "PNG"])
+    inspection = inspect_repository(tmp_path, scan_ci=False, pseudobuild=True)
+    assert {"zlib", "libpng"} <= set(required_names(inspection))

@@ -289,11 +289,16 @@ def _apply_pseudobuild(
 
     * a package the configure could not find and carried on without anyway is
       optional, and that is a demonstration rather than an inference;
-    * the package whose absence stopped the configure is required.
+    * a package whose absence stopped the configure is required -- every one
+      of them, in every round.
 
     A package that was *found* proves only that it exists on this machine --
     it says nothing about whether the build would have managed without it --
     so the static verdict is left alone there.
+
+    Confined to an empty sysroot, "could not find" covers far more than the
+    misses FPHSA narrates: a quiet pkg-config probe or a bare find_library
+    that came back empty was just as absent, and the configure still finished.
     """
     from dataclasses import replace
 
@@ -320,13 +325,28 @@ def _apply_pseudobuild(
             gate=f"configure ran on without it ({name} not found)",
         )
 
-    if result.blocking:
-        key = canonical(result.blocking)
+    if result.completed and result.confined:
+        present = {canonical(n) for n in result.found} | {
+            canonical(n) for n in result.blockers
+        }
+        for probe in result.probes.values():
+            key = canonical(probe.name)
+            current = found.get(key) if key else None
+            if current is None or key in present or current.optional:
+                continue
+            found[key] = replace(
+                current,
+                optional=True,
+                gate=f"configure ran on without it ({probe.name} was never there)",
+            )
+
+    for blocker in result.blockers or ([result.blocking] if result.blocking else []):
+        key = canonical(blocker)
         current = found.get(key) if key else None
         if current is not None:
             found[key] = replace(current, optional=False, gate=None)
-        elif key is None:
-            record(result.blocking, "library", "pseudobuild: configure stopped here")
+        else:
+            record(blocker, "library", "pseudobuild: configure stopped here")
 
     # A probe is a question, not a requirement -- adopting every one of them
     # would inflate the list with things like ssleay32 that the configure
@@ -373,6 +393,11 @@ def _apply_unreached(result: PseudoBuild, found: dict) -> None:
         known = db.lookup(probe.name, "library")
         probed.add((known.name if known else probe.name).lower())
     probed |= {n.lower() for n in result.found | result.soft_misses}
+    # A blocker was asked for, whether or not the trace saw the question: a
+    # header it could not find counts as much.
+    for blocker in result.blockers:
+        known = db.lookup(blocker, "library")
+        probed.add((known.name if known else blocker).lower())
 
     for name, requirement in list(found.items()):
         if requirement.optional or requirement.kind != "library":
@@ -414,6 +439,7 @@ def inspect_repository(
     use_meson_introspect: bool = True,
     pseudobuild: bool = False,
     pseudobuild_timeout: int = 600,
+    pseudobuild_arch: str = "riscv64",
 ) -> RepositoryInspection:
     """Read a source tree and work out what building it needs from the system."""
     root = Path(root)
@@ -457,7 +483,9 @@ def inspect_repository(
         _apply_meson_verdict(meson_scan, found, record)
 
     if pseudobuild:
-        inspection.pseudobuild = run_pseudobuild(root, timeout=pseudobuild_timeout)
+        inspection.pseudobuild = run_pseudobuild(
+            root, timeout=pseudobuild_timeout, arch=pseudobuild_arch
+        )
         if inspection.pseudobuild is not None:
             _apply_pseudobuild(inspection.pseudobuild, found, record, inspection)
 

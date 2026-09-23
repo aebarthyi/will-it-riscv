@@ -75,62 +75,84 @@ scratch directory, with CMake tracing every command and its arguments already
 expanded, and every `pkg-config` query denied. A configure told that nothing
 is installed, which still insists on something, genuinely needs it.
 
-Three outcomes, and only two of them prove anything:
-
-| the configure said | meaning |
-| --- | --- |
-| `-- Could NOT find X`, then carried on | **X is optional.** Demonstrated, not inferred. |
-| `Could NOT find X` inside a `CMake Error` | **X is required**, and it is the first thing that stops the build. |
-| `-- Found X` | only that X exists on *this* host — it says nothing about whether the build needed it, so the static verdict stands |
-
-And when the configure runs to the end, silence counts too: anything it never
-asked about is not part of a default build. That inference is applied only to
-dependencies sighted solely in CMake files, since the trace has no view of a
-Makefile or a CI config.
-
-**Unblock and rerun.** A configure that stops tells you one thing: what
-stopped it. So the blocker is satisfied with a stub and the configure runs
-again, until it either completes or stops somewhere stubbing cannot reach.
-Everything is driven by what the configure itself said — it names the cache
-variables it could not fill, and when a Find module tries to read a header
-that is not there, it names the exact path.
-
-GDAL takes three rounds: blocked at PROJ, so `PROJ_LIBRARY` and
-`PROJ_INCLUDE_DIR` get stub files; blocked again because `FindPROJ.cmake`
-wants to read a version out of `proj.h`, so that header is written carrying
-every common spelling of a version macro; then it completes. Proven-optional
-goes from 7 to 50.
-
-The blockers accumulate into the output that matters for a port: the hard
-requirements, in the order the build demands them. Status misses are never
-stubbed — faking an optional dependency would erase the very evidence that it
-is one — and nothing is ever written outside the scratch directory.
-
 ```console
 $ will-it-riscv ~/src/gdal --pseudobuild
 ```
 ```
 Pseudobuild
-  configure completed over 3 rounds in 54s — 186 dependency probes observed
+  configured as linux/riscv64, confined to an empty sysroot
+  configure completed over 4 rounds in 50s — 189 dependency probes observed
   hard requirements, in the order the build demanded them:
     1. PROJ
-  proven optional (absent, and the configure carried on):
-      AdbcDriverManager, Armadillo, Arrow, BRUNSLI, Blosc, CryptoPP, Doxygen,
-      ECW, GEOS, HDF4, HDF5, MySQL, NetCDF, ODBC, OpenJPEG, Oracle, Poppler,
-      PostgreSQL, QHULL, SPATIALITE, TileDB, muparser … (50 in all)
+  proven optional (absent, and the configure carried on): AdbcDriverManager, Armadillo,
+      Arrow, BRUNSLI, Blosc, CURL, CryptoPP, Deflate, Doxygen, ECW, EXPAT, ExprTk, … (70 in all)
+  host gaps, stubbed — every riscv64 Linux system has these: linux/fs.h
+  found anyway — host programs, or compile-only checks: BISON, Java, PkgConfig, SWIG, Threads
 ```
 
-| repo | static | pseudobuild |
-| --- | --- | --- |
-| gdal | 297 required / 4 optional | **255 / 46**, one hard requirement: PROJ |
-| curl | 48 / 1 | **35 / 14** |
-| opencv | 60 / 13 | **32 / 41** |
+**It configures for riscv64, not for the machine you run it on.** The
+configure runs as a cross build — `CMAKE_SYSTEM_NAME Linux`,
+`CMAKE_SYSTEM_PROCESSOR riscv64` — with every library, header and package
+search re-rooted into an empty scratch sysroot. Otherwise the host answers
+questions meant for the target. On a Mac with Homebrew, 24 of GDAL's
+dependencies were simply *found*, which proves nothing about whether the
+build needed them, and `if(APPLE)` sends the configure down branches a
+riscv64 build never takes. Confined, the only things a configure can find are
+the stubs this tool puts there, so every probe ends in a provable state.
+OpenCV, confined, follows its RISC-V branches and checks for RVV.
+
+| the configure said | meaning |
+| --- | --- |
+| `-- Could NOT find X`, then carried on | **X is optional.** Demonstrated, not inferred. |
+| `Could NOT find X` inside a `CMake Error` | **X is required**, and it is the first thing that stops the build. |
+| `-- Found X`, confined | a build tool on this host, or a compile-only check fooled — nothing real was there to find |
+
+And when the configure runs to the end, silence counts too: anything it
+never asked about is not part of a default build. That inference is applied only to
+dependencies sighted solely in CMake files, since the trace has no view of a
+Makefile or a CI config. Confined, the same goes for a quiet `pkg-config`
+probe or a bare `find_library` that came back empty: it was just as absent,
+and the configure still finished.
+
+**Unblock and rerun.** A configure that stops tells you one thing: what
+stopped it. So the blocker is satisfied with a stub and the configure runs
+again, until it either completes or stops somewhere stubbing cannot reach.
+Everything is driven by what the configure itself said:
+
+| it said | the stub |
+| --- | --- |
+| `(missing: PROJ_LIBRARY PROJ_INCLUDE_DIR)` | an empty library and an include directory |
+| `(missing: … SSL Crypto)`, or `links to: OpenSSL::SSL but the target was not found` | the component's `OPENSSL_SSL_LIBRARY` |
+| `The following required packages were not found: - libpsl` | a `libpsl.pc` in the only directory pkg-config may search |
+| `file failed to open for reading: …/proj.h` | that header, carrying every common spelling of a version macro |
+| `… are set to NOTFOUND … FOO_LIBRARY linked by target` | the variable a target links |
+| `linux/fs.h header not found` | the header — reported as a **host gap**, not a dependency: every riscv64 Linux system has it; the Mac SDK does not |
+
+Status misses are never stubbed — faking an optional dependency
+would erase the very evidence that it is one — and nothing is ever written
+outside the scratch directory.
+
+| repo | static | pseudobuild, on the host | pseudobuild, confined | hard requirements |
+| --- | --- | --- | --- | --- |
+| gdal | 297 required / 4 optional | 255 / 46 | **202 / 99** | PROJ |
+| curl | 47 / 1 | 35 / 14 | **30 / 19** | OpenSSL, libpsl |
+| opencv | 60 / 13 | 32 / 41 | **22 / 51** | none — it bundles every codec |
 
 **This runs the project's build scripts.** Everything else in this tool only
 reads. Use it on repositories you trust, ideally in a container. It is
-opt-in, time-bounded (`--pseudobuild-timeout`), confined to a temporary
-directory that is deleted afterwards, and never invokes the compiler on the
-project itself.
+opt-in, time-bounded (`--pseudobuild-timeout` bounds the whole loop), confined to a
+temporary directory that is deleted afterwards, and never invokes the compiler
+on the project itself.
+
+**Its compile checks are the host's.** There is no riscv64 compiler in the
+loop: the host's compiler answers `check_include_file` and friends, against
+the host's SDK. Checks that would need linking cannot be answered at all —
+the Linux platform rules and the host's linker do not mix — so try-compiles
+only compile, and a library a link check "found" is not taken as present.
+Headers the host lacks and any riscv64 Linux system has
+are stubbed and listed as host gaps. If a project will not configure as a
+cross build at all, it is configured for the host instead, and the report
+says so.
 
 ### Meson projects are asked, not guessed at
 

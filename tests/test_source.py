@@ -514,3 +514,102 @@ def test_meson_verdict_overrides_a_scraper_guess(tmp_path):
     assert inspection.meson_introspect == "ok"
     assert "libxml2" in optional_names(inspection)
     assert "libxml2" not in required_names(inspection)
+
+
+# -- pseudobuild ------------------------------------------------------------
+
+
+def fake_pseudobuild(monkeypatch, **kwargs):
+    from will_it_riscv import source as source_module
+    from will_it_riscv.pseudobuild import Probe, PseudoBuild
+
+    result = PseudoBuild(**kwargs)
+    monkeypatch.setattr(source_module, "run_pseudobuild", lambda *a, **k: result)
+    return result, Probe
+
+
+def test_a_shrugged_off_package_is_proven_optional(tmp_path, monkeypatch):
+    build_repo(tmp_path, {
+        "CMakeLists.txt": "find_package(ZLIB REQUIRED)\nfind_package(MySQL)\n",
+    })
+    fake_pseudobuild(
+        monkeypatch, completed=True, found={"ZLIB"}, soft_misses={"MySQL"},
+    )
+    inspection = inspect_repository(tmp_path, scan_ci=False, pseudobuild=True)
+    assert "zlib" in required_names(inspection)
+    mysql = next(r for r in inspection.profile.system_requirements
+                 if r.name == "mysqlclient")
+    assert mysql.optional
+    assert "ran on without it" in mysql.gate
+
+
+def test_the_blocker_is_proven_required(tmp_path, monkeypatch):
+    build_repo(tmp_path, {
+        "CMakeLists.txt": 'option(WITH_X "" OFF)\nif(WITH_X)\n  find_package(ZLIB)\nendif()\n',
+    })
+    fake_pseudobuild(monkeypatch, completed=False, blocking="ZLIB")
+    inspection = inspect_repository(tmp_path, scan_ci=False, pseudobuild=True)
+    # Static reading called it optional; the configure stopped without it.
+    assert "zlib" in required_names(inspection)
+
+
+def test_a_completed_configure_makes_silence_meaningful(tmp_path, monkeypatch):
+    build_repo(tmp_path, {
+        "CMakeLists.txt": "find_package(ZLIB REQUIRED)\nfind_package(HDF5 REQUIRED)\n",
+    })
+    fake_pseudobuild(monkeypatch, completed=True, found={"ZLIB"})
+    inspection = inspect_repository(tmp_path, scan_ci=False, pseudobuild=True)
+    assert "zlib" in required_names(inspection)
+    # Never probed by a configure that ran to the end: not part of this build.
+    assert "hdf5" in optional_names(inspection)
+
+
+def test_an_unfinished_configure_proves_nothing_by_silence(tmp_path, monkeypatch):
+    build_repo(tmp_path, {
+        "CMakeLists.txt": "find_package(ZLIB REQUIRED)\nfind_package(HDF5 REQUIRED)\n",
+    })
+    fake_pseudobuild(monkeypatch, completed=False, blocking="ZLIB")
+    inspection = inspect_repository(tmp_path, scan_ci=False, pseudobuild=True)
+    assert "hdf5" in required_names(inspection)
+
+
+def test_silence_does_not_overrule_non_cmake_evidence(tmp_path, monkeypatch):
+    """The CMake trace has no view of a Makefile or a CI config."""
+    build_repo(tmp_path, {
+        "CMakeLists.txt": "project(demo)\n",
+        "Makefile": "LIBS=-lhdf5\n",
+    })
+    fake_pseudobuild(monkeypatch, completed=True, found=set())
+    inspection = inspect_repository(tmp_path, scan_ci=False, pseudobuild=True)
+    assert "hdf5" in required_names(inspection)
+
+
+def test_only_a_required_probe_is_adopted(tmp_path, monkeypatch):
+    from will_it_riscv.pseudobuild import Probe
+
+    build_repo(tmp_path, {"CMakeLists.txt": "project(demo)\n"})
+    _, _ = fake_pseudobuild(
+        monkeypatch,
+        completed=False,
+        probes={
+            "zlib": Probe(name="zlib", command="find_package", required=True),
+            "hdf5": Probe(name="hdf5", command="find_package", required=False),
+        },
+    )
+    inspection = inspect_repository(tmp_path, scan_ci=False, pseudobuild=True)
+    names = [r.name for r in inspection.profile.system_requirements]
+    assert "zlib" in names
+    assert "hdf5" not in names
+
+
+def test_pseudobuild_is_off_unless_asked_for(tmp_path, monkeypatch):
+    from will_it_riscv import source as source_module
+
+    called = []
+    monkeypatch.setattr(
+        source_module, "run_pseudobuild", lambda *a, **k: called.append(1)
+    )
+    build_repo(tmp_path, {"CMakeLists.txt": "find_package(ZLIB REQUIRED)\n"})
+    inspection = inspect_repository(tmp_path, scan_ci=False)
+    assert called == []
+    assert inspection.pseudobuild is None

@@ -22,6 +22,8 @@ from typing import Callable, Optional
 
 from .meson_introspect import MesonDependency, MesonScan, scan_dependencies
 from .models import BuildProfile, SystemRequirement
+from .pseudobuild import PseudoBuild
+from .pseudobuild import run as run_pseudobuild
 from .sdist import (
     ScanPolicy,
     SdistInspection,
@@ -68,6 +70,8 @@ class RepositoryInspection:
 
     root: Path
     profile: BuildProfile = field(default_factory=BuildProfile)
+    pseudobuild: Optional[PseudoBuild] = None
+    """Result of configuring the project for real, when asked for."""
     meson_introspect: Optional[str] = None
     """What Meson's own dependency scan did: None if not attempted, "ok",
     or the reason it could not be used."""
@@ -276,6 +280,112 @@ def _apply_meson_verdict(scan: MesonScan, found: dict, record) -> None:
         )
 
 
+def _apply_pseudobuild(
+    result: PseudoBuild, found: dict, record, inspection: RepositoryInspection
+) -> None:
+    """Fold in what running the configure proved.
+
+    Only two of the three outcomes prove anything about necessity:
+
+    * a package the configure could not find and carried on without anyway is
+      optional, and that is a demonstration rather than an inference;
+    * the package whose absence stopped the configure is required.
+
+    A package that was *found* proves only that it exists on this machine --
+    it says nothing about whether the build would have managed without it --
+    so the static verdict is left alone there.
+    """
+    from dataclasses import replace
+
+    from .syslibs import database
+
+    if result.error and not result.probes:
+        inspection.profile.notes.append(f"pseudobuild did not run: {result.error}")
+        return
+
+    db = database()
+
+    def canonical(name: str) -> Optional[str]:
+        known = db.lookup(name, "library")
+        return known.name if known is not None else None
+
+    for name in sorted(result.soft_misses):
+        key = canonical(name)
+        current = found.get(key) if key else None
+        if current is None:
+            continue
+        found[key] = replace(
+            current,
+            optional=True,
+            gate=f"configure ran on without it ({name} not found)",
+        )
+
+    if result.blocking:
+        key = canonical(result.blocking)
+        current = found.get(key) if key else None
+        if current is not None:
+            found[key] = replace(current, optional=False, gate=None)
+        elif key is None:
+            record(result.blocking, "library", "pseudobuild: configure stopped here")
+
+    # A probe is a question, not a requirement -- adopting every one of them
+    # would inflate the list with things like ssleay32 that the configure
+    # merely wondered about. Only REQUIRED says something.
+    for probe in result.probes.values():
+        if not probe.required:
+            continue
+        key = canonical(probe.name)
+        if key and key not in found:
+            record(probe.name, "library", "pseudobuild: required by the configure")
+
+    if result.completed:
+        _apply_unreached(result, found)
+
+
+#: Evidence that the CMake trace is entitled to overrule. A requirement whose
+#: only sighting was in a CMake file is one the trace has full view of; one
+#: also seen in a Makefile or a CI config is not.
+def _only_seen_in_cmake(requirement) -> bool:
+    if not requirement.found_in:
+        return False
+    for origin in requirement.found_in:
+        name = origin.rsplit("/", 1)[-1].lower()
+        if name != "cmakelists.txt" and not name.endswith(".cmake"):
+            return False
+    return True
+
+
+def _apply_unreached(result: PseudoBuild, found: dict) -> None:
+    """After a configure that finished, silence means something.
+
+    The configure ran end to end with every pkg-config query denied, so
+    anything it never even asked about is not part of a default build. That
+    only applies to dependencies the trace could have seen -- ones sighted
+    solely in CMake files.
+    """
+    from dataclasses import replace
+
+    from .syslibs import database
+
+    db = database()
+    probed = set()
+    for probe in result.probes.values():
+        known = db.lookup(probe.name, "library")
+        probed.add((known.name if known else probe.name).lower())
+    probed |= {n.lower() for n in result.found | result.soft_misses}
+
+    for name, requirement in list(found.items()):
+        if requirement.optional or requirement.kind != "library":
+            continue
+        if name.lower() in probed or not _only_seen_in_cmake(requirement):
+            continue
+        found[name] = replace(
+            requirement,
+            optional=True,
+            gate="a completed configure never asked for it",
+        )
+
+
 def _cmake_symbols(members: list) -> object:
     """Learn every CMake option default before judging any condition.
 
@@ -302,6 +412,8 @@ def inspect_repository(
     policy: Optional[ScanPolicy] = None,
     scan_ci: bool = True,
     use_meson_introspect: bool = True,
+    pseudobuild: bool = False,
+    pseudobuild_timeout: int = 600,
 ) -> RepositoryInspection:
     """Read a source tree and work out what building it needs from the system."""
     root = Path(root)
@@ -343,6 +455,11 @@ def inspect_repository(
 
     if meson_scan is not None and meson_scan.ok:
         _apply_meson_verdict(meson_scan, found, record)
+
+    if pseudobuild:
+        inspection.pseudobuild = run_pseudobuild(root, timeout=pseudobuild_timeout)
+        if inspection.pseudobuild is not None:
+            _apply_pseudobuild(inspection.pseudobuild, found, record, inspection)
 
     _apply_implied_tools(inspection.profile, record)
     inspection.profile.system_requirements = sorted(

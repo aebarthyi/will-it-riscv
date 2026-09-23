@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:  # pragma: no cover - models must not import at runtime
+    from .pseudobuild import PseudoBuild
 
 
 class Verdict(enum.Enum):
@@ -180,6 +183,8 @@ class Analysis:
     files_scanned: int = 0
     meson_introspect: Optional[str] = None
     """"ok" when Meson reported its own dependencies, else why it could not."""
+    pseudobuild: Optional[PseudoBuild] = None
+    """The result of configuring the project for real, when asked for."""
     bundled_libraries: set[str] = field(default_factory=set)
     """Libraries the project ships its own copy of, making the system package
     optional rather than required."""

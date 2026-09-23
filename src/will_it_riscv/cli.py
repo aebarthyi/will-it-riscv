@@ -101,6 +101,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip CI configs and Dockerfiles when scanning a source tree",
     )
     scope.add_argument(
+        "--pseudobuild", action="store_true",
+        help="configure the project for real in a scratch directory and watch "
+        "what it asks for. Finds what static reading cannot -- a dependency "
+        "the configure shrugs off is proven optional, and the one that stops "
+        "it is proven required. RUNS THE PROJECT'S BUILD SCRIPTS: only do this "
+        "for a repository you trust.",
+    )
+    scope.add_argument(
+        "--pseudobuild-timeout", type=int, default=600, metavar="SECONDS",
+    )
+    scope.add_argument(
         "--no-meson-introspect", action="store_true",
         help="do not ask meson about its own dependencies; read the "
         "meson.build files directly instead (meson resolves the project's "
@@ -197,9 +208,18 @@ def _scan_source_tree(
     scan_ci = not args.no_ci_scan
     use_meson = not args.no_meson_introspect
     if args.quiet:
-        return inspect_repository(path, scan_ci=scan_ci, use_meson_introspect=use_meson)
-    with stderr.status(f"scanning {path}…"):
-        return inspect_repository(path, scan_ci=scan_ci, use_meson_introspect=use_meson)
+        return inspect_repository(
+            path, scan_ci=scan_ci, use_meson_introspect=use_meson,
+            pseudobuild=args.pseudobuild,
+            pseudobuild_timeout=args.pseudobuild_timeout,
+        )
+    label = "configuring" if args.pseudobuild else "scanning"
+    with stderr.status(f"{label} {path}…"):
+        return inspect_repository(
+            path, scan_ci=scan_ci, use_meson_introspect=use_meson,
+            pseudobuild=args.pseudobuild,
+            pseudobuild_timeout=args.pseudobuild_timeout,
+        )
 
 
 def _annotate_distro(analysis: Analysis, distro: DistroIndex) -> None:
@@ -305,6 +325,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             analysis.files_scanned = scan.files_scanned
             analysis.bundled_libraries = scan.bundled
             analysis.meson_introspect = scan.meson_introspect
+            analysis.pseudobuild = scan.pseudobuild
             for warning in scan.warnings:
                 analysis.add_warning(warning)
             analysis.root = scan.name

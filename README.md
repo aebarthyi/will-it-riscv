@@ -63,6 +63,50 @@ so about, rather than silently reporting nothing. It also flags third-party
 package sources — a PPA or a vendor apt repo that has no builds for your
 architecture is a finding, not a detail.
 
+### Pseudobuilds: configure it, watch, throw it away
+
+Static reading has a ceiling. GDAL wraps every driver in its own
+`gdal_check_package()` macro, so no regex and no `if`/`else` walk will ever
+tell you those are optional — but the macro is perfectly visible while it
+runs.
+
+`--pseudobuild` runs the project's **configure** step (never its build) in a
+scratch directory, with CMake tracing every command and its arguments already
+expanded, and every `pkg-config` query denied. A configure told that nothing
+is installed, which still insists on something, genuinely needs it.
+
+Three outcomes, and only two of them prove anything:
+
+| the configure said | meaning |
+| --- | --- |
+| `-- Could NOT find X`, then carried on | **X is optional.** Demonstrated, not inferred. |
+| `Could NOT find X` inside a `CMake Error` | **X is required**, and it is the first thing that stops the build. |
+| `-- Found X` | only that X exists on *this* host — it says nothing about whether the build needed it, so the static verdict stands |
+
+And when the configure runs to the end, silence counts too: anything it never
+asked about is not part of a default build. That inference is applied only to
+dependencies sighted solely in CMake files, since the trace has no view of a
+Makefile or a CI config.
+
+```console
+$ will-it-riscv ~/src/gdal --pseudobuild
+```
+```
+Pseudobuild
+  configure stopped early in 19s — 45 dependency probes observed
+  first blocker: PROJ
+  proven optional (absent, and the configure carried on):
+      CryptoPP, MSSQL_ODBC, MySQL, ODBC, ODBCCPP, Python
+```
+
+OpenCV's configure completes, and its required set halves: 60 → 32.
+
+**This runs the project's build scripts.** Everything else in this tool only
+reads. Use it on repositories you trust, ideally in a container. It is
+opt-in, time-bounded (`--pseudobuild-timeout`), confined to a temporary
+directory that is deleted afterwards, and never invokes the compiler on the
+project itself.
+
 ### Meson projects are asked, not guessed at
 
 `meson introspect --scan-dependencies` walks a project's `meson.build` files,

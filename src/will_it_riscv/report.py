@@ -47,6 +47,9 @@ def render_text(
     console.print()
 
     _summary(analysis, console)
+    # Before the project section: when a configure stops, what stopped it is
+    # the most useful sentence in the report.
+    _pseudobuild_section(analysis, console)
     _project_section(analysis, console)
 
     for verdict in (
@@ -73,6 +76,53 @@ def render_text(
         for warning in analysis.warnings:
             console.print(f"  • {warning}", style="dim", highlight=False)
         console.print()
+
+
+def _pseudobuild_section(analysis: Analysis, console: Console) -> None:
+    """What running the configure demonstrated, as opposed to what we inferred."""
+    result = analysis.pseudobuild
+    if result is None:
+        return
+    console.print(Text("Pseudobuild", style="bold"))
+    if result.error and not result.probes:
+        console.print(f"  did not run: {result.error}", style="yellow")
+        console.print()
+        return
+
+    outcome = "configure completed" if result.completed else "configure stopped early"
+    console.print(
+        f"  {outcome} in {result.duration:.0f}s — "
+        f"{len(result.probes)} dependency probes observed"
+    )
+    if result.blocking:
+        console.print(
+            Text(f"  first blocker: {result.blocking}", style="bold red"),
+            highlight=False,
+        )
+        console.print(
+            "    the configure stops here, so this has to exist on the target "
+            "before anything else matters",
+            style="dim",
+        )
+    if result.soft_misses:
+        console.print(
+            "  proven optional (absent, and the configure carried on): "
+            + ", ".join(sorted(result.soft_misses)),
+            highlight=False,
+        )
+    if result.found:
+        console.print(
+            "  located on this host: " + ", ".join(sorted(result.found)),
+            style="dim",
+            highlight=False,
+        )
+    if not result.completed:
+        console.print(
+            "    the configure did not finish, so anything after the blocker "
+            "was never reached and is missing from this report",
+            style="dim yellow",
+        )
+    console.print()
 
 
 def _project_section(analysis: Analysis, console: Console) -> None:
@@ -397,6 +447,19 @@ def to_dict(analysis: Analysis) -> dict:
             }
             for p in sorted(analysis.packages.values(), key=lambda r: r.sort_key())
         ],
+        "pseudobuild": (
+            {
+                "completed": analysis.pseudobuild.completed,
+                "duration_seconds": round(analysis.pseudobuild.duration, 1),
+                "probes": sorted(analysis.pseudobuild.probes),
+                "found": sorted(analysis.pseudobuild.found),
+                "proven_optional": sorted(analysis.pseudobuild.soft_misses),
+                "blocking": analysis.pseudobuild.blocking,
+                "error": analysis.pseudobuild.error,
+            }
+            if analysis.pseudobuild is not None
+            else None
+        ),
         "project": (
             {
                 "files_scanned": analysis.files_scanned,

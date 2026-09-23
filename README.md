@@ -76,18 +76,28 @@ expanded, and every `pkg-config` query denied. A configure told that nothing
 is installed, which still insists on something, genuinely needs it.
 
 ```console
-$ will-it-riscv ~/src/gdal --pseudobuild
+$ will-it-riscv ~/src/gromacs --pseudobuild
 ```
 ```
 Pseudobuild
-  configured as linux/riscv64, confined to an empty sysroot
-  configure completed over 4 rounds in 50s — 189 dependency probes observed
+  configured as linux/riscv64, confined to an empty sysroot; configure completed over 3 rounds
+  in 23s — 24 dependency probes observed
+  rounds: OpenMP → FFTW → completed
+  blame by experiment: OpenMP ✓, FFTW ✓   (✓ the error moved once it existed; ✗ it did not,
+  so the stub was taken back out)
+
+  Will it riscv?  YES — every dependency a default build demands is in Debian 13 (trixie) for riscv64
+    sudo apt install libfftw3-dev    # the minimum a default configure demanded
+    OpenMP comes with the compiler (GCC's libgomp)
+    shown by configuring, not compiling: the configure accepts a linux/riscv64 build given only these
+
   hard requirements, in the order the build demanded them:
-    1. PROJ
-  proven optional (absent, and the configure carried on): AdbcDriverManager, Armadillo,
-      Arrow, BRUNSLI, Blosc, CURL, CryptoPP, Deflate, Doxygen, ECW, EXPAT, ExprTk, … (70 in all)
-  host gaps, stubbed — every riscv64 Linux system has these: linux/fs.h
-  found anyway — host programs, or compile-only checks: BISON, Java, PkgConfig, SWIG, Threads
+    1.  OpenMP  shown by experiment  cmake/gmxManageOpenMP.cmake:46        comes with the compiler
+    2.  FFTW    shown by experiment  cmake/gmxManageFFTLibraries.cmake:67  libfftw3-dev ✓
+  proven optional — absent, and the configure carried on (3): HDF5, ImageMagick, MPI
+  claimed by compile-only checks, unverifiable without a target linker: BLAS, LAPACK
+  located on this host, need untested: LATEX, UnixCommands
+  graph: 9 nodes, 9 edges — -f dot | dot -Tsvg > deps.svg
 ```
 
 **It configures for riscv64, not for the machine you run it on.** The
@@ -106,14 +116,13 @@ OpenCV, confined, follows its RISC-V branches and checks for RVV.
 | `-- Could NOT find X`, carried on, and **completed** | **X is optional.** Demonstrated, not inferred. |
 | `-- Could NOT find X`, carried on, then stopped | nothing — it may have stopped *because* of X. AdaptiveCpp misses LLVM this way. |
 | `Could NOT find X` inside a `CMake Error` | **X is required**, and it is the first thing that stops the build. |
-| `-- Found X`, confined | a build tool on this host, or a compile-only check fooled — nothing real was there to find |
+| `-- Found X` at a host program | a build tool on this host; whether the build needs it is untested |
+| `-- Found X`, a library, confined | a compile-only check fooled — nothing real was there to find |
 
 And when the configure runs to the end, silence counts too: anything it
 never asked about is not part of a default build. That inference is applied only to
 dependencies sighted solely in CMake files, since the trace has no view of a
-Makefile or a CI config. Confined, the same goes for a quiet `pkg-config`
-probe or a bare `find_library` that came back empty: it was just as absent,
-and the configure still finished.
+Makefile or a CI config.
 
 **Unblock and rerun.** A configure that stops tells you one thing: what
 stopped it. So the blocker is satisfied with a stub and the configure runs
@@ -144,13 +153,45 @@ Status misses are never stubbed on sight — faking an optional dependency
 would erase the very evidence that it is one — and nothing is ever written
 outside the scratch directory.
 
-| repo | static | pseudobuild, on the host | pseudobuild, confined | hard requirements |
+### The dependency graph, and the answer
+
+Every probe in the trace carries who asked: the project line that decided to
+(for GDAL, each `gdal_check_package(…)` call, not the macro body they all go
+through), the project macro it went through, the package whose Find module
+asked it, and the round that first reached it. That is the graph — the
+project at the root, an edge from whatever asked to what it asked for — and
+`-f dot` draws it, grouped by round, so the drawing shows the unblock loop
+too: what the first configure asked, and what only came into view once PROJ
+existed.
+
+```console
+$ will-it-riscv ~/src/gdal --pseudobuild -f dot | dot -Tsvg > gdal.svg
+```
+
+Hover a node for its proof. `-f json` carries the same graph under
+`pseudobuild.graph`.
+
+The answer comes from checking the hard requirements — and the build tools
+the configure REQUIRED — against the distro's riscv64 archive:
+
+| | |
+| --- | --- |
+| **yes** | the configure completes as a linux/riscv64 build, and the archive has everything it demanded |
+| **probably** | it completes, but a name could not be matched to a package, the archive was not checked, or it only configured for the host |
+| **no** | a hard requirement has no riscv64 package: it has to be built first |
+| **unknown** | the configure stopped somewhere no stub gets past, and says where |
+
+| repo | static | pseudobuild | hard requirements | will it riscv? |
 | --- | --- | --- | --- | --- |
-| gdal | 297 required / 4 optional | 255 / 46 | **202 / 99** | PROJ |
-| curl | 47 / 1 | 35 / 14 | **30 / 19** | OpenSSL, libpsl |
-| opencv | 60 / 13 | 32 / 41 | **22 / 51** | none — it bundles every codec |
-| gromacs | 20 / 0 | — | **13 / 7** | OpenMP, FFTW — both by experiment |
-| adaptivecpp | 13 / 6 | — | 13 / 6 | stops: it needs clang's own headers |
+| gdal | 297 required / 4 optional | **202 / 99** | PROJ | yes — `libproj-dev` |
+| curl | 47 / 1 | **29 / 19** | OpenSSL, libpsl | yes — `libssl-dev libpsl-dev` |
+| opencv | 60 / 13 | **22 / 51** | none — it bundles every codec | yes |
+| gromacs | 20 / 0 | **13 / 7** | OpenMP, FFTW (by experiment) | yes — `libfftw3-dev` |
+| adaptivecpp | 13 / 6 | 13 / 6 | — | unknown: it stops wanting clang's own headers |
+
+"Yes" means the configure accepts a riscv64 build given only those packages.
+It does not mean the code compiles: the pseudobuild never runs the compiler
+on the project.
 
 **This runs the project's build scripts.** Everything else in this tool only
 reads. Use it on repositories you trust, ideally in a container. It is
@@ -162,8 +203,8 @@ on the project itself.
 loop: the host's compiler answers `check_include_file` and friends, against
 the host's SDK. Checks that would need linking cannot be answered at all —
 the Linux platform rules and the host's linker do not mix — so try-compiles
-only compile, and a library a link check "found" is not taken as present.
-Headers the host lacks and any riscv64 Linux system has
+only compile, and a library a link check "found" is reported as unverified
+rather than present. Headers the host lacks and any riscv64 Linux system has
 are stubbed and listed as host gaps. If a project will not configure as a
 cross build at all, it is configured for the host instead, and the report
 says so.
@@ -286,6 +327,9 @@ $ will-it-riscv --no-scan
 
 # machine-readable, for CI
 $ will-it-riscv -f json -o riscv-report.json
+
+# configure it as linux/riscv64 and draw what it asked for
+$ will-it-riscv --pseudobuild -f dot | dot -Tsvg > deps.svg
 
 # just the names of everything that is not pure Python
 $ will-it-riscv -f list

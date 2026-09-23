@@ -374,6 +374,12 @@ fedora = ["libcurl-devel"]
 debian = ["libnghttp2-dev"]
 fedora = ["libnghttp2-devel"]
 
+[library.libpsl]
+aliases = ["psl"]
+pkgconfig = "libpsl"
+debian = ["libpsl-dev"]
+fedora = ["libpsl-devel"]
+
 [library.libsodium]
 aliases = ["sodium"]
 debian = ["libsodium-dev"]

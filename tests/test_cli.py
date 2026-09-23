@@ -93,3 +93,73 @@ def test_markdown_has_the_apt_line(analysis):
     assert "sudo apt install libssl-dev" in text
     assert "| `built` |" in text
     assert "# will-it-riscv: demo" in text
+
+
+# -- the pseudobuild's answer, in every format -------------------------------
+
+
+@pytest.fixture
+def configured(analysis):
+    from will_it_riscv.pseudobuild import Probe, PseudoBuild
+
+    analysis.pseudobuild = PseudoBuild(
+        completed=True,
+        platform="linux/riscv64",
+        rounds=2,
+        blockers=["PROJ"],
+        round_blockers=["PROJ", None],
+        probes={
+            "proj": Probe(name="PROJ", command="find_package", site="CMakeLists.txt:9"),
+            "geos": Probe(name="GEOS", command="find_package", round=2),
+        },
+        soft_misses={"GEOS"},
+        host_gaps=["linux/fs.h"],
+    )
+    return analysis
+
+
+def test_the_text_report_answers_the_question(configured):
+    from io import StringIO
+
+    from rich.console import Console
+
+    from will_it_riscv.report import render_text
+
+    out = StringIO()
+    render_text(configured, Console(file=out, width=160))
+    text = out.getvalue()
+    assert "Will it riscv?" in text
+    assert "PROJ" in text and "CMakeLists.txt:9" in text
+    assert "rounds: PROJ → completed" in text
+    assert "linux/fs.h" in text
+
+
+def test_json_carries_the_graph(configured):
+    payload = json.loads(render_json(configured))
+    pseudo = payload["pseudobuild"]
+    assert pseudo["platform"] == "linux/riscv64"
+    assert pseudo["graph"]["hard_requirements"] == ["PROJ"]
+    assert pseudo["graph"]["answer"]["verdict"] == "probably"   # no archive checked
+
+
+def test_dot_format_is_offered_and_renders(configured):
+    from will_it_riscv.report import render_dot
+
+    assert cli.build_parser().parse_args(["-f", "dot"]).format == "dot"
+    assert render_dot(configured).startswith('digraph "demo"')
+
+
+def test_dot_without_a_pseudobuild_draws_what_static_reading_found(analysis):
+    from will_it_riscv.report import render_dot
+
+    analysis.project_requirements["zlib"] = SystemRequirement(
+        name="zlib", debian=("zlib1g-dev",), found_in=("CMakeLists.txt",)
+    )
+    dot = render_dot(analysis)
+    assert '"__project__" -> "zlib"' in dot
+
+
+def test_markdown_leads_with_the_answer(configured):
+    text = render_markdown(configured)
+    assert "## Will it riscv? **probably**" in text
+    assert "| 1 | `PROJ` |" in text

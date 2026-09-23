@@ -18,7 +18,7 @@ from .distro import DEFAULT_DISTRO, KNOWN_DISTROS, DistroIndex, resolve_spec
 from .index import IndexError_, PackageIndex
 from .inputs import RootRequirements, load
 from .models import Analysis, Verdict
-from .report import render_json, render_list, render_markdown, render_text
+from .report import render_dot, render_json, render_list, render_markdown, render_text
 from .source import RepositoryInspection, inspect_repository
 from .target import Target
 
@@ -106,7 +106,8 @@ def build_parser() -> argparse.ArgumentParser:
         "architecture confined to an empty scratch sysroot, and watch what it "
         "asks for. Finds what static reading cannot -- a dependency the "
         "configure shrugs off is proven optional, and one that stops it is "
-        "proven required. RUNS THE PROJECT'S BUILD SCRIPTS: only do this "
+        "proven required -- and answers whether the target's distro has "
+        "everything it demands. RUNS THE PROJECT'S BUILD SCRIPTS: only do this "
         "for a repository you trust.",
     )
     scope.add_argument(
@@ -138,8 +139,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     output = parser.add_argument_group("output")
     output.add_argument(
-        "-f", "--format", choices=("text", "json", "markdown", "list"), default="text",
-        help="'list' prints just the non-pure-Python packages, one per line",
+        "-f", "--format", choices=("text", "json", "markdown", "list", "dot"),
+        default="text",
+        help="'list' prints just the non-pure-Python packages, one per line; "
+        "'dot' prints the project's dependency graph for Graphviz "
+        "(dot -Tsvg), from the pseudobuild when there is one",
     )
     output.add_argument("-o", "--output", metavar="FILE", help="write the report here")
     output.add_argument(
@@ -361,7 +365,9 @@ def _emit(args: argparse.Namespace, analysis: Analysis, distro: Optional[DistroI
         return
 
     if args.format == "json":
-        payload = render_json(analysis)
+        payload = render_json(analysis, distro)
+    elif args.format == "dot":
+        payload = render_dot(analysis, distro)
     elif args.format == "markdown":
         payload = render_markdown(analysis, distro)
     elif args.format == "list":

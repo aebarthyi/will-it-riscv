@@ -33,7 +33,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 
@@ -57,6 +57,18 @@ class Probe:
     command: str
     required: bool = False
     quiet: bool = False
+    parent: Optional[str] = None
+    """The package whose own Find module or config file asked this -- the
+    edge from CURL to PkgConfig. None when the project itself asked."""
+    via: Optional[str] = None
+    """The project's own function or macro that asked, such as GDAL's
+    ``gdal_check_package``."""
+    site: Optional[str] = None
+    """Where in the project the question was asked, as ``path:line``
+    relative to the source root."""
+    round: int = 1
+    """The configure attempt that first reached this probe. Anything past
+    round one was only reachable once an earlier blocker had been stubbed."""
 
 
 @dataclass
@@ -74,6 +86,9 @@ class PseudoBuild:
 
     found: set = field(default_factory=set)
     """Packages the configure located and used. Proven present."""
+    found_at: dict = field(default_factory=dict)
+    """Where the configure said it found each one. A path under a ``bin``
+    directory is a host program; confined, nothing else real can be found."""
     soft_misses: set = field(default_factory=set)
     """Packages the configure looked for, did not find, and carried on
     without anyway. That is proof of optionality, not an inference."""
@@ -123,6 +138,18 @@ class PseudoBuild:
     def reached(self, name: str) -> bool:
         return name.lower() in self.probes
 
+    def reached_behind(self, probe: Probe) -> Optional[str]:
+        """The blocker this probe was hidden behind, if it was.
+
+        A probe first reached in round N+1 was only reachable because round
+        N's blocker had been stubbed. That is a statement about the order the
+        configure runs in, not about what depends on what.
+        """
+        index = probe.round - 2
+        if 0 <= index < len(self.round_blockers):
+            return self.round_blockers[index]
+        return None
+
 
 def available() -> bool:
     return shutil.which("cmake") is not None
@@ -139,6 +166,7 @@ _MISSING_FILE = re.compile(
     r"file failed to open for reading \(No such file or directory\):\s*\n\s*(\S+)"
 )
 _STATUS_FOUND = re.compile(r"^-- +Found ([A-Za-z0-9_.+-]+)", re.MULTILINE)
+_STATUS_FOUND_AT = re.compile(r"^-- +Found ([A-Za-z0-9_.+-]+): +(\S+)", re.MULTILINE)
 _ANY_MISS = re.compile(r"Could NOT find ([A-Za-z0-9_.+-]+)")
 #: pkg_check_modules(... REQUIRED) lists what it could not find, one per line.
 _PKG_REQUIRED = "required packages were not found"
@@ -299,18 +327,21 @@ LOOKUP_COMMANDS = {
 
 
 def _parse_trace(
-    path: Path, lookups: Optional[dict] = None
+    path: Path, root: Optional[Path] = None, lookups: Optional[dict] = None
 ) -> tuple[dict[str, Probe], int]:
-    """Every dependency question in the trace -- and, when asked for, every
-    lookup each package's own Find module ran.
+    """Every dependency question in the trace, and who asked it.
 
     The json-v1 trace numbers every command's depth in the whole call stack
-    (``global_frame``), so the find_package a find_library is running inside
-    can be read straight off the stack.
+    (``global_frame``), so the chain of callers above a find_package can be
+    rebuilt exactly: which of the project's macros asked, from which line,
+    and whether it was really another package's Find module asking.
     """
     probes: dict[str, Probe] = {}
+    chains: dict[str, list[str]] = {}
     traced = 0
     stack: list[dict] = []
+    wrappers: set[str] = set()
+    prefixes = _prefixes(root)
     try:
         handle = path.open(encoding="utf-8", errors="replace")
     except OSError:
@@ -334,8 +365,15 @@ def _parse_trace(
                 del stack[depth - 1:]
                 ancestors = list(stack)
                 stack.append(event)
-            else:   # CMake < 3.21: no call stack
+            else:   # CMake < 3.21: no call stack, so no provenance
                 ancestors = []
+            if command in ("function", "macro"):
+                # Only the project's own. CMake's find_dependency is a macro
+                # too, and "asked via find_dependency" says nothing.
+                defined = event.get("args") or []
+                if defined and _inside(str(event.get("file", "")), prefixes):
+                    wrappers.add(str(defined[0]).lower())
+                continue
             if command not in FIND_COMMANDS and command not in LOOKUP_COMMANDS:
                 continue
             args = [str(a) for a in event.get("args", []) if str(a).strip()]
@@ -354,15 +392,36 @@ def _parse_trace(
             for name in _subjects(command, args):
                 key = name.lower()
                 existing = probes.get(key)
-                probe = Probe(
+                required = "REQUIRED" in upper
+                if existing is not None:
+                    if required and not existing.required:
+                        probes[key] = replace(existing, required=True)
+                    continue
+                parent, via = _asker(key, ancestors, wrappers)
+                chains[key] = _project_sites([event, *reversed(ancestors)], prefixes)
+                probes[key] = Probe(
                     name=name,
                     command=command,
-                    required="REQUIRED" in upper,
+                    required=required,
                     quiet="QUIET" in upper,
+                    parent=parent,
+                    via=via,
                 )
-                if existing is None or (probe.required and not existing.required):
-                    probes[key] = probe
+    sites = _choose_sites(chains)
+    for key, site in sites.items():
+        probes[key] = replace(probes[key], site=site)
     return probes, traced
+
+
+def _prefixes(root: Optional[Path]) -> tuple[str, ...]:
+    if root is None:
+        return ()
+    spellings = {str(root), str(Path(root).resolve())}
+    return tuple(s.rstrip("/") + "/" for s in spellings)
+
+
+def _inside(file: str, prefixes: tuple[str, ...]) -> bool:
+    return bool(prefixes) and file.startswith(prefixes)
 
 
 def _owner(ancestors: list) -> Optional[str]:
@@ -386,6 +445,71 @@ def _lookup_names(args: list[str]) -> list[str]:
         if re.match(r"^[A-Za-z0-9_+.-][A-Za-z0-9_+./<>=-]*$", arg) and ".." not in arg:
             names.append(arg)
     return names
+
+
+def _asker(key: str, ancestors: list, wrappers: set) -> tuple[Optional[str], Optional[str]]:
+    """The package and the project macro that asked, innermost first."""
+    via = None
+    for caller in reversed(ancestors):
+        command = str(caller.get("cmd", "")).lower()
+        if command in ("find_package", "find_dependency"):
+            asked = (caller.get("args") or [""])[0]
+            if str(asked).lower() != key:
+                return str(asked), via
+            continue   # FindCURL retrying CURL in config mode is still CURL
+        if via is None and command in wrappers:
+            via = command
+    return None, via
+
+
+def _project_sites(events: list, prefixes: tuple[str, ...]) -> list[str]:
+    """``path:line`` of every frame inside the project, innermost first."""
+    sites: list[str] = []
+    for event in events:
+        file = str(event.get("file", ""))
+        if not _inside(file, prefixes):
+            continue
+        relative = file
+        for prefix in prefixes:
+            if file.startswith(prefix):
+                relative = file[len(prefix):]
+                break
+        site = f"{relative}:{event.get('line', 0)}"
+        if not sites or sites[-1] != site:
+            sites.append(site)
+    return sites
+
+
+#: A line that asks for this many different things is a wrapper's body, not
+#: the place anybody decided to depend on something.
+_WRAPPER_FANOUT = 3
+
+
+def _choose_sites(chains: dict[str, list[str]]) -> dict[str, str]:
+    """Pick, for each probe, the line that actually decided to ask.
+
+    The innermost project frame is usually right. When the project routes
+    every lookup through one macro, it is the same line for fifty packages
+    -- GDAL's ``find_package`` inside ``gdal_check_package`` -- so step out
+    to whichever line called the macro, while that narrows things down.
+    """
+    fanout: dict[str, int] = {}
+    for chain in chains.values():
+        for site in set(chain):
+            fanout[site] = fanout.get(site, 0) + 1
+    chosen: dict[str, str] = {}
+    for key, chain in chains.items():
+        if not chain:
+            continue
+        index = 0
+        while (
+            index + 1 < len(chain)
+            and fanout[chain[index]] >= _WRAPPER_FANOUT
+            and fanout[chain[index + 1]] < fanout[chain[index]]
+        ):
+            index += 1
+        chosen[key] = chain[index]
+    return chosen
 
 
 #: Keywords after which a find command stops naming libraries and starts
@@ -496,8 +620,15 @@ def run(
                     outcome = host
 
             aggregate.rounds = attempt
-            aggregate.probes.update(outcome.probes)
+            for key, probe in outcome.probes.items():
+                existing = aggregate.probes.get(key)
+                if existing is None:
+                    aggregate.probes[key] = replace(probe, round=attempt)
+                elif probe.required and not existing.required:
+                    aggregate.probes[key] = replace(existing, required=True)
             aggregate.found |= outcome.found
+            for name, where in outcome.found_at.items():
+                aggregate.found_at.setdefault(name, where)
             aggregate.soft_misses |= outcome.soft_misses
             aggregate.commands_traced += outcome.commands_traced
             aggregate.completed = outcome.completed
@@ -884,7 +1015,7 @@ def _configure(
             command, capture_output=True, text=True, timeout=timeout, env=env
         )
     except subprocess.TimeoutExpired:
-        probes, traced = _parse_trace(trace)
+        probes, traced = _parse_trace(trace, root)
         return PseudoBuild(
             probes=probes,
             error=f"configure did not finish within {timeout}s",
@@ -894,7 +1025,7 @@ def _configure(
         return PseudoBuild(error=f"could not run cmake: {exc}")
 
     lookups: dict = {}
-    probes, traced = _parse_trace(trace, lookups=lookups)
+    probes, traced = _parse_trace(trace, root, lookups)
     narration = (process.stdout or "") + "\n" + (process.stderr or "")
     found, soft, blockers = _read_outcomes(narration)
     result = PseudoBuild(
@@ -908,6 +1039,7 @@ def _configure(
         lookups=lookups,
     )
     result.narration = narration
+    result.found_at = dict(_STATUS_FOUND_AT.findall(narration))
     if not result.completed:
         result.error = _first_error(process.stdout, process.stderr)
     return result

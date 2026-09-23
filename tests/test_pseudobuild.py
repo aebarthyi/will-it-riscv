@@ -609,3 +609,33 @@ def test_an_innocent_suspect_is_taken_back_out(tmp_path):
     assert result.experiments == [("Thing", False)]
     assert result.blockers == []
     assert "THING_LIBRARY" not in result.unblocked
+
+
+# -- provenance: who asked --------------------------------------------------
+
+
+def test_the_trace_says_who_asked_and_from_where(tmp_path):
+    """global_frame rebuilds the call stack: macro, parent package, call site."""
+    root = tmp_path / "src"
+    root.mkdir()
+    events = [
+        {"cmd": "macro", "args": ["proj_check"], "file": f"{root}/helpers.cmake", "line": 1, "global_frame": 1},
+    ]
+    # proj_check(X) called from three lines; its body's find_package is one line.
+    for index, name in enumerate(["CURL", "EXPAT", "GEOS"], start=10):
+        events += [
+            {"cmd": "proj_check", "args": [name], "file": f"{root}/CMakeLists.txt", "line": index, "global_frame": 1},
+            {"cmd": "find_package", "args": [name], "file": f"{root}/helpers.cmake", "line": 3, "global_frame": 2},
+        ]
+    # FindCURL (outside the project) asks for PkgConfig: an edge CURL -> PkgConfig.
+    events[3:3] = [
+        {"cmd": "find_package", "args": ["PkgConfig"], "file": "/usr/share/cmake/FindCURL.cmake", "line": 5, "global_frame": 3},
+    ]
+    trace = tmp_path / "trace.json"
+    trace.write_text("\n".join(json.dumps(e) for e in events))
+    probes, _ = _parse_trace(trace, root)
+    assert probes["curl"].via == "proj_check"
+    # The macro body's line asks for everything; the call site says who decided.
+    assert probes["curl"].site == "CMakeLists.txt:10"
+    assert probes["geos"].site == "CMakeLists.txt:12"
+    assert probes["pkgconfig"].parent == "CURL"

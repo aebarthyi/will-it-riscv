@@ -49,7 +49,7 @@ def render_text(
     _summary(analysis, console)
     # Before the project section: when a configure stops, what stopped it is
     # the most useful sentence in the report.
-    _pseudobuild_section(analysis, console)
+    _pseudobuild_section(analysis, console, distro)
     _project_section(analysis, console)
 
     for verdict in (
@@ -78,8 +78,34 @@ def render_text(
         console.print()
 
 
-def _pseudobuild_section(analysis: Analysis, console: Console) -> None:
+_ANSWER_STYLE = {
+    "yes": "bold green",
+    "probably": "bold yellow",
+    "no": "bold red",
+    "unknown": "bold magenta",
+}
+
+
+def _pseudobuild_graph(analysis: Analysis, distro: Optional[DistroIndex]):
+    from .graph import build
+
+    if analysis.pseudobuild is None:
+        return None
+    return build(analysis.pseudobuild, analysis.root, distro)
+
+
+def _names(nodes, limit: int = 40) -> str:
+    names = [n.name for n in nodes]
+    shown = ", ".join(names[:limit])
+    return shown + (f" … ({len(names)} in all)" if len(names) > limit else "")
+
+
+def _pseudobuild_section(
+    analysis: Analysis, console: Console, distro: Optional[DistroIndex] = None
+) -> None:
     """What running the configure demonstrated, as opposed to what we inferred."""
+    from .graph import OPTIONAL, PRESENT, UNKNOWN, UNVERIFIED
+
     result = analysis.pseudobuild
     if result is None:
         return
@@ -88,19 +114,29 @@ def _pseudobuild_section(analysis: Analysis, console: Console) -> None:
         console.print(f"  did not run: {result.error}", style="yellow")
         console.print()
         return
+    graph = _pseudobuild_graph(analysis, distro)
+    assert graph is not None and graph.answer is not None
 
     where = (
         f"configured as {result.platform}, confined to an empty sysroot"
         if result.confined
         else "configured for this host — its own libraries answered for the target"
     )
-    console.print(f"  {where}", style="dim")
-    outcome = "configure completed" if result.completed else "configure stopped early"
+    outcome = "configure completed" if result.completed else "configure stopped"
     rounds = "" if result.rounds <= 1 else f" over {result.rounds} rounds"
     console.print(
-        f"  {outcome}{rounds} in {result.duration:.0f}s — "
-        f"{len(result.probes)} dependency probes observed"
+        f"  {where}; {outcome}{rounds} in {result.duration:.0f}s — "
+        f"{len(result.probes)} dependency probes observed",
+        highlight=False,
     )
+    if result.rounds > 1 and any(result.round_blockers):
+        steps = [
+            (_blocker_label(graph, name) if name else "stuck")
+            for name in result.round_blockers
+        ]
+        if result.completed:
+            steps[-1] = "completed"
+        console.print("  rounds: " + " → ".join(steps), style="dim", highlight=False)
     if result.experiments:
         verdicts = ", ".join(
             f"{name} {'✓' if ok else '✗'}" for name, ok in result.experiments
@@ -113,22 +149,68 @@ def _pseudobuild_section(analysis: Analysis, console: Console) -> None:
         )
     for note in result.notes:
         console.print(f"  note: {note}", style="yellow", highlight=False)
-    if result.blockers:
+
+    answer = graph.answer
+    console.print()
+    line = Text("  Will it riscv?  ")
+    line.append(answer.verdict.upper(), style=_ANSWER_STYLE.get(answer.verdict, "bold"))
+    line.append(f" — {answer.headline}")
+    console.print(line, highlight=False)
+    if answer.install:
+        console.print(
+            f"    sudo apt install {' '.join(answer.install)}"
+            "    # the minimum a default configure demanded",
+            highlight=False,
+        )
+    for sentence in answer.toolchain + answer.notes:
+        console.print(f"    {sentence}", style="dim", highlight=False)
+    if result.completed:
+        console.print(
+            "    shown by configuring, not compiling: the configure accepts a "
+            f"{result.platform} build given only these",
+            style="dim",
+        )
+    console.print()
+
+    required = graph.required()
+    if required:
         console.print(
             Text("  hard requirements, in the order the build demanded them:",
                  style="bold red")
         )
-        for index, name in enumerate(result.blockers, 1):
-            console.print(f"    {index}. {name}", highlight=False)
+        table = Table(show_header=False, box=None, pad_edge=False, padding=(0, 2, 0, 0))
+        for column in ("index", "name", "proof", "site", "package"):
+            table.add_column(no_wrap=column != "site", overflow="fold")
+        for index, node in enumerate(required, 1):
+            table.add_row(
+                f"    {index}.",
+                Text(node.name, style="bold"),
+                Text("shown by experiment" if "experiment" in node.proof
+                     else "stopped the configure", style="dim"),
+                Text(node.site or "", style="dim"),
+                _availability(node),
+            )
+        console.print(table)
+    tools = [n for n in graph.with_status(PRESENT) if n.asked_required]
+    if tools:
         console.print(
-            "    each of these stopped a configure; nothing else can be "
-            "checked until they exist on the target",
-            style="dim",
+            "  build tools it REQUIRED, which this host has: "
+            + ", ".join(f"{n.name} ({_availability(n).plain})" for n in tools),
+            highlight=False,
         )
-    if result.soft_misses:
+    optional = graph.with_status(OPTIONAL)
+    if optional:
         console.print(
-            "  proven optional (absent, and the configure carried on): "
-            + ", ".join(sorted(result.soft_misses)),
+            f"  proven optional — absent, and the configure carried on ({len(optional)}): "
+            + _names(optional),
+            highlight=False,
+        )
+    unverified = graph.with_status(UNVERIFIED)
+    if unverified:
+        console.print(
+            "  claimed by compile-only checks, unverifiable without a target "
+            "linker: " + _names(unverified),
+            style="dim yellow",
             highlight=False,
         )
     if result.host_gaps:
@@ -138,25 +220,49 @@ def _pseudobuild_section(analysis: Analysis, console: Console) -> None:
             style="dim",
             highlight=False,
         )
-    if result.found:
-        # Confined, nothing real can be found but a host program -- or a
-        # compile-only check that was fooled.
-        label = (
-            "found anyway — host programs, or compile-only checks: "
-            if result.confined else "located on this host: "
-        )
+    present = [n for n in graph.with_status(PRESENT) if not n.asked_required]
+    if present:
         console.print(
-            "  " + label + ", ".join(sorted(result.found)),
+            "  located on this host, need untested: " + _names(present),
             style="dim",
             highlight=False,
         )
-    if not result.completed:
+    unknown = graph.with_status(UNKNOWN)
+    if unknown and not result.completed:
         console.print(
-            "    the configure did not finish, so anything after the blocker "
-            "was never reached and is missing from this report",
+            f"  reached before the configure stopped ({len(unknown)}): " + _names(unknown),
+            style="dim",
+            highlight=False,
+        )
+        console.print(
+            "    anything after the point where it stopped was never reached",
             style="dim yellow",
         )
+    console.print(
+        f"  graph: {len(graph.nodes)} nodes, {len(graph.edges)} edges — "
+        "-f dot | dot -Tsvg > deps.svg",
+        style="dim",
+        highlight=False,
+    )
     console.print()
+
+
+def _blocker_label(graph, raw: str) -> str:
+    from .graph import _display
+
+    return _display(graph, raw)
+
+
+def _availability(node) -> Text:
+    if node.provided_by:
+        return Text("comes with the compiler", style="green")
+    if not node.debian or node.guessed:
+        return Text("no known package", style="yellow")
+    if node.available:
+        return Text(f"{node.available} ✓", style="green")
+    if node.missing:
+        return Text(f"{node.debian[0]} ✗ not for this arch", style="bold red")
+    return Text(node.debian[0], style="dim")
 
 
 def _project_section(analysis: Analysis, console: Console) -> None:
@@ -436,7 +542,10 @@ def _distro_alternatives(
 # ------------------------------------------------------------------ other
 
 
-def to_dict(analysis: Analysis) -> dict:
+def to_dict(analysis: Analysis, distro: Optional[DistroIndex] = None) -> dict:
+    from .graph import to_dict as graph_dict
+
+    graph = _pseudobuild_graph(analysis, distro)
     return {
         "root": analysis.root,
         "target": analysis.target,
@@ -500,6 +609,7 @@ def to_dict(analysis: Analysis) -> dict:
                     for name, ok in analysis.pseudobuild.experiments
                 ],
                 "notes": list(analysis.pseudobuild.notes),
+                "graph": graph_dict(graph) if graph is not None else None,
             }
             if analysis.pseudobuild is not None
             else None
@@ -556,8 +666,17 @@ def _requirement_dict(r) -> dict:
     }
 
 
-def render_json(analysis: Analysis) -> str:
-    return json.dumps(to_dict(analysis), indent=2)
+def render_json(analysis: Analysis, distro: Optional[DistroIndex] = None) -> str:
+    return json.dumps(to_dict(analysis, distro), indent=2)
+
+
+def render_dot(analysis: Analysis, distro: Optional[DistroIndex] = None) -> str:
+    """The dependency graph for Graphviz: observed if there was a pseudobuild,
+    otherwise the project and what static reading says it needs."""
+    from .graph import static, to_dot
+
+    graph = _pseudobuild_graph(analysis, distro) or static(analysis)
+    return to_dot(graph)
 
 
 def render_markdown(analysis: Analysis, distro: Optional[DistroIndex] = None) -> str:
@@ -567,6 +686,29 @@ def render_markdown(analysis: Analysis, distro: Optional[DistroIndex] = None) ->
         out.append(f"- **Distro:** {distro.spec.label} / {distro.arch}")
     out.append(f"- **Packages reached:** {len(analysis.packages)}")
     out.append("")
+
+    graph = _pseudobuild_graph(analysis, distro)
+    if graph is not None and graph.answer is not None:
+        out.append(f"## Will it riscv? **{graph.answer.verdict}**")
+        out.append("")
+        out.append(f"{graph.answer.headline[0].upper()}{graph.answer.headline[1:]}.")
+        out.append("")
+        if graph.answer.install:
+            out.append("```console")
+            out.append(f"$ sudo apt install {' '.join(graph.answer.install)}")
+            out.append("```")
+            out.append("")
+        required = graph.required()
+        if required:
+            out.append("| # | hard requirement | shown by | asked at | package |")
+            out.append("| --- | --- | --- | --- | --- |")
+            for index, node in enumerate(required, 1):
+                proof = "experiment" if "experiment" in node.proof else "stopped the configure"
+                out.append(
+                    f"| {index} | `{node.name}` | {proof} | `{node.site or '—'}` | "
+                    f"{_availability(node).plain} |"
+                )
+            out.append("")
 
     out.append("| verdict | count |")
     out.append("| --- | --- |")

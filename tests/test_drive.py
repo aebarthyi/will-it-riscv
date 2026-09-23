@@ -94,9 +94,13 @@ def test_module_names_are_mapped_to_their_distributions():
 # -- in a plan ---------------------------------------------------------------
 
 
-def test_what_the_build_never_imports_blocks_only_as_written(tmp_path, monkeypatch, target):
-    """MFC's shape: the build imports pyrometheus, which declares jaxlib, which
-    has nothing for riscv64 -- and the build never loads jaxlib itself."""
+def test_the_default_install_is_required_whatever_the_build_imports(
+    tmp_path, monkeypatch, target
+):
+    """MFC's shape: the build step imports pyrometheus, which declares jaxlib,
+    which has nothing for riscv64. The build step never loads jaxlib -- but
+    the default install brings it, and the default build is the minimal spec.
+    That the build step never loads it is information, not a pass."""
     monkeypatch.setattr(drive, "_pip_install", fake_install([]))
     root = repo_with_driver(tmp_path / "repo", "import pyrometheus\n")
     (root / "pyproject.toml").write_text(
@@ -119,12 +123,12 @@ def test_what_the_build_never_imports_blocks_only_as_written(tmp_path, monkeypat
          "evidence": []},
     ]})
     result = planrun.execute(plan, root, index=index, target=target, timeout=120)
+    jaxlib = result.nodes["pypi:jaxlib"]
+    assert jaxlib.required
+    assert (jaxlib.usage, jaxlib.declared_by) == ("declared", ["pyrometheus"])
     assert result.nodes["pypi:pyrometheus"].usage == "imported"
-    assert result.nodes["pypi:jaxlib"].usage == "declared"
-    assert result.nodes["pypi:jaxlib"].declared_by == ["pyrometheus"]
-    assert result.answer.verdict == "no-as-written"
-    assert result.answer.as_written == ["pypi:jaxlib"]
-    assert "pyrometheus declares it" in result.answer.headline
+    assert result.answer.verdict == "no"
+    assert result.answer.blockers == ["pypi:jaxlib"]
     json.dumps(planrun.to_dict(result))
 
 

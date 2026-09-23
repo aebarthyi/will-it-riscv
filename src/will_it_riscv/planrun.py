@@ -77,6 +77,12 @@ class DepNode:
     detail: str = ""
     version: Optional[str] = None
     required: bool = False
+    """Needed by the default build -- the minimal spec. Everything the default
+    install brings in counts, whether or not the build step imports it."""
+    optional_via: list[str] = field(default_factory=list)
+    """When not required: what turns on the optional steps that need it."""
+    carried_on: bool = False
+    """A default configure looked for it, did not find it, and completed."""
     steps: list[str] = field(default_factory=list)
     """Every step that asked for it."""
     package: Optional[str] = None
@@ -85,8 +91,10 @@ class DepNode:
     """The id of the step that makes it exist, when the plan does."""
     usage: Optional[str] = None
     """For a Python package, once the build driver has run: ``imported`` by
-    the build, ``declared`` by something it imports but never loaded itself,
-    or ``unused``. None when nothing ran that could tell."""
+    the build step, ``declared`` by something it imports but never loaded
+    itself, or ``unused``. Information for a port, never a reason to drop a
+    requirement: MFC's build step never loads jaxlib, and its flamelet
+    example cannot run without it. None when nothing ran that could tell."""
     declared_by: list[str] = field(default_factory=list)
     """The imported packages that bring it in, when its usage is declared."""
 
@@ -112,14 +120,14 @@ class PlanAnswer:
     """``yes``, ``yes-after-source-builds``, ``probably``, ``no`` or ``unknown``."""
     headline: str
     blockers: list[str] = field(default_factory=list)
-    """Nothing for the target, and the build needs it -- or nothing ran to say."""
-    as_written: list[str] = field(default_factory=list)
-    """Nothing for the target, installed as the plan is written, and never
-    imported by the build: jaxlib, which MFC's pyrometheus declares."""
+    """Required by the default build, and nothing for the target."""
     from_source: list[str] = field(default_factory=list)
-    unused_from_source: list[str] = field(default_factory=list)
-    """To build from source only because the install brings them; never used."""
+    """Required by the default build, and only source for the target."""
     install: list[str] = field(default_factory=list)
+    optional: dict[str, list[str]] = field(default_factory=dict)
+    """What turns it on -> the blockers and source builds only it brings."""
+    optional_stopped: list[str] = field(default_factory=list)
+    """Optional steps that could not be run to the end."""
 
 
 @dataclass
@@ -213,6 +221,16 @@ def _edge(result: PlanResult, source: str, target: str) -> None:
         result.edges.append((source, target))
 
 
+def _need(node: DepNode, step: Step) -> None:
+    """Record that this step needs the node: required, or optional behind a flag."""
+    if step.optional:
+        flag = step.enabled_by or step.id
+        if flag not in node.optional_via:
+            node.optional_via.append(flag)
+    else:
+        node.required = True
+
+
 def _settle(
     node: DepNode, tier: str, detail: str, provided_by: Optional[str] = None
 ) -> None:
@@ -252,7 +270,7 @@ def _python_install(
     for report in analysis.packages.values():
         node = _node(result, f"pypi:{report.name}", "pypi", report.name)
         node.version = node.version or report.version
-        node.required = True
+        _need(node, step)
         if step.id not in node.steps:
             node.steps.append(step.id)
         detail = report.reasons[0] if report.reasons else report.verdict.value
@@ -282,7 +300,7 @@ def _system_packages(
     missing = 0
     for package in step.packages:
         node = _node(result, f"debian:{package}", "debian", package)
-        node.required = True
+        _need(node, step)
         node.steps.append(step.id)
         _edge(result, f"step:{step.id}", node.id)
         if not checked:
@@ -391,11 +409,16 @@ def _plan_check(result: PlanResult) -> None:
     The plan says MFC's post_process target is configured with
     -DMFC_POST_PROCESS=ON; the driver either did that or it did not.
     """
-    planned = [s for s in result.plan.steps if s.kind == CMAKE_CONFIGURE]
     for outcome in result.steps:
         trace = outcome.trace
         if trace is None:
             continue
+        # A default driver run is held against the default configures only:
+        # the plan's --gpu variant is not something ./mfc.sh build runs.
+        planned = [
+            s for s in result.plan.steps
+            if s.kind == CMAKE_CONFIGURE and s.optional == outcome.step.optional
+        ]
         observed = [_configure_of(argv) for tool, argv in trace.commands if tool == "cmake"]
         configures = [c for c in observed if c is not None]
         matched: set = set()
@@ -462,7 +485,10 @@ def _cmake_configure(
     for key, gnode in graph.nodes.items():
         node = _node(result, ids[key], gnode.kind, gnode.name)
         needed = gnode.status == depgraph.REQUIRED or gnode.asked_required
-        node.required = node.required or needed
+        if needed:
+            _need(node, step)
+        elif gnode.status == depgraph.OPTIONAL and not step.optional:
+            node.carried_on = True
         if step.id not in node.steps:
             node.steps.append(step.id)
         tier, detail, by = _cmake_tier(gnode, provided)
@@ -506,37 +532,36 @@ def _cmake_tier(
 
 
 def _answer(result: PlanResult) -> PlanAnswer:
+    """The default build is the minimal spec; optional steps are reported apart."""
     required = [n for n in result.nodes.values() if n.required]
-    stuck = sorted(n.id for n in required if n.tier == NONE)
-    # A package the build never imports blocks the install as written, not
-    # the build: say which, and why, rather than folding it into "no".
-    as_written = [b for b in stuck if result.nodes[b].usage in ("declared", "unused")]
-    blockers = [b for b in stuck if b not in as_written]
-    source = sorted(n.id for n in required if n.tier == SOURCE)
-    unused_from_source = [n for n in source if result.nodes[n].usage == "unused"]
-    from_source = [n for n in source if n not in unused_from_source]
+    blockers = sorted(n.id for n in required if n.tier == NONE)
+    from_source = sorted(n.id for n in required if n.tier == SOURCE)
     unknown = sorted(n.id for n in required if n.tier == UNKNOWN)
     install = sorted({n.package for n in required if n.tier == BINARY and n.package})
-    stopped = [s for s in result.steps if s.status in ("stopped", "failed")]
+    optional: dict[str, list[str]] = {}
+    for node in sorted(result.nodes.values(), key=lambda n: n.id):
+        if node.required or node.tier not in (NONE, SOURCE):
+            continue
+        for flag in node.optional_via:
+            optional.setdefault(flag, []).append(node.id)
+    optional_stopped = [
+        s.step.id for s in result.steps
+        if s.step.optional and s.status in ("stopped", "failed")
+    ]
+    stopped = [
+        s for s in result.steps if not s.step.optional and s.status in ("stopped", "failed")
+    ]
     lists: dict = {
-        "blockers": blockers, "as_written": as_written, "from_source": from_source,
-        "unused_from_source": unused_from_source, "install": install,
+        "blockers": blockers, "from_source": from_source, "install": install,
+        "optional": optional, "optional_stopped": optional_stopped,
     }
     if blockers:
         names = ", ".join(result.nodes[b].name for b in blockers[:5])
         more = f" and {len(blockers) - 5} more" if len(blockers) > 5 else ""
         return PlanAnswer(
             "no",
-            f"{names}{more}: required, and nothing for the target in the index or "
-            "archive checked",
-            **lists,
-        )
-    if as_written:
-        reasons = "; ".join(_why_unneeded(result.nodes[b]) for b in as_written[:3])
-        return PlanAnswer(
-            "no-as-written",
-            f"the install fails on {', '.join(result.nodes[b].name for b in as_written[:5])}, "
-            f"which has nothing for the target — but the build never imports it: {reasons}",
+            f"{names}{more}: required by the default build, and nothing for the target "
+            "in the index or archive checked",
             **lists,
         )
     if stopped:
@@ -547,26 +572,22 @@ def _answer(result: PlanResult) -> PlanAnswer:
     if from_source:
         return PlanAnswer(
             "yes-after-source-builds",
-            f"every step completes, once {len(from_source)} "
+            f"every default step completes, once {len(from_source)} "
             f"package{'s' if len(from_source) != 1 else ''} are built from source",
             **lists,
         )
     if unknown:
         return PlanAnswer(
             "probably",
-            f"every step completes; {len(unknown)} requirement"
+            f"every default step completes; {len(unknown)} requirement"
             f"{'s' if len(unknown) != 1 else ''} could not be checked",
             **lists,
         )
     return PlanAnswer(
-        "yes", "every step completes, and everything it needs exists for the target", **lists
+        "yes",
+        "every default step completes, and everything it needs exists for the target",
+        **lists,
     )
-
-
-def _why_unneeded(node: DepNode) -> str:
-    if node.usage == "declared" and node.declared_by:
-        return f"{', '.join(node.declared_by)} declares it"
-    return "nothing the build imports needs it"
 
 
 # ------------------------------------------------------------------- output
@@ -577,7 +598,7 @@ _TIER_STYLE = {
 }
 _VERDICT_STYLE = {
     "yes": "bold green", "yes-after-source-builds": "bold yellow",
-    "probably": "bold yellow", "no": "bold red", "no-as-written": "bold red",
+    "probably": "bold yellow", "no": "bold red",
     "unknown": "bold magenta",
 }
 
@@ -594,11 +615,13 @@ def render_text(result: PlanResult, console) -> None:
     console.print(Text("Steps", style="bold"))
     for outcome in result.steps:
         mark = {"done": "✓", "completed": "✓", "stopped": "✗", "failed": "✗"}[outcome.status]
-        style = "green" if mark == "✓" else "red"
+        style = "green" if mark == "✓" else ("yellow" if outcome.step.optional else "red")
         line = Text(f"  {mark} ", style=style)
         line.append(f"{outcome.step.id:<24}", style="bold")
         line.append(f" {outcome.step.kind:<16} ")
         line.append(outcome.detail)
+        if outcome.step.optional:
+            line.append(f"   (optional: {outcome.step.enabled_by})", style="dim")
         console.print(line, highlight=False)
     for outcome in result.steps:
         for check in outcome.plan_check:
@@ -633,16 +656,49 @@ def render_text(result: PlanResult, console) -> None:
             console.print(f"    • {node.id:<28} {node.detail}", highlight=False)
             console.print(f"      {chain}{_usage_note(node)}", style="dim", highlight=False)
 
-    show("nothing public for the target", answer.blockers, "bold red")
-    show("nothing public, but the build never imports it", answer.as_written, "bold red")
-    show("to build from source", answer.from_source, "bold yellow")
-    if answer.unused_from_source:
-        names = ", ".join(result.nodes[n].name for n in answer.unused_from_source)
+    show("required, and nothing public for the target", answer.blockers, "bold red")
+    show("required, and only source for the target", answer.from_source, "bold yellow")
+    imported = [n for n in answer.blockers + answer.from_source
+                if result.nodes[n].usage == "imported"]
+    if any(result.nodes[n].usage for n in answer.blockers + answer.from_source):
         console.print(
-            Text(f"  installed but never imported by the build ({len(answer.unused_from_source)})",
-                 style="bold"),
+            f"    of these, the build step itself imports {len(imported)}"
+            + (f": {', '.join(result.nodes[n].name for n in imported)}" if imported else "")
+            + " — the rest are installed by default all the same",
+            style="dim",
+            highlight=False,
         )
-        console.print(f"    {names}", style="dim", highlight=False)
+    if answer.optional or answer.optional_stopped:
+        console.print(Text("  optional — only with an extra flag or choice", style="bold blue"))
+        crossed = any(
+            result.nodes[n].tier == NONE for ids in answer.optional.values() for n in ids
+        )
+        for flag, node_ids in answer.optional.items():
+            names = ", ".join(
+                result.nodes[n].name + (" ✗" if result.nodes[n].tier == NONE else "")
+                for n in node_ids
+            )
+            console.print(f"    {flag}:  {names}", highlight=False)
+        for step_id in answer.optional_stopped:
+            outcome = next(s for s in result.steps if s.step.id == step_id)
+            console.print(
+                f"    {outcome.step.enabled_by}:  step {step_id!r} {outcome.status}: "
+                f"{outcome.detail}",
+                highlight=False,
+            )
+        if crossed:
+            console.print("    ✗ nothing public for the target", style="dim")
+    carried_on = sorted(
+        n.name for n in result.nodes.values()
+        if n.carried_on and not n.required and not n.optional_via
+    )
+    if carried_on:
+        console.print(
+            f"  optional in the configures — absent, and they carried on ({len(carried_on)}): "
+            + ", ".join(carried_on),
+            style="dim",
+            highlight=False,
+        )
     unknown = sorted(n.id for n in result.nodes.values() if n.required and n.tier == UNKNOWN)
     show("not settled", unknown, "bold magenta")
     provided = sorted(n.id for n in result.nodes.values() if n.required and n.tier == PROVIDED)
@@ -662,12 +718,16 @@ def render_text(result: PlanResult, console) -> None:
 
 
 def _usage_note(node: DepNode) -> str:
+    """What the build step's trace showed. Information, never a demotion."""
     if node.usage == "imported":
-        return "   · imported by the build"
+        return "   · the build step imports it"
     if node.usage == "declared":
-        return f"   · never imported; declared by {', '.join(node.declared_by)}"
+        return (
+            f"   · installed by default with {', '.join(node.declared_by)}; "
+            "the build step itself never loads it"
+        )
     if node.usage == "unused":
-        return "   · never imported by the build"
+        return "   · installed by default; the build step itself never loads it"
     return ""
 
 
@@ -688,10 +748,10 @@ def to_dict(result: PlanResult) -> dict:
                 "verdict": answer.verdict,
                 "headline": answer.headline,
                 "blockers": answer.blockers,
-                "as_written": answer.as_written,
                 "from_source": answer.from_source,
-                "unused_from_source": answer.unused_from_source,
                 "install": answer.install,
+                "optional": answer.optional,
+                "optional_stopped": answer.optional_stopped,
             }
             if answer else None
         ),
@@ -700,6 +760,8 @@ def to_dict(result: PlanResult) -> dict:
             {
                 "id": s.step.id,
                 "kind": s.step.kind,
+                "optional": s.step.optional,
+                "enabled_by": s.step.enabled_by,
                 "status": s.status,
                 "detail": s.detail,
                 "hard_requirements": (
@@ -731,6 +793,8 @@ def to_dict(result: PlanResult) -> dict:
                 "tier": n.tier,
                 "detail": n.detail,
                 "required": n.required,
+                "optional_via": n.optional_via,
+                "carried_on": n.carried_on,
                 "steps": n.steps,
                 "package": n.package,
                 "provided_by": n.provided_by,
@@ -762,21 +826,30 @@ def to_dot(result: PlanResult, required_only: bool = True) -> str:
         '  node [shape=box, style="rounded,filled", fontname=Helvetica, fontsize=11];',
         '  edge [color="#9a9a9a", arrowsize=0.6];',
     ]
-    keep = {n.id for n in result.nodes.values() if n.required or not required_only}
+    keep = {
+        n.id for n in result.nodes.values() if n.required or n.optional_via or not required_only
+    }
     for outcome in result.steps:
         step = outcome.step
         fill = "#e2e2e2" if outcome.status in ("done", "completed") else "#f6c9c9"
         label = f"{step.id}\n{step.kind}"
+        style = "filled,bold"
+        if step.optional:
+            label += f"\noptional: {step.enabled_by}"
+            style = "filled,dashed"
         lines.append(
             f"  {_quote('step:' + step.id)} [label={_quote(label)}, shape=box, "
-            f'style="filled,bold", fillcolor="{fill}"];'
+            f'style="{style}", fillcolor="{fill}"];'
         )
     for node in sorted(result.nodes.values(), key=lambda n: n.id):
         if node.id not in keep:
             continue
         label = f"{node.name}\n{node.ecosystem}" + (f" {node.version}" if node.version else "")
         font = ', fontcolor="white"' if node.tier == NONE else ""
-        faded = ', style="rounded,filled,dashed", color="#9a9a9a"' if node.usage == "unused" else ""
+        faded = (
+            ', style="rounded,filled,dashed", color="#6f8fbf"'
+            if not node.required and node.optional_via else ""
+        )
         tip = f"{node.tier}: {node.detail}" + (f" · {node.usage}" if node.usage else "")
         lines.append(
             f"  {_quote(node.id)} [label={_quote(label)}, fillcolor=\"{_FILL[node.tier]}\""

@@ -261,3 +261,54 @@ def test_a_plan_that_cannot_be_run_is_reported_and_refused(tmp_path, capsys):
     bad.write_text(json.dumps({"repo": "x", "steps": [{"id": "a", "kind": "nope"}]}))
     assert cli.main([str(tmp_path), "--plan", str(bad), "--no-distro"]) == 2
     assert "'kind' must be one of" in capsys.readouterr().err
+
+
+# -- the default build is the minimal spec -----------------------------------
+
+
+def test_an_optional_step_says_what_turns_it_on():
+    with pytest.raises(PlanError, match="says what turns it on"):
+        parse_plan(plan({"id": "gpu", "kind": "cmake-configure", "optional": True,
+                         "evidence": []}))
+    with pytest.raises(PlanError, match="only means something on an optional step"):
+        parse_plan(plan({"id": "cfg", "kind": "cmake-configure", "enabled_by": "--gpu",
+                         "evidence": []}))
+
+
+def test_the_default_build_cannot_wait_on_an_optional_step():
+    with pytest.raises(PlanError, match="comes after optional step 'gpu'"):
+        parse_plan(plan(
+            {"id": "gpu", "kind": "cmake-configure", "optional": True, "enabled_by": "--gpu",
+             "evidence": []},
+            {"id": "cfg", "kind": "cmake-configure", "after": ["gpu"], "evidence": []},
+        ))
+
+
+def test_what_only_an_optional_step_needs_is_optional(tmp_path, target):
+    """The GPU toolchain is not in the archive; the default build does not need it."""
+    result = run_plan(tmp_path, target, plan(
+        {"id": "apt", "kind": "system-packages", "packages": ["gcc"], "evidence": []},
+        {"id": "gpu", "kind": "system-packages", "packages": ["nvhpc", "gcc"],
+         "optional": True, "enabled_by": "./build.sh --gpu", "evidence": []},
+    ), distro=FakeDistro({"gcc"}))
+    assert result.nodes["debian:gcc"].required
+    nvhpc = result.nodes["debian:nvhpc"]
+    assert not nvhpc.required and nvhpc.optional_via == ["./build.sh --gpu"]
+    assert result.answer.verdict == "yes"
+    assert result.answer.optional == {"./build.sh --gpu": ["debian:nvhpc"]}
+
+
+@needs_cmake
+def test_an_optional_step_that_stops_does_not_decide_the_answer(tmp_path, target):
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.18)\n"
+        "project(demo NONE)\n"
+        'if(DEMO_GPU)\n  message(FATAL_ERROR "GPU builds need a vendor compiler")\nendif()\n'
+    )
+    result = run_plan(tmp_path, target, plan(
+        {"id": "cpu", "kind": "cmake-configure", "evidence": []},
+        {"id": "gpu", "kind": "cmake-configure", "defines": {"DEMO_GPU": True},
+         "optional": True, "enabled_by": "--gpu", "evidence": []},
+    ))
+    assert result.answer.verdict == "yes"
+    assert result.answer.optional_stopped == ["gpu"]

@@ -717,3 +717,17 @@ def test_a_plans_defines_are_passed_and_never_stubbed_over(tmp_path):
     assert result.completed, result.error
     assert result.blockers == ["fypp"]
     assert "DEMO_MPI" not in result.unblocked
+
+
+def test_an_error_summary_keeps_all_of_a_wrapped_message():
+    """MFC's reason is on the message's second line: say all of it."""
+    from will_it_riscv.pseudobuild import _first_error
+
+    out = (
+        "CMake Error at CMakeLists.txt:92 (message):\n"
+        "  ERROR: MFC with GPU processing is not currently compatible with GNU\n"
+        "  compilers.  Please use NVIDIA or Cray compilers.\n"
+        "\n"
+        "-- Configuring incomplete, errors occurred!\n"
+    )
+    assert _first_error(out, "").endswith("Please use NVIDIA or Cray compilers.")

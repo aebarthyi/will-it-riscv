@@ -143,6 +143,24 @@
       ]
     },
     {
+      "id": "simulation-gpu-acc",
+      "kind": "cmake-configure",
+      "optional": true,
+      "enabled_by": "./mfc.sh build --gpu acc",
+      "after": ["toolchain", "dep-fftw"],
+      "note": "the OpenACC GPU build: not part of the default build, so whatever it needs is optional",
+      "defines": {
+        "MFC_SIMULATION": true, "CMAKE_BUILD_TYPE": "Release",
+        "MFC_SINGLE_PRECISION": false, "MFC_MIXED_PRECISION": false, "MFC_MPI": true,
+        "MFC_OpenACC": true, "MFC_OpenMP": false, "MFC_GCov": false,
+        "MFC_Unified": false, "MFC_Fastmath": false
+      },
+      "evidence": [
+        {"at": "toolchain/mfc/cli/commands.py:154", "quote": "--gpu [acc|mp]"},
+        {"at": "toolchain/mfc/build.py:474", "quote": "-DMFC_OpenACC={'ON' if (ARG('gpu') == gpuConfigOptions.ACC.value) else 'OFF'}"}
+      ]
+    },
+    {
       "id": "build",
       "kind": "python-run",
       "after": ["toolchain"],

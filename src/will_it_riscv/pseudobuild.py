@@ -1391,12 +1391,20 @@ def _first_error(stdout: str, stderr: str) -> str:
             stripped = line.strip()
             if stripped.startswith(("CMake Error", "ERROR:")):
                 # "CMake Error at x.cmake:12 (message):" says where, not what.
-                # The sentence that says what is on the next line.
-                detail = next(
-                    (n.strip() for n in lines[index + 1:index + 4] if n.strip()), ""
-                )
+                # What follows, wrapped over several indented lines, says what
+                # -- and MFC's "Please use NVIDIA or Cray compilers" is on the
+                # second of them.
+                detail: list[str] = []
+                for following in lines[index + 1:index + 6]:
+                    if not following.strip():
+                        if detail:
+                            break
+                        continue
+                    if not following.startswith(" "):
+                        break
+                    detail.append(following.strip())
                 if stripped.endswith(":") and detail:
-                    return f"{stripped} {detail}"[:240]
-                return stripped[:240]
+                    return f"{stripped} {' '.join(detail)}"[:320]
+                return stripped[:320]
     tail = (stdout or stderr or "").strip().splitlines()
     return tail[-1][:200] if tail else "configure did not complete"

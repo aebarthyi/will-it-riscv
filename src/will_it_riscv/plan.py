@@ -31,7 +31,7 @@ PYTHON_RUN = "python-run"
 STEP_KINDS = (PYTHON_INSTALL, SYSTEM_PACKAGES, CMAKE_CONFIGURE, PYTHON_RUN)
 
 _STEP_FIELDS = {
-    "id", "kind", "evidence", "after", "note", "provides",
+    "id", "kind", "evidence", "after", "note", "provides", "optional", "enabled_by",
     "manifest", "extras", "packages", "source", "defines", "script", "args",
 }
 _PLAN_FIELDS = {"version", "repo", "entry", "steps", "unsure"}
@@ -72,6 +72,13 @@ class Step:
     provides: list[str] = field(default_factory=list)
     """What this step makes exist for the steps after it: MFC's dependency
     targets build FFTW, HDF5, SILO and LAPACK from source."""
+    optional: bool = False
+    """Not part of the default build. The default build is the minimal spec:
+    everything it needs is required. A step that only runs with an extra
+    flag, or on a choice left to the user, is optional -- and so is anything
+    only it needs."""
+    enabled_by: Optional[str] = None
+    """What turns an optional step on: ``./mfc.sh build --gpu acc``."""
     manifest: Optional[str] = None
     """python-install: the pyproject.toml or requirements file installed."""
     extras: list[str] = field(default_factory=list)
@@ -162,10 +169,17 @@ def parse_plan(data: Any) -> Plan:
     ids = [s.id for s in steps]
     for duplicate in sorted({i for i in ids if ids.count(i) > 1}):
         problems.append(f"step id {duplicate!r} is used twice")
+    optional = {s.id for s in steps if s.optional}
     for step in steps:
         for other in step.after:
             if other not in ids:
                 problems.append(f"step {step.id!r}: 'after' names unknown step {other!r}")
+            elif other in optional and not step.optional:
+                # The default build cannot wait on something it does not do.
+                problems.append(
+                    f"step {step.id!r} is part of the default build, but comes after "
+                    f"optional step {other!r}"
+                )
     if not problems and _has_cycle(steps):
         problems.append("steps depend on each other in a cycle")
 
@@ -208,6 +222,19 @@ def _step(raw: Any, index: int, problems: list[str]) -> Optional[Step]:
         note=raw.get("note") if isinstance(raw.get("note"), str) else None,
         provides=_strings(raw.get("provides", []), f"{where}: 'provides'", problems),
     )
+    optional = raw.get("optional", False)
+    if not isinstance(optional, bool):
+        problems.append(f"{where}: 'optional' is true or false")
+    elif optional:
+        step.optional = True
+        enabled_by = raw.get("enabled_by")
+        if not isinstance(enabled_by, str) or not enabled_by.strip():
+            # Optional means someone has to decide to turn it on. Say how.
+            problems.append(f"{where}: an optional step says what turns it on ('enabled_by')")
+        else:
+            step.enabled_by = enabled_by
+    elif "enabled_by" in raw:
+        problems.append(f"{where}: 'enabled_by' only means something on an optional step")
     if kind == PYTHON_INSTALL:
         manifest = raw.get("manifest")
         if not isinstance(manifest, str) or not manifest:
@@ -389,6 +416,8 @@ PLAN_SCHEMA: dict = {
                     },
                     "script": {"type": "string"},
                     "args": {"type": "array", "items": {"type": "string"}},
+                    "optional": {"type": "boolean"},
+                    "enabled_by": {"type": "string"},
                 },
             },
         },

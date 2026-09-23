@@ -88,18 +88,43 @@ asked about is not part of a default build. That inference is applied only to
 dependencies sighted solely in CMake files, since the trace has no view of a
 Makefile or a CI config.
 
+**Unblock and rerun.** A configure that stops tells you one thing: what
+stopped it. So the blocker is satisfied with a stub and the configure runs
+again, until it either completes or stops somewhere stubbing cannot reach.
+Everything is driven by what the configure itself said — it names the cache
+variables it could not fill, and when a Find module tries to read a header
+that is not there, it names the exact path.
+
+GDAL takes three rounds: blocked at PROJ, so `PROJ_LIBRARY` and
+`PROJ_INCLUDE_DIR` get stub files; blocked again because `FindPROJ.cmake`
+wants to read a version out of `proj.h`, so that header is written carrying
+every common spelling of a version macro; then it completes. Proven-optional
+goes from 7 to 50.
+
+The blockers accumulate into the output that matters for a port: the hard
+requirements, in the order the build demands them. Status misses are never
+stubbed — faking an optional dependency would erase the very evidence that it
+is one — and nothing is ever written outside the scratch directory.
+
 ```console
 $ will-it-riscv ~/src/gdal --pseudobuild
 ```
 ```
 Pseudobuild
-  configure stopped early in 19s — 45 dependency probes observed
-  first blocker: PROJ
+  configure completed over 3 rounds in 54s — 186 dependency probes observed
+  hard requirements, in the order the build demanded them:
+    1. PROJ
   proven optional (absent, and the configure carried on):
-      CryptoPP, MSSQL_ODBC, MySQL, ODBC, ODBCCPP, Python
+      AdbcDriverManager, Armadillo, Arrow, BRUNSLI, Blosc, CryptoPP, Doxygen,
+      ECW, GEOS, HDF4, HDF5, MySQL, NetCDF, ODBC, OpenJPEG, Oracle, Poppler,
+      PostgreSQL, QHULL, SPATIALITE, TileDB, muparser … (50 in all)
 ```
 
-OpenCV's configure completes, and its required set halves: 60 → 32.
+| repo | static | pseudobuild |
+| --- | --- | --- |
+| gdal | 297 required / 4 optional | **255 / 46**, one hard requirement: PROJ |
+| curl | 48 / 1 | **35 / 14** |
+| opencv | 60 / 13 | **32 / 41** |
 
 **This runs the project's build scripts.** Everything else in this tool only
 reads. Use it on repositories you trust, ideally in a container. It is

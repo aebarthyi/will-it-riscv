@@ -90,18 +90,21 @@ def _pseudobuild_section(analysis: Analysis, console: Console) -> None:
         return
 
     outcome = "configure completed" if result.completed else "configure stopped early"
+    rounds = "" if result.rounds <= 1 else f" over {result.rounds} rounds"
     console.print(
-        f"  {outcome} in {result.duration:.0f}s — "
+        f"  {outcome}{rounds} in {result.duration:.0f}s — "
         f"{len(result.probes)} dependency probes observed"
     )
-    if result.blocking:
+    if result.blockers:
         console.print(
-            Text(f"  first blocker: {result.blocking}", style="bold red"),
-            highlight=False,
+            Text("  hard requirements, in the order the build demanded them:",
+                 style="bold red")
         )
+        for index, name in enumerate(result.blockers, 1):
+            console.print(f"    {index}. {name}", highlight=False)
         console.print(
-            "    the configure stops here, so this has to exist on the target "
-            "before anything else matters",
+            "    each of these stopped a configure; nothing else can be "
+            "checked until they exist on the target",
             style="dim",
         )
     if result.soft_misses:
@@ -450,6 +453,9 @@ def to_dict(analysis: Analysis) -> dict:
         "pseudobuild": (
             {
                 "completed": analysis.pseudobuild.completed,
+                "rounds": analysis.pseudobuild.rounds,
+                "blockers": list(analysis.pseudobuild.blockers),
+                "stubbed": list(analysis.pseudobuild.unblocked),
                 "duration_seconds": round(analysis.pseudobuild.duration, 1),
                 "probes": sorted(analysis.pseudobuild.probes),
                 "found": sorted(analysis.pseudobuild.found),

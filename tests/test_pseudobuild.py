@@ -175,7 +175,8 @@ def test_real_configure_that_completes_without_an_optional_package(tmp_path):
 
 
 @needs_cmake
-def test_real_configure_that_stops_identifies_the_blocker(tmp_path):
+def test_real_configure_that_stops_is_unblocked_and_rerun(tmp_path):
+    """The blocker is recorded, stubbed, and the configure run again."""
     (tmp_path / "cmake").mkdir()
     (tmp_path / "cmake" / "FindThing.cmake").write_text(FIND_MODULE)
     (tmp_path / "CMakeLists.txt").write_text(
@@ -185,8 +186,38 @@ def test_real_configure_that_stops_identifies_the_blocker(tmp_path):
         "find_package(Thing REQUIRED)\n"
     )
     result = run(tmp_path, timeout=120)
-    assert not result.completed
+    assert result.blockers == ["Thing"]        # it was a hard requirement
     assert result.blocking == "Thing"
+    assert result.rounds == 2                  # stubbed, then it got through
+    assert result.completed
+    assert "THING_LIBRARY" in result.unblocked
+
+
+@needs_cmake
+def test_a_blocker_is_never_reported_as_optional(tmp_path):
+    """Round one narrates the blocker as a status miss before fatalling."""
+    (tmp_path / "cmake").mkdir()
+    (tmp_path / "cmake" / "FindThing.cmake").write_text(FIND_MODULE)
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(demo NONE)\n"
+        "list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake)\n"
+        "find_package(Thing REQUIRED)\n"
+    )
+    result = run(tmp_path, timeout=120)
+    assert "Thing" not in result.soft_misses
+
+
+@needs_cmake
+def test_the_loop_stops_when_it_cannot_help(tmp_path):
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(demo NONE)\n"
+        'message(FATAL_ERROR "no amount of stubbing fixes this")\n'
+    )
+    result = run(tmp_path, timeout=120, max_rounds=4)
+    assert not result.completed
+    assert result.rounds == 1      # nothing to synthesise, so no second try
 
 
 @needs_cmake
@@ -197,3 +228,115 @@ def test_the_source_tree_is_left_alone(tmp_path):
     before = sorted(p.name for p in tmp_path.iterdir())
     run(tmp_path, timeout=120)
     assert sorted(p.name for p in tmp_path.iterdir()) == before
+
+
+# -- synthesis --------------------------------------------------------------
+
+
+def synth(narration, tmp_path, blocking=None, already=None):
+    from will_it_riscv.pseudobuild import _synthesize
+
+    return _synthesize(blocking, narration, tmp_path, already or set())
+
+
+ERROR = "CMake Error at FindPackageHandleStandardArgs.cmake:290 (message):\n  "
+
+
+def test_missing_library_and_include_variables_are_stubbed(tmp_path):
+    overrides, _ = synth(
+        ERROR + "Could NOT find PROJ (missing: PROJ_LIBRARY PROJ_INCLUDE_DIR)\n",
+        tmp_path,
+    )
+    assert set(overrides) == {"PROJ_LIBRARY", "PROJ_INCLUDE_DIR"}
+    from pathlib import Path
+
+    assert Path(overrides["PROJ_LIBRARY"]).exists()
+    assert Path(overrides["PROJ_INCLUDE_DIR"]).is_dir()
+
+
+def test_status_misses_are_never_stubbed(tmp_path):
+    """Stubbing an optional dependency would erase the evidence it is one."""
+    narration = (
+        "-- Could NOT find MySQL (missing: MYSQL_LIBRARY MYSQL_INCLUDE_DIR)\n"
+        "-- Could NOT find ODBC (missing: ODBC_INCLUDE_DIR)\n"
+        + ERROR + "Could NOT find PROJ (missing: PROJ_LIBRARY)\n"
+    )
+    overrides, _ = synth(narration, tmp_path)
+    assert set(overrides) == {"PROJ_LIBRARY"}
+
+
+def test_a_version_variable_gets_a_generous_version(tmp_path):
+    overrides, _ = synth(
+        ERROR + "Could NOT find X (missing: X_VERSION)\n", tmp_path
+    )
+    assert overrides["X_VERSION"] == "99.9.9"
+
+
+def test_an_executable_variable_gets_a_runnable_stub(tmp_path):
+    from pathlib import Path
+
+    overrides, _ = synth(
+        ERROR + "Could NOT find X (missing: X_EXECUTABLE)\n", tmp_path
+    )
+    path = Path(overrides["X_EXECUTABLE"])
+    assert path.exists() and path.stat().st_mode & 0o111
+
+
+def test_a_config_mode_dir_hint_is_left_alone(tmp_path):
+    """Faking <Pkg>_DIR sends CMake after a config file that is not there."""
+    overrides, _ = synth(ERROR + "Could NOT find PROJ (missing: PROJ_DIR)\n", tmp_path)
+    assert "PROJ_DIR" not in overrides
+
+
+def test_an_unrecognised_variable_is_merely_made_truthy(tmp_path):
+    overrides, _ = synth(
+        ERROR + "Could NOT find X (missing: CRYPTOPP_TEST_KNOWNBUG)\n", tmp_path
+    )
+    assert overrides["CRYPTOPP_TEST_KNOWNBUG"] == "1"
+
+
+def test_a_header_the_module_wanted_to_read_is_written_with_versions(tmp_path):
+    """GDAL's FindPROJ greps the version out of proj.h and rejects old ones."""
+    target = tmp_path / "include" / "proj.h"
+    narration = (
+        "CMake Error at FindPROJ.cmake:48 (file):\n"
+        "  file failed to open for reading (No such file or directory):\n"
+        f"    {target}\n"
+    )
+    overrides, created = synth(narration, tmp_path, blocking="PROJ")
+    assert created == [str(target)]
+    body = target.read_text()
+    assert "#define PROJ_VERSION_MAJOR 99" in body
+    assert '#define PROJ_VERSION "99.9.9"' in body
+
+
+def test_writing_a_file_counts_as_progress_even_without_an_override(tmp_path):
+    target = tmp_path / "include" / "thing.h"
+    narration = (
+        "CMake Error at F.cmake:1 (file):\n"
+        "  file failed to open for reading (No such file or directory):\n"
+        f"    {target}\n"
+    )
+    overrides, created = synth(narration, tmp_path)
+    assert overrides == {} and created
+
+
+def test_nothing_is_written_outside_the_scratch_directory(tmp_path):
+    narration = (
+        "CMake Error at F.cmake:1 (file):\n"
+        "  file failed to open for reading (No such file or directory):\n"
+        "    /etc/definitely-not-ours.h\n"
+    )
+    _, created = synth(narration, tmp_path)
+    assert created == []
+
+
+def test_a_file_already_written_is_not_rewritten(tmp_path):
+    target = tmp_path / "include" / "x.h"
+    narration = (
+        "CMake Error at F.cmake:1 (file):\n"
+        "  file failed to open for reading (No such file or directory):\n"
+        f"    {target}\n"
+    )
+    _, created = synth(narration, tmp_path, already={str(target)})
+    assert created == []

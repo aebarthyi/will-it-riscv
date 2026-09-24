@@ -7,6 +7,8 @@ answered the cheapest way that is still honest:
   system-packages   looked up in the distro's riscv64 archive
   cmake-configure   configured for real, confined to an empty sysroot that
                     grows a stub for whatever the configure insists on
+  meson-setup       the same, for Meson: set up as a linux/riscv64 cross
+                    build, confined the same way
   python-run        the project's own build driver, run on the host with its
                     build tools shimmed, to see which packages it imports
 
@@ -23,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 
 from . import drive
@@ -32,6 +35,7 @@ from .inputs import RootRequirements, load
 from .models import Verdict
 from .plan import (
     CMAKE_CONFIGURE,
+    MESON_SETUP,
     PYTHON_INSTALL,
     PYTHON_RUN,
     SYSTEM_PACKAGES,
@@ -42,6 +46,7 @@ from .plan import (
 )
 from .pseudobuild import PseudoBuild
 from .pseudobuild import run as run_pseudobuild
+from .pseudomeson import run as run_pseudomeson
 
 if TYPE_CHECKING:  # pragma: no cover
     from .distro import DistroIndex
@@ -79,14 +84,8 @@ UPSTREAM_BINARIES = {
                          "aarch64": "aarch64-unknown-linux-gnu",
                          "x86_64": "x86_64-unknown-linux-gnu"}),
 }
-#: Tools whose source is public but which publish no binaries for riscv64:
-#: they would have to be built from source first.
-UPSTREAM_SOURCE = {
-    "bazel-bootstrap": (
-        "Bazel publishes no riscv64 binaries; it has to be bootstrapped from its "
-        "source (github.com/bazelbuild/bazel) with a JDK"
-    ),
-}
+# Tools whose source is public but which publish no binaries for riscv64 --
+# they would have to be built from source first -- are in upstream.UPSTREAM.
 
 _RANK = {PROVIDED: -1, BINARY: 0, TOOLCHAIN: 0, SOURCE: 1, UNKNOWN: 2, NONE: 3}
 
@@ -121,6 +120,9 @@ class DepNode:
     example cannot run without it. None when nothing ran that could tell."""
     declared_by: list[str] = field(default_factory=list)
     """The imported packages that bring it in, when its usage is declared."""
+    wants: Optional[str] = None
+    """For a distro package asked for at a version: the version the build
+    wants -- 8.7.0, for jax's Bazel. What recursing into its source fetches."""
 
 
 @dataclass
@@ -216,8 +218,8 @@ def execute(
         elif step.kind == PYTHON_RUN:
             outcome = _python_run(step, root, result, timeout, pip_cache, progress)
         else:
-            assert step.kind == CMAKE_CONFIGURE
-            outcome = _cmake_configure(
+            assert step.kind in (CMAKE_CONFIGURE, MESON_SETUP)
+            outcome = _configure(
                 step, plan, root, target, distro, timeout, provided, result, pip_cache
             )
         result.steps.append(outcome)
@@ -284,11 +286,17 @@ def _python_install(
     distro: Optional[DistroIndex], result: PlanResult,
 ) -> StepResult:
     """Resolved against the index for the target, never installed."""
-    assert step.manifest is not None
-    try:
-        roots = load(root / step.manifest, tuple(step.extras))
-    except (OSError, ValueError) as exc:
-        return StepResult(step, "failed", f"{step.manifest}: {exc}")
+    if step.manifest is None:
+        try:
+            requirements = [Requirement(spec) for spec in step.packages]
+        except InvalidRequirement as exc:
+            return StepResult(step, "failed", f"{exc}")
+        roots = RootRequirements(source=f"step {step.id}", runtime=requirements)
+    else:
+        try:
+            roots = load(root / step.manifest, tuple(step.extras))
+        except (OSError, ValueError) as exc:
+            return StepResult(step, "failed", f"{step.manifest}: {exc}")
     if step.section == "build-system":
         # What building it needs: its [build-system].requires, installed
         # the way pip's build isolation would.
@@ -336,6 +344,8 @@ def _system_packages(
         assert parsed is not None   # parse_plan checked
         package, operator, wanted = parsed
         node = _node(result, f"debian:{package}", "debian", package)
+        if wanted and (node.wants is None or _newer(wanted, node.wants)):
+            node.wants = wanted
         _need(node, step)
         node.steps.append(step.id)
         _edge(result, f"step:{step.id}", node.id)
@@ -524,9 +534,20 @@ def _elsewhere(package: str, arch: str, shortfall: str) -> tuple[str, str]:
     if upstream is not None and arch in upstream[1]:
         installer, triples = upstream
         return BINARY, f"{shortfall}; {installer} ships {triples[arch]} toolchains"
-    if package in UPSTREAM_SOURCE:
-        return SOURCE, f"{shortfall}; {UPSTREAM_SOURCE[package]}"
+    from .upstream import UPSTREAM
+
+    if package in UPSTREAM:
+        return SOURCE, f"{shortfall}; {UPSTREAM[package].note}"
     return NONE, shortfall
+
+
+def _newer(a: str, b: str) -> bool:
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        return Version(a) > Version(b)
+    except InvalidVersion:
+        return False
 
 
 def _satisfies(have: Optional[str], operator: Optional[str], wanted: str) -> bool:
@@ -545,21 +566,30 @@ def _satisfies(have: Optional[str], operator: Optional[str], wanted: str) -> boo
     return mine == theirs if operator == "==" else mine >= theirs
 
 
-def _cmake_configure(
+def _configure(
     step: Step, plan: Plan, root: Path, target: Target, distro: Optional[DistroIndex],
     timeout: int, provided: dict[str, str], result: PlanResult,
     pip_cache: Optional[Path] = None,
 ) -> StepResult:
+    """A CMake configure or a Meson setup, and what it asked for."""
     source = root / step.source
     # What earlier steps installed is what the configure's interpreter can
-    # import: numpy, when a build requirement put it there.
+    # import, and what gives it its build tools: numpy, Cython, meson.
     dists = {n.name: n.version for n in result.nodes.values() if n.ecosystem == "pypi"}
-    outcome = run_pseudobuild(
-        source, timeout=timeout, arch=target.arch, defines=step.defines,
-        python_dists=dists, pip_cache=pip_cache,
-    )
+    if step.kind == MESON_SETUP:
+        outcome = run_pseudomeson(
+            source, timeout=timeout, arch=target.arch, options=step.defines,
+            python_dists=dists, pip_cache=pip_cache, meson=step.meson,
+        )
+        missing = "meson.build"
+    else:
+        outcome = run_pseudobuild(
+            source, timeout=timeout, arch=target.arch, defines=step.defines,
+            python_dists=dists, pip_cache=pip_cache,
+        )
+        missing = "CMakeLists.txt"
     if outcome is None:
-        return StepResult(step, "failed", f"no CMakeLists.txt in {step.source}")
+        return StepResult(step, "failed", f"no {missing} in {step.source}")
     if outcome.error and not outcome.probes and not outcome.completed:
         return StepResult(step, "failed", outcome.error, pseudobuild=outcome)
     graph = depgraph.build(outcome, f"{plan.repo}/{step.id}", distro)
@@ -588,7 +618,7 @@ def _cmake_configure(
     chain = " → ".join(graph.nodes[k].name for k in graph.order) or "nothing required"
     detail = f"{outcome.rounds} round{'s' if outcome.rounds != 1 else ''}: {chain}"
     if outcome.python_installed:
-        detail += "; its interpreter imported " + ", ".join(outcome.python_installed)
+        detail += "; installed for the host: " + ", ".join(outcome.python_installed)
     if not outcome.completed and outcome.error:
         detail += f"; stopped at {outcome.error}"
     return StepResult(step, status, detail, pseudobuild=outcome, graph=graph)

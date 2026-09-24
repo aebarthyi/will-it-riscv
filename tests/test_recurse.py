@@ -106,17 +106,28 @@ def test_a_cmake_package_is_planned_to_be_configured(tmp_path):
     assert check_evidence(plan, tmp_path) == []   # its citations hold, like any plan's
 
 
-def test_a_meson_python_package_is_read_and_says_so(tmp_path):
-    """meson and ninja come from pip, as build requirements: nothing to ask the distro."""
+def test_a_meson_python_package_is_planned_to_be_set_up(tmp_path):
+    """meson and ninja come from pip, as build requirements: nothing to ask the distro.
+
+    numpy ships its own Meson, and says so in [tool.meson-python].
+    """
     write(tmp_path, {
         "pyproject.toml": '[build-system]\nrequires = ["meson-python"]\n'
-                          'build-backend = "mesonpy"\n',
+                          'build-backend = "mesonpy"\n'
+                          "[tool.meson-python]\nmeson = 'vendored-meson/meson/meson.py'\n"
+                          "[tool.meson-python.args]\nsetup = ['-Dblas=openblas', '--vsenv']\n",
         "meson.build": "project('pkg', 'c')\n",
+        "CMakeLists.txt": "project(unused)\n",
     })
     plan = auto_plan(tmp_path, "pkg")
-    assert [s.id for s in plan.steps] == ["build-requires"]
-    assert not configured(plan)
-    assert any("does not configure yet" in u for u in plan.unsure)
+    assert [(s.id, s.kind) for s in plan.steps] == [
+        ("build-requires", "python-install"), ("setup", "meson-setup"),
+    ]
+    setup = plan.steps[1]
+    assert setup.meson == "vendored-meson/meson/meson.py"
+    assert setup.defines == {"blas": "openblas"}
+    assert configured(plan)
+    assert check_evidence(plan, tmp_path) == []
 
 
 def test_a_plain_meson_build_needs_meson_from_the_distro(tmp_path):
@@ -125,6 +136,7 @@ def test_a_plain_meson_build_needs_meson_from_the_distro(tmp_path):
     assert next(s for s in plan.steps if s.id == "meson-tools").packages == [
         "meson", "ninja-build",
     ]
+    assert any(s.kind == "meson-setup" for s in plan.steps) and configured(plan)
 
 
 def test_a_pinned_tool_is_asked_for_at_its_pin(tmp_path):
@@ -230,13 +242,13 @@ def run(tmp_path, target, root_deps, sdists, wheels=None, distro=None, **options
 
 @needs_cmake
 def test_the_answer_is_built_back_up_from_the_leaves(tmp_path, target):
-    """a configures with CMake; it builds with b, which builds with Meson."""
+    """a configures with CMake; it builds with b, which builds with SCons."""
     sdists = {
         "a": sdist_of("a", ["b"], {"CMakeLists.txt": "cmake_minimum_required(VERSION 3.18)\n"
                                                      "project(a NONE)\n"}),
-        "b": sdist_of("b", [], {"meson.build": "project('b', 'c')\n"}),
+        "b": sdist_of("b", [], {"SConstruct": "Program('b.c')\n"}),
     }
-    walk = run(tmp_path, target, ["a"], sdists, distro=FakeDistro({"meson", "ninja-build"}))
+    walk = run(tmp_path, target, ["a"], sdists, distro=FakeDistro({"scons"}))
     a, b = walk.nodes["pypi:a@1.0"], walk.nodes["pypi:b@1.0"]
     assert b.status == recurse.PROBABLY          # read, not configured
     assert a.status == recurse.PROBABLY          # configured, but b could only be read
@@ -322,3 +334,35 @@ def test_a_tool_the_archive_has_too_old_is_installed_from_upstream(tmp_path, tar
     distro = FakeDistro({"rustc": "1.85.0+dfsg1-1", "cargo": "1.85.0+dfsg1-1"})
     walk = run(tmp_path, target, ["a"], sdists, distro=distro)
     assert recurse.installed(walk.nodes["pypi:a@1.0"]) == ["cargo", "rustc (rustup)"]
+
+
+def test_a_tool_the_archive_has_too_old_is_followed_to_its_source(tmp_path, target, monkeypatch):
+    """jax pins Bazel 8.7.0; Debian has 4.2.3. So: Bazel's own bootstrap, one level down."""
+    from test_bazel import BAZEL_TREE, write
+
+    from will_it_riscv.sources import SourceTree
+
+    bazel_tree = write(tmp_path / "bazel-src", BAZEL_TREE)
+    fetched = []
+
+    def fetch_upstream(tool, version, cache_root):
+        fetched.append((tool.name, version))
+        return SourceTree(name=tool.name, version=version, path=bazel_tree, kind="git",
+                          origin=f"{tool.repository}@{version}")
+
+    monkeypatch.setattr(recurse, "fetch_upstream", fetch_upstream)
+    sdists = {"a": sdist_of("a", [], {".bazelversion": "8.7.0\n", "MODULE.bazel": ""})}
+    distro = FakeDistro({
+        "bazel-bootstrap": "4.2.3+ds-11", "openjdk-21-jdk-headless": "21.0.12",
+        "unzip": "6.0", "python3": "3.13.5", "g++": "14.2.0",
+    })
+    walk = run(tmp_path, target, ["a"], sdists, distro=distro)
+    assert fetched == [("bazel", "8.7.0")]
+    tool = walk.nodes["debian:bazel-bootstrap@8.7.0"]
+    assert tool.status == recurse.PROBABLY, tool.reason
+    assert "read, not run" in tool.reason
+    assert walk.order.index(tool.key) < walk.order.index("pypi:a@1.0")
+    assert walk.nodes["pypi:a@1.0"].status == recurse.PROBABLY
+    assert recurse.installed(tool) == [
+        "g++", "openjdk-21-jdk-headless", "python3", "unzip",
+    ]

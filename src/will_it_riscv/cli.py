@@ -118,6 +118,32 @@ def build_parser() -> argparse.ArgumentParser:
         "into one graph. RUNS THE CONFIGURE STEPS IT LISTS. See examples/plans/.",
     )
     scope.add_argument(
+        "--plan-from-model", action="store_true",
+        help="have a model write the plan from the repository's evidence pack -- its "
+        "install docs, scripts, manifests, build files and CI, line by line -- check "
+        "every citation, send back what does not hold, and then run the plan as --plan "
+        "would. RUNS THE CONFIGURE STEPS THE MODEL LISTS.",
+    )
+    scope.add_argument(
+        "--planner", choices=("claude-cli", "anthropic", "openai"), default=None,
+        help="what writes the plan: claude-cli (Claude Code's `claude -p`; the default "
+        "when it is installed), anthropic (the Claude API; needs ANTHROPIC_API_KEY and "
+        "the teacher extra), or openai (any OpenAI-compatible server -- vLLM, llama.cpp, "
+        "Ollama -- serving a small model)",
+    )
+    scope.add_argument("--planner-model", metavar="NAME", help="the model the planner runs")
+    scope.add_argument(
+        "--planner-url", metavar="URL",
+        help="an OpenAI-compatible endpoint, e.g. http://localhost:8000/v1",
+    )
+    scope.add_argument(
+        "--save-plan", metavar="PLAN.json", help="write the model's plan here as well",
+    )
+    scope.add_argument(
+        "--show-pack", action="store_true",
+        help="print the evidence pack a planner would be shown, and exit",
+    )
+    scope.add_argument(
         "--recurse", action="store_true",
         help="with --plan: fetch the source of everything the default build requires "
         "that has no binary for the target, plan it from its own build files, "
@@ -343,8 +369,21 @@ def main(argv: Optional[list[str]] = None) -> int:
             free_threaded=True,
         )
 
-    if args.recurse and not args.plan:
+    if args.show_pack:
+        from . import evidence
+
+        root = Path(args.path)
+        if not root.is_dir():
+            raise SystemExit(f"{root}: --show-pack needs the repository directory")
+        sys.stdout.write(evidence.build(root).render())
+        return 0
+    if args.recurse and not (args.plan or args.plan_from_model):
         raise SystemExit("--recurse needs --plan: it recurses from a plan's answer")
+    if args.plan_from_model:
+        plan = _model_plan(args, stderr)
+        if plan is None:
+            return 2
+        return _run_plan(args, target, cache, stderr, plan=plan)
     if args.plan:
         return _run_plan(args, target, cache, stderr)
 
@@ -439,8 +478,44 @@ def main(argv: Optional[list[str]] = None) -> int:
     return 0 if args.exit_zero else analysis.exit_code()
 
 
+def _model_plan(args: argparse.Namespace, stderr: Console):
+    """--plan-from-model: a plan written by a model, checked, or None."""
+    import shutil
+
+    from . import modelplan
+    from .plan import plan_to_dict
+
+    root = Path(args.path)
+    if not root.is_dir():
+        raise SystemExit(f"{root}: --plan-from-model needs the repository directory")
+    kind = args.planner or ("claude-cli" if shutil.which("claude") else "anthropic")
+    try:
+        planner = modelplan.backend(kind, args.planner_model, args.planner_url)
+    except (ValueError, RuntimeError) as exc:
+        raise SystemExit(str(exc)) from exc
+    with stderr.status(f"{planner.name} is writing the plan…"):
+        outcome = modelplan.plan_repository(root, planner)
+    for number, attempt in enumerate(outcome.attempts, 1):
+        if attempt.problems:
+            stderr.print(
+                f"[yellow]plan {number}: {len(attempt.problems)} problem(s), sent back[/yellow]"
+            )
+            for problem in attempt.problems[:8]:
+                stderr.print(f"  • {problem}", highlight=False)
+    if outcome.error:
+        stderr.print(f"[red]{outcome.error}[/red]")
+    if outcome.plan is None:
+        stderr.print("[red]the model wrote no plan this can run[/red]")
+        return None
+    if not outcome.ok:
+        stderr.print("[yellow]running the last plan it wrote, problems and all[/yellow]")
+    if args.save_plan:
+        Path(args.save_plan).write_text(json.dumps(plan_to_dict(outcome.plan), indent=2) + "\n")
+    return outcome.plan
+
+
 def _run_plan(
-    args: argparse.Namespace, target: Target, cache: Cache, stderr: Console
+    args: argparse.Namespace, target: Target, cache: Cache, stderr: Console, plan=None,
 ) -> int:
     """--plan: run each step in the pretend environment, report one graph."""
     from . import planrun
@@ -449,13 +524,14 @@ def _run_plan(
     root = Path(args.path)
     if not root.is_dir():
         raise SystemExit(f"{root}: --plan needs the repository directory")
-    try:
-        plan = load_plan(Path(args.plan))
-    except PlanError as exc:
-        stderr.print(f"[red]{args.plan}: not a plan this can run[/red]")
-        for problem in exc.problems:
-            stderr.print(f"  • {problem}", highlight=False)
-        return 2
+    if plan is None:
+        try:
+            plan = load_plan(Path(args.plan))
+        except PlanError as exc:
+            stderr.print(f"[red]{args.plan}: not a plan this can run[/red]")
+            for problem in exc.problems:
+                stderr.print(f"  • {problem}", highlight=False)
+            return 2
     if args.format not in ("text", "json", "dot"):
         raise SystemExit("--plan reports as text, json or dot")
     from . import recurse as recursion

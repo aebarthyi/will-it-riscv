@@ -168,3 +168,22 @@ def test_the_plan_check_compares_configures_with_the_plan(tmp_path, monkeypatch,
     assert checks[0] == "ran 2 configures; 1 of the plan's 2 cmake steps match"
     assert "the plan has 'missing', which the driver never configured" in checks
     assert any("the driver configured sub" in c for c in checks)
+
+
+def test_an_install_adds_to_what_is_already_there(tmp_path):
+    """pip --target will not merge into an existing bin/; the merge does."""
+    from will_it_riscv.drive import _merge
+
+    site = tmp_path / "site"
+    (site / "bin").mkdir(parents=True)
+    (site / "bin" / "meson").write_text("meson")
+    (site / "pkg").mkdir()
+    (site / "pkg" / "old.py").write_text("")
+    incoming = tmp_path / "incoming"
+    (incoming / "bin").mkdir(parents=True)
+    (incoming / "bin" / "cython").write_text("cython")
+    (incoming / "pkg").mkdir()
+    (incoming / "pkg" / "new.py").write_text("")
+    _merge(incoming, site)
+    assert sorted(p.name for p in (site / "bin").iterdir()) == ["cython", "meson"]
+    assert sorted(p.name for p in (site / "pkg").iterdir()) == ["new.py", "old.py"]

@@ -45,6 +45,9 @@ TOOLCHAIN = {
     "pythonlibs": "the target's Python (python3-dev)",
 }
 
+#: What a blocker is provided by when a Python build requirement answers it.
+BUILD_REQUIREMENTS = "its Python build requirements (pip)"
+
 #: FindOpenMP, FindMPI and friends report per language: OpenMP_CXX is OpenMP.
 _LANGUAGE_SUFFIX = re.compile(r"_(C|CXX|Fortran|CUDA|HIP)$")
 
@@ -182,7 +185,9 @@ def build(
         if node is None:
             node = graph.nodes[key] = Node(
                 key=key, name=raw, kind=kind, debian=debian, guessed=guessed,
-                provided_by=TOOLCHAIN.get(key),
+                provided_by=TOOLCHAIN.get(key) or (
+                    BUILD_REQUIREMENTS if raw in result.build_tools else None
+                ),
             )
         if raw not in node.aliases:
             node.aliases.append(raw)

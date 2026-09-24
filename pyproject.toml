@@ -32,6 +32,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-httpx>=0.30", "mypy>=1.10", "ruff>=0.5"]
+# The Claude API, for writing plans and labelling a dataset with them.
+teacher = ["anthropic>=1.0"]
 
 [project.urls]
 Homepage = "https://github.com/tactcomplabs/will-it-riscv"
@@ -39,6 +41,8 @@ Issues = "https://github.com/tactcomplabs/will-it-riscv/issues"
 
 [project.scripts]
 will-it-riscv = "will_it_riscv.cli:main"
+will-it-riscv-dataset = "will_it_riscv.dataset:main"
+will-it-riscv-eval = "will_it_riscv.evaluate:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/will_it_riscv"]
@@ -58,6 +62,10 @@ ignore = ["UP007", "UP045"]
 
 [tool.mypy]
 warn_unused_ignores = false
+
+[[tool.mypy.overrides]]
+module = ["anthropic", "anthropic.*"]
+ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["tomli", "tomli.*", "tomllib"]

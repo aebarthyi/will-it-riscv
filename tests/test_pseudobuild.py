@@ -851,3 +851,20 @@ def test_what_a_configure_imports_is_installed_at_the_plans_version(tmp_path, mo
     assert result.completed, result.error
     assert result.python_installed == ["wirtestmod==1.0"]
     assert result.python_stubbed == []
+
+
+@needs_cmake
+def test_a_command_a_stubbed_package_would_define_is_stubbed_too(tmp_path):
+    """sundials4py calls nanobind_add_module, which nanobind's own config defines."""
+    (tmp_path / "ext.cpp").write_text("")
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.24)\n"
+        "project(demo CXX)\n"
+        "find_package(wirnano CONFIG REQUIRED)\n"
+        "wirnano_add_module(demo_ext NB_STATIC ext.cpp)\n"
+        "target_compile_definitions(demo_ext PRIVATE X=1)\n"
+        "wirnano_add_stub(demo_ext_stub MODULE demo_ext)\n"
+    )
+    result = run(tmp_path, timeout=120)
+    assert result.completed, result.error
+    assert result.blockers == ["wirnano"]

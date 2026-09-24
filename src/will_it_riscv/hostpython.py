@@ -20,10 +20,14 @@ host; that is the one place a host package is the right answer.
 from __future__ import annotations
 
 import json
+import os
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+from packaging.utils import canonicalize_name
 
 from .drive import _pip_install, dist_for_module
 
@@ -33,6 +37,7 @@ import importlib.abc, importlib.machinery, json, os, runpy, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SITE = os.path.join(HERE, "site")
+STUBSITE = os.path.join(HERE, "stubsite")
 with open(os.path.join(HERE, "stubs.txt")) as handle:
     STUBS = set(handle.read().split())
 
@@ -73,7 +78,7 @@ def _missed(name):
 
 
 sys.meta_path.append(_Stubs())
-os.environ["PYTHONPATH"] = SITE + os.pathsep + os.environ.get("PYTHONPATH", "")
+os.environ["PYTHONPATH"] = os.pathsep.join([SITE, os.environ.get("PYTHONPATH", ""), STUBSITE])
 args = sys.argv[1:]
 while args and args[0].startswith("-") and args[0] not in ("-c", "-m", "-"):
     flag = args.pop(0)
@@ -91,6 +96,12 @@ try:
     elif args[:1] == ["-m"]:
         sys.argv = [args[1], *args[2:]]
         sys.path[0:0] = [os.getcwd(), SITE]
+        import importlib.util
+        if importlib.util.find_spec(args[1].split(".")[0]) is None:
+            # runpy says so with a plain ImportError, which is not caught below.
+            _missed(args[1])
+            sys.stderr.write(f"{sys.executable}: No module named {args[1]}\n")
+            sys.exit(1)
         runpy.run_module(args[1], run_name="__main__", alter_sys=True)
     elif args and args[0] != "-":
         sys.argv = list(args)
@@ -106,6 +117,28 @@ except ModuleNotFoundError as exc:
 '''
 
 _WRAPPER = '#!/bin/sh\nexec "{python}" -S "{runner}" "$@"\n'
+
+#: A stubbed module, as a file, so that any interpreter a build runs sees it:
+#: Meson runs a ``.py`` script with its own Python, not the one it was given.
+_STUB_MODULE = '''# stub emitted by will-it-riscv: nothing said which version to install
+class _Anything:
+    def __getattr__(self, name):
+        return _Anything()
+    def __call__(self, *args, **kwargs):
+        return _Anything()
+    def __iter__(self):
+        return iter(())
+    def __bool__(self):
+        return False
+    def __str__(self):
+        return ""
+    def __mro_entries__(self, bases):
+        return (object,)
+
+
+def __getattr__(name):
+    return _Anything()
+'''
 
 
 @dataclass
@@ -136,11 +169,56 @@ class HostPython:
         executable = home / f"python{sys.version_info[0]}.{sys.version_info[1]}"
         executable.write_text(_WRAPPER.format(python=sys.executable, runner=home / "runner.py"))
         executable.chmod(0o755)
+        if dists is not None:
+            dists = {str(canonicalize_name(k)): v for k, v in dists.items()}
         return cls(home=home, dists=dists, pip_cache=pip_cache)
 
     @property
     def executable(self) -> Path:
         return self.home / f"python{sys.version_info[0]}.{sys.version_info[1]}"
+
+    @property
+    def site(self) -> Path:
+        return self.home / "site"
+
+    @property
+    def stubsite(self) -> Path:
+        """Stubbed modules, as files: last on the path, so anything real wins."""
+        return self.home / "stubsite"
+
+    @property
+    def path(self) -> str:
+        """The PYTHONPATH for anything else the build runs Python with."""
+        return os.pathsep.join([str(self.site), str(self.stubsite)])
+
+    @property
+    def scripts(self) -> Path:
+        """Where installed packages put their programs: cython, meson, ninja."""
+        return self.home / "site" / "bin"
+
+    def version_of(self, dist: str) -> Optional[str]:
+        """The version the plan resolved a distribution to, if it did."""
+        return (self.dists or {}).get(str(canonicalize_name(dist)))
+
+    def install(self, dist: str, version: Optional[str] = None) -> Optional[str]:
+        """Put a distribution in for the host, from a wheel; the spec, or None."""
+        spec = f"{dist}=={version}" if version else dist
+        if spec in self.installed:
+            return spec
+        if not _pip_install(spec, self.site, self.pip_cache, wheels_only=True):
+            return None
+        self.installed.append(spec)
+        return spec
+
+    def missed(self, module: str) -> None:
+        """Record an import that failed somewhere this interpreter did not see.
+
+        Meson runs a ``.py`` script with the interpreter running Meson, not
+        the one it was given: pandas' generate_version.py dies importing
+        versioneer, and only Meson's log says so.
+        """
+        with open(self.home / "missing.jsonl", "a") as log:
+            log.write(json.dumps({"module": module.split(".")[0]}) + "\n")
 
     def missing(self) -> list[str]:
         """Imports that killed the interpreter and have not been dealt with."""
@@ -183,4 +261,9 @@ class HostPython:
                 stubs.add(module)
                 self.stubbed.append(f"{module} ({spec} has no wheel for the host)")
         (self.home / "stubs.txt").write_text("\n".join(sorted(stubs)))
+        for module in stubs:
+            package = self.stubsite / module
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", module) and not package.exists():
+                package.mkdir(parents=True)
+                (package / "__init__.py").write_text(_STUB_MODULE)
         return fresh

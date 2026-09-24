@@ -6,8 +6,10 @@ as a hand-written plan must:
 
   [build-system].requires   a python-install of what building it needs
   CMakeLists.txt at the top a cmake-configure, run in the pretend environment
-  meson.build, Bazel,       a system-packages step for the tool itself -- the
-  Cargo, SCons              part that can be checked -- and a note that its
+  meson.build at the top    a meson-setup, likewise, with the options and the
+                            Meson that [tool.meson-python] names
+  Bazel, Cargo, SCons       a system-packages step for the tool itself -- the
+                            part that can be checked -- and a note that its
                             configure was not run, because the pretend
                             environment does not configure that system yet
 
@@ -26,6 +28,8 @@ from packaging.utils import canonicalize_name
 
 from .plan import (
     CMAKE_CONFIGURE,
+    CONFIGURE_KINDS,
+    MESON_SETUP,
     PYTHON_INSTALL,
     SYSTEM_PACKAGES,
     Evidence,
@@ -58,14 +62,23 @@ BACKENDS = {
 }
 
 
-def auto_plan(tree: Path, name: str) -> Plan:
-    """The plan a fetched package's own build files imply."""
+def auto_plan(
+    tree: Path, name: str, arch: str = "riscv64", cache_root: Optional[Path] = None
+) -> Plan:
+    """The plan a fetched package's own build files imply.
+
+    ``cache_root`` is where a Bazel build's rules_python is read from, to
+    see whether its hermetic Python exists for ``arch``.
+    """
     tree = Path(tree)
     steps: list[Step] = []
     unsure: list[str] = []
+    read: list[str] = []
+    blocked: list[str] = []
     project_dir = _project_dir(tree, name)
     manifest = project_dir / "pyproject.toml" if project_dir else None
     backend: Optional[str] = None
+    data: dict = {}
 
     if manifest is not None and manifest.is_file():
         text = manifest.read_text(encoding="utf-8", errors="replace")
@@ -87,6 +100,11 @@ def auto_plan(tree: Path, name: str) -> Plan:
             ))
 
     systems = _systems(tree, backend)
+    # A tree can carry both; the backend says which one the package builds with.
+    if backend == "mesonpy":
+        systems.discard("cmake")
+    elif backend == "scikit_build_core.build":
+        systems.discard("meson")
     after = [s.id for s in steps]
     build_requires = _build_requires(manifest)
     if "cmake" in systems and (tree / "CMakeLists.txt").is_file():
@@ -104,29 +122,32 @@ def auto_plan(tree: Path, name: str) -> Plan:
             note="its own CMake build, configured in the pretend environment",
             evidence=_cite(cmake_text, "CMakeLists.txt", r"^\s*project\s*\(", default_line=1),
         ))
+    if "meson" in systems and (tree / "meson.build").is_file():
+        meson_text = (tree / "meson.build").read_text(encoding="utf-8", errors="replace")
+        options, vendored = _meson_python(data)
+        steps.append(Step(
+            id="setup",
+            kind=MESON_SETUP,
+            after=after,
+            defines=options,
+            meson=vendored,
+            note="its own Meson build, set up in the pretend environment",
+            evidence=_cite(meson_text, "meson.build", r"^\s*project\s*\(", default_line=1),
+        ))
     for system in sorted(systems - {"cmake"}):
-        packages, markers = UNCONFIGURED.get(system, ([], []))
+        if system == "meson" and (tree / "meson.build").is_file():
+            if not build_requires & {"meson-python", "meson"}:
+                steps.append(_tools_step(system, tree, manifest, backend))
+            continue
         unsure.append(
             f"builds with {system}, which the pretend environment does not configure yet: "
             "what that build asks the system for was read, not shown"
         )
-        if system == "meson" and build_requires & {"meson-python", "meson"}:
-            continue   # meson and ninja come from pip, as build requirements
-        packages = _pinned(system, tree, list(packages))
-        if not packages:
-            continue
-        marker = next((m for m in markers if (tree / m).is_file()), None)
-        evidence = [Evidence(marker, 1, 1)] if marker else []
-        if marker is None and manifest is not None and backend:
-            text = manifest.read_text(encoding="utf-8", errors="replace")
-            evidence = _cite(text, manifest.relative_to(tree).as_posix(), r"build-backend")
-        steps.append(Step(
-            id=f"{system}-tools",
-            kind=SYSTEM_PACKAGES,
-            packages=packages,
-            note=f"it builds with {system}; the tool itself is the part that can be checked",
-            evidence=evidence,
-        ))
+        tools = _tools_step(system, tree, manifest, backend)
+        if tools.packages:
+            steps.append(tools)
+        if system == "bazel":
+            steps += _bazel_steps(tree, name, arch, cache_root, read, blocked)
     if not systems and _compiles(tree) and (
         (tree / "setup.py").is_file() or (backend or "").startswith("setuptools")
     ):
@@ -136,7 +157,82 @@ def auto_plan(tree: Path, name: str) -> Plan:
         )
     if not steps and not unsure:
         unsure.append("nothing in its source tree says how it builds")
-    return Plan(repo=str(canonicalize_name(name)), steps=steps, unsure=unsure)
+    return Plan(
+        repo=str(canonicalize_name(name)), steps=steps, unsure=unsure, read=read,
+        blocked=blocked,
+    )
+
+
+def _tools_step(
+    system: str, tree: Path, manifest: Optional[Path], backend: Optional[str]
+) -> Step:
+    """The build system's own tool, from the distro, at any version it pins."""
+    packages, markers = UNCONFIGURED.get(system, ([], []))
+    packages = _pinned(system, tree, list(packages))
+    marker = next((m for m in markers if (tree / m).is_file()), None)
+    evidence = [Evidence(marker, 1, 1)] if marker else []
+    if marker is None and manifest is not None and backend:
+        text = manifest.read_text(encoding="utf-8", errors="replace")
+        evidence = _cite(text, manifest.relative_to(tree).as_posix(), r"build-backend")
+    return Step(
+        id=f"{system}-tools",
+        kind=SYSTEM_PACKAGES,
+        packages=packages,
+        note=f"it builds with {system}; the tool itself is the part that can be checked",
+        evidence=evidence,
+    )
+
+
+def _bazel_steps(
+    tree: Path, name: str, arch: str, cache_root: Optional[Path],
+    read: list[str], blocked: list[str],
+) -> list[Step]:
+    """What reading its MODULE.bazel adds: wheels to build first, a compiler."""
+    from . import bazel
+
+    reading = bazel.read(tree, name, arch, cache_root)
+    if reading is None:
+        return []
+    read += reading.read
+    blocked += reading.blocked
+    steps: list[Step] = []
+    if reading.wheels:
+        steps.append(Step(
+            id="bazel-wheels",
+            kind=PYTHON_INSTALL,
+            packages=reading.wheels,
+            note=f"the wheels its Bazel build takes from dist/, which {arch} has to build first",
+            evidence=reading.wheel_evidence,
+        ))
+    if reading.compiler:
+        steps.append(Step(
+            id="bazel-cc",
+            kind=SYSTEM_PACKAGES,
+            packages=[reading.compiler],
+            note="the machine's own C++ compiler, in place of a hermetic toolchain",
+            evidence=reading.compiler_evidence,
+        ))
+    return steps
+
+
+def _meson_python(data: dict) -> tuple[dict, Optional[str]]:
+    """The -D options and the Meson a meson-python build is set up with.
+
+    ``[tool.meson-python.args] setup`` is what it adds to ``meson setup``;
+    ``[tool.meson-python] meson`` is a Meson the project ships instead of
+    the one pip installs -- numpy's vendored fork.
+    """
+    config = data.get("tool", {}).get("meson-python", {})
+    if not isinstance(config, dict):
+        return {}, None
+    options: dict[str, str] = {}
+    setup = config.get("args", {}).get("setup", []) if isinstance(config.get("args"), dict) else []
+    for arg in setup if isinstance(setup, list) else []:
+        match = re.match(r"^-D([A-Za-z0-9_.:-]+)=(.*)$", str(arg))
+        if match:
+            options[match.group(1)] = match.group(2)
+    meson = config.get("meson")
+    return options, meson if isinstance(meson, str) and meson else None
 
 
 def _build_requires(manifest: Optional[Path]) -> set:
@@ -199,7 +295,7 @@ def _compiles(tree: Path) -> bool:
 
 def configured(plan: Plan) -> bool:
     """Whether any step of the plan actually runs the package's build."""
-    return any(s.kind == CMAKE_CONFIGURE for s in plan.steps) and not any(
+    return any(s.kind in CONFIGURE_KINDS for s in plan.steps) and not any(
         "does not configure" in u for u in plan.unsure
     )
 

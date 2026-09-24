@@ -361,3 +361,37 @@ def test_an_optional_step_that_stops_does_not_decide_the_answer(tmp_path, target
     ))
     assert result.answer.verdict == "yes"
     assert result.answer.optional_stopped == ["gpu"]
+
+
+def test_a_python_install_can_name_its_packages_instead_of_a_file():
+    """jaxlib's Bazel build takes numpy, scipy and ml_dtypes wheels from dist/."""
+    plan = parse_plan({"repo": "r", "steps": [{
+        "id": "wheels", "kind": "python-install", "packages": ["numpy==2.1.3"], "evidence": [],
+    }]})
+    assert plan.steps[0].packages == ["numpy==2.1.3"] and plan.steps[0].manifest is None
+    with pytest.raises(PlanError, match="'manifest' or 'packages'"):
+        parse_plan({"repo": "r", "steps": [
+            {"id": "w", "kind": "python-install", "evidence": []},
+        ]})
+
+
+def test_a_meson_setup_names_the_meson_it_ships():
+    plan = parse_plan({"repo": "r", "steps": [{
+        "id": "setup", "kind": "meson-setup", "meson": "vendored-meson/meson/meson.py",
+        "defines": {"blas": "openblas"}, "evidence": [],
+    }]})
+    assert plan.steps[0].meson == "vendored-meson/meson/meson.py"
+    assert plan.steps[0].defines == {"blas": "openblas"}
+
+
+def test_cmake_names_are_as_loose_as_cmake_is():
+    """LAMMPS documents -D PKG_ML-PACE=on; pyproject cmake.args write -DX:BOOL=ON."""
+    plan = parse_plan({"repo": "r", "steps": [{
+        "id": "c", "kind": "cmake-configure", "evidence": [],
+        "defines": {"PKG_ML-PACE": "on", "SUNDIALS_ENABLE_PYTHON:BOOL": "ON"},
+    }]})
+    assert plan.steps[0].defines == {"PKG_ML-PACE": "on", "SUNDIALS_ENABLE_PYTHON": "ON"}
+    with pytest.raises(PlanError, match="not a CMake variable name"):
+        parse_plan({"repo": "r", "steps": [{
+            "id": "c", "kind": "cmake-configure", "evidence": [], "defines": {"-bad": "1"},
+        }]})

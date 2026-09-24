@@ -396,9 +396,17 @@ def _write_shims(directory: Path) -> None:
 def _pip_install(
     spec: str, site: Path, cache: Optional[Path], wheels_only: bool = False
 ) -> bool:
+    """Install into ``site``, adding to whatever is already there.
+
+    ``pip install --target`` will not merge into a directory that exists:
+    once meson's wheel has made ``bin/``, Cython's scripts are quietly left
+    out. So each install goes to a fresh directory and is merged in.
+    """
+    site.mkdir(parents=True, exist_ok=True)
+    incoming = Path(tempfile.mkdtemp(prefix=".incoming-", dir=site.parent))
     command = [
         sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check",
-        "--no-input", "--target", str(site), spec,
+        "--no-input", "--target", str(incoming), spec,
     ]
     if wheels_only:
         command.insert(-1, "--only-binary=:all:")
@@ -406,11 +414,29 @@ def _pip_install(
     if cache is not None:
         env["PIP_CACHE_DIR"] = str(cache)
     try:
-        return subprocess.run(
+        ok = subprocess.run(
             command, capture_output=True, text=True, timeout=600, env=env
         ).returncode == 0
+        if ok:
+            _merge(incoming, site)
+        return ok
     except (OSError, subprocess.SubprocessError):
         return False
+    finally:
+        shutil.rmtree(incoming, ignore_errors=True)
+
+
+def _merge(source: Path, destination: Path) -> None:
+    for entry in source.iterdir():
+        target = destination / entry.name
+        if entry.is_dir() and not entry.is_symlink() and target.is_dir():
+            _merge(entry, target)
+            continue
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+        elif target.exists() or target.is_symlink():
+            target.unlink()
+        shutil.move(str(entry), str(target))
 
 
 # ------------------------------------------------------------------ cloning

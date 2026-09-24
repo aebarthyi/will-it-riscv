@@ -264,9 +264,10 @@ Steps
 
 | step kind | how it is answered |
 | --- | --- |
-| `python-install` | resolved against the index for the target's wheel tags — never installed |
+| `python-install` | resolved against the index for the target's wheel tags — never installed. A manifest, or `packages` named in the plan itself |
 | `system-packages` | looked up in the distro's riscv64 archive |
 | `cmake-configure` | configured for real, with the plan's `-D` flags, confined to an empty sysroot that grows a stub for whatever the configure insists on |
+| `meson-setup` | the same for Meson: `meson setup` as a linux/riscv64 cross build, with the plan's `-D` options and the Meson the project ships, if it names one |
 | `python-run` | the project's own build driver, run on the host from a copy-on-write clone, with its build tools shimmed and every import it makes recorded |
 
 **Nothing is emulated.** The sandbox is a pretend environment: whatever a
@@ -323,6 +324,104 @@ say what the plan claims is reported before anything runs. `plan.PLAN_SCHEMA`
 is the same shape as a JSON Schema, for constraining whatever writes one.
 `examples/plans/mfc.json` is written by hand; every citation in it holds.
 
+### Plans written by a model
+
+`examples/plans/mfc.json` is written by hand. The plan format is built so a
+model can write one, and `--plan-from-model` has one do it:
+
+```console
+$ will-it-riscv ~/src/MFC --plan-from-model --save-plan mfc.json
+```
+
+**The model is shown an evidence pack, not the repository.** `--show-pack`
+prints it. It holds the parts of the tree that say how the project builds,
+chosen the same way every time and numbered line by line:
+- the install sections of the README and docs;
+- the scripts at the top of the tree, what they source, and the Python
+  drivers they hand over to (`mfc.sh` → `toolchain/bootstrap/python.sh` →
+  `toolchain/main.py`);
+- the manifests (for `pyproject.toml`, only the tables a build reads);
+- the top of `CMakeLists.txt` and `meson.build`;
+- the CI workflows that build it, and the scripts they call.
+
+Linting and formatting scripts go last. Anything that doesn't fit the
+budget (about 20k tokens) is named as not shown.
+
+**Every answer is checked, and what is wrong goes back.** The answer might
+not be JSON, the plan format might refuse a step, a quote might not be on
+the lines cited, or a citation might point to a line the pack never
+showed. Each problem goes back as a sentence, and the model writes the
+plan again. The model only plans; the executor judges, so a bad plan costs
+a round, not a wrong verdict.
+
+It writes a wire format: the plan format with every object closed,
+evidence always `{at, quote}`, and `-D` flags as name/value pairs. That is
+strict enough for schema-constrained decoding, and the same schema
+constrains every backend:
+
+| `--planner` | what writes the plan |
+| --- | --- |
+| `claude-cli` | Claude Code's `claude -p`, tools off, with `--json-schema` (the default, and no API key needed) |
+| `anthropic` | the Claude API with structured outputs (`pip install 'will-it-riscv[teacher]'`, `ANTHROPIC_API_KEY`) |
+| `openai` | any OpenAI-compatible server, such as vLLM, llama.cpp or Ollama, with the schema as `response_format`: what a fine-tuned small model is served by (`--planner-url`, `--planner-model`) |
+
+**A dataset of verified plans.** `will-it-riscv-dataset` labels a corpus
+with a teacher and verifies each label by running the plan. Anything that
+fails because of the plan goes back to the teacher: a manifest that isn't
+there, a configure pointed at a directory with nothing to configure, or a
+driver that configured something the plan doesn't list. A configure that
+stops is the build's own answer, not the plan's fault. Each example keeps
+its pack, plan, transcript and run, and the verified ones export as
+chat-format JSONL: the pack in, the plan out.
+
+```console
+$ will-it-riscv-dataset seed-pypi --top 3000 --want 350 --to examples/corpus/pypi.jsonl
+$ will-it-riscv-dataset label --corpus examples/corpus/repos.jsonl --out data/repos --jobs 2
+$ will-it-riscv-dataset export --out data/repos --to data/sft
+```
+
+`examples/corpus` holds two corpora:
+- `pypi.jsonl`: 309 of the 3000 most-downloaded PyPI projects that compile
+  and have no riscv64 wheel;
+- `repos.jsonl`: 45 source repositories whose build is a script, a
+  toolchain or a CI recipe (MFC, GROMACS, LAMMPS, CP2K, GDAL, OpenCV, jax,
+  XLA, CPython, …).
+
+One in ten entries is held out by a hash of its name, and five
+script-driven repositories are pinned to the held-out set.
+
+A pilot of eight repositories, with Opus as the teacher through
+`claude -p`, gave 8 verified plans for $2.45. Six were right first time.
+MFC's first plan ran `./mfc.sh build` but listed none of the eight
+configures the driver runs; the plan check named them, and the second
+plan had them all, `--gpu acc` included, marked optional. numpy's first
+plan tripped on the plan format rejecting a Meson option with a dash in
+its name, and that was fixed in the format, not left to the model.
+
+**Evaluation.** `will-it-riscv-eval` scores planners on the held-out
+repositories. Each planner gets the same pack the reference was labelled
+from:
+- `parsed`: whether it produced a plan at all;
+- `cited` and `grounded`: how many of its citations hold, and how many are
+  lines the pack showed;
+- precision, recall and F1 of its steps against the verified plan, matched
+  softly (package lists by overlap, configures by directory and `-D`
+  flags);
+- agreement on which steps are optional, and on ordering;
+- with `--execute`, whether running it reaches the same verdict and
+  requires the same things.
+
+The baselines are `autoplan`, the build-file reader recursion uses, and
+`teacher-first`, the teacher's plan before any of it was sent back. On
+the pilot's three held-out repositories, autoplan finds 19% of the steps.
+The teacher's first plans were all accepted as written, so they match
+their references by construction; that baseline only means something
+where revisions happened.
+
+```console
+$ will-it-riscv-eval --out data/repos --planner openai --planner-url http://localhost:8000/v1 --planner-model qwen3-8b-plans
+```
+
 ### Recursion: down the tree, and back up
 
 A plan's answer stops at its frontier: what the default build requires that
@@ -339,38 +438,52 @@ $ will-it-riscv ~/src/MFC --plan examples/plans/mfc.json --recurse
 ```
 ```
 Recursion
-  fetched 19 packages and configured 2, in 42s
+  fetched 20 packages and configured 9, in 148s
   MFC
-  ├─ ~ cantera 3.2.0  probably — its configure completed; numpy could only be read   [sdist cantera-3.2.0.tar.gz]
+  ├─ ✓ cantera 3.2.0  buildable — its configure completed: Python → Boost → BLAS → HDF5   [sdist cantera-3.2.0.tar.gz]
   │  │    installed first: libboost-all-dev, libhdf5-dev, liblapack-dev, libopenblas-dev, the target's Python (python3-dev)
-  │  └─ ~ numpy 2.5.3  probably — read, not configured: builds with meson   [sdist numpy-2.5.3.tar.gz]
-  ├─ ~ contourpy 1.4.0  probably — read, not configured: builds with meson   [sdist contourpy-1.4.0.tar.gz]
+  │  └─ ✓ numpy 2.5.3  buildable — its configure completed: cython   [sdist numpy-2.5.3.tar.gz]
+  ├─ ✓ contourpy 1.4.0  buildable — its configure completed: pybind11   [sdist contourpy-1.4.0.tar.gz]
+  ├─ ~ ffmt 0.4.5  probably — read, not configured: builds with cargo   [sdist ffmt-0.4.5.tar.gz]
+  │       installed first: cargo, rustc
   ├─ ...
-  ├─ ? jaxlib 0.11.2  unknown — needs bazel-bootstrap, which the target has only as source   [git https://github.com/jax-ml/jax@jax-v0.11.2]
-  │  └─ ? bazel-bootstrap  unknown — source only: Debian 13 (trixie) for riscv64 has 4.2.3+ds-11; the build
-  │                        wants >= 8.7.0; Bazel publishes no riscv64 binaries; it has to be bootstrapped from its
-  │                        source (github.com/bazelbuild/bazel) with a JDK (not recursed into yet)
-  ├─ ~ ml-dtypes 0.6.0  probably — its configure completed; numpy could only be read   [sdist ml_dtypes-0.6.0.tar.gz]
-  │  │    installed first: the target's Python (python3-dev)
-  │  └─ ~ numpy 2.5.3  (above)
+  ├─ ~ jaxlib 0.11.2  probably — read, not configured: builds with bazel   [git https://github.com/jax-ml/jax@jax-v0.11.2]
+  │  │    hermetic Python: rules_python 2.2.0 has CPython 3.12.13 for riscv64-unknown-linux-gnu ✓
+  │  │    its hermetic C++ toolchains are for linux aarch64 and x86_64 only; --config=clang_local builds with
+  │  │    the machine's own compiler instead (clang)
+  │  │    its Python packages are downloaded as wheels for aarch64 and x86_64 only; for riscv64, local_wheels
+  │  │    takes ml_dtypes, numpy, scipy from dist/, built first
+  │  │    installed first: clang
+  │  ├─ ~ bazel-bootstrap 8.7.0  probably — bootstraps with compile.sh, which builds Bazel with itself: read,
+  │  │                           not run   [git https://github.com/bazelbuild/bazel@8.7.0]
+  │  │       installed first: g++, openjdk-21-jdk-headless, python3, unzip
+  │  ├─ ✓ ml-dtypes 0.6.0  buildable — its configure completed: Python   [sdist ml_dtypes-0.6.0.tar.gz]
+  │  │  │    installed first: the target's Python (python3-dev)
+  │  │  └─ ✓ numpy 2.5.3  (above)
+  │  ├─ ✓ numpy 2.5.3  (above)
+  │  └─ ✓ scipy 1.18.1  buildable — its configure completed: cython → pythran → numpy → pybind11 → OpenBLAS
+  │     │    installed first: libopenblas-dev
+  │     └─ ✓ numpy 2.5.3  (above)
+  ├─ ✓ matplotlib 3.11.2  buildable — its configure completed: pybind11   [sdist matplotlib-3.11.2.tar.gz]
   ├─ ...
   ├─ ~ orjson 3.12.0  probably — read, not configured: builds with cargo   [sdist orjson-3.12.0.tar.gz]
   │       installed first: cargo, rustc (rustup)
-  ├─ ~ ruff 0.6.5  probably — read, not configured: builds with cargo   [sdist ruff-0.6.5.tar.gz]
-  │       installed first: cargo, rustc
+  ├─ ✓ pandas 3.0.6  buildable — its configure completed: cython   [sdist pandas-3.0.6.tar.gz]
   ...
 
   build order, dependencies first:
-    numpy 2.5.3 → cantera 3.2.0 → contourpy 1.4.0 → ffmt 0.4.5 → h5py 3.16.0 → imageio-ffmpeg 0.6.0 → jaxlib 0.11.2 → ...
+    numpy 2.5.3 → cantera 3.2.0 → contourpy 1.4.0 → ffmt 0.4.5 → h5py 3.16.0 → imageio-ffmpeg 0.6.0 →
+    bazel-bootstrap 8.7.0 → ml-dtypes 0.6.0 → scipy 1.18.1 → jaxlib 0.11.2 → matplotlib 3.11.2 → ...
 
-  Will it riscv, all the way down?  UNKNOWN — jaxlib could not be settled: jaxlib → bazel-bootstrap (...)
+  Will it riscv, all the way down?  PROBABLY — after building 20 packages from source, some of them only
+  read, not configured
 ```
 
 | status | meaning |
 | --- | --- |
-| `buildable` ✓ | its own configure ran to the end, and everything under it is buildable |
-| `probably` ~ | its build could only be read (Meson, Cargo and setuptools builds are not configured yet), and nothing under it is blocked |
-| `blocked` ✗ | something it requires has nothing public for the target |
+| `buildable` ✓ | its own configure or setup ran to the end, and everything under it is buildable |
+| `probably` ~ | its build could only be read (Cargo, setuptools and Bazel builds are not configured), and nothing under it is blocked |
+| `blocked` ✗ | something it requires has nothing public for the target, or reading its build found something the target cannot have |
 | `unknown` ? | a configure stopped, a fetch failed, a bootstrap cycle, or the budget ran out |
 
 The build order is a post-order walk of the tree, dependencies first, and
@@ -380,6 +493,11 @@ already in the tree. That means archive packages, the target's Python, and
 any tool the archive has too old. orjson and typos declare `rust-version =
 "1.95"` and Debian 13 has rustc 1.85, so those two get rustc from rustup.
 ruff asks for 1.76, and Debian's rustc is enough.
+
+Nine of the twenty configure for real: cantera and ml-dtypes with CMake,
+and numpy, scipy, matplotlib, pandas, contourpy, scikit-image and siphash24
+with Meson (below). jaxlib builds with Bazel, which is read rather than run,
+and the Bazel it needs is followed to its own source (below that).
 
 A fetched package's configure is where the pretend environment has to be
 most accommodating, because these configures lean on what pip's build
@@ -408,18 +526,85 @@ isolation would have given them:
   compiles a Fortran library in its build tree to work out name mangling,
   then looks for it there; the host's own libraries stay out of reach.
 
-With those, cantera's configure goes Python → Boost → BLAS → HDF5 →
-completed in six rounds, and ml-dtypes' goes Python → numpy → completed.
-Both are only "probably" because numpy, which both build against, builds
-with Meson. jaxlib is where the answer stays open: jax pins Bazel 8.7.0 in
-`.bazelversion`, Debian 13 has 4.2.3 for riscv64, and Bazel publishes no
-riscv64 binaries. Bazel would have to be bootstrapped from source first, and
-the recursion does not follow a distro tool's source yet.
-
 **This runs the configures of everything it fetches.** They are third-party
 build scripts, run on this host: confined to a scratch sysroot, never
 compiled, never emulated, but run. `--recurse` is opt-in and bounded by
 `--recurse-depth` (3) and `--recurse-limit` (40 packages).
+
+### Meson builds are set up the same way
+
+numpy, scipy, matplotlib and pandas build with Meson, through meson-python.
+A plan's `meson-setup` step, and `--pseudobuild` on a tree with a
+`meson.build` and no `CMakeLists.txt`, runs `meson setup` the way a CMake
+configure is run. It is a cross build for linux/riscv64, confined to an
+empty sysroot, set up in a copy-on-write clone of the tree because Meson
+writes into it, and unblocked round by round.
+
+```console
+$ will-it-riscv ~/src/numpy --pseudobuild
+```
+```
+Pseudobuild
+  configured as linux/riscv64, confined to an empty sysroot; configure completed over 2 rounds in 17s
+  — 8 dependency probes observed
+  rounds: cython → completed
+  note: configured with the Meson it ships (vendored-meson/meson/meson.py)
+
+  Will it riscv?  YES — every dependency a default build demands is in Debian 13 (trixie) for riscv64
+    cython comes with its Python build requirements (pip)
+    shown by configuring, not compiling: the configure accepts a linux/riscv64 build given only these
+
+  hard requirements, in the order the build demanded them:
+    1.  cython  stopped the configure    comes with its Python build requirements
+  proven optional — absent, and the configure carried on (2): blis, flexiblas
+  claimed by compile-only checks, unverifiable without a target linker: blas, lapack
+  graph: 5 nodes, 5 edges — -f dot | dot -Tsvg > deps.svg
+```
+
+| Meson said | what it is given |
+| --- | --- |
+| `Dependency "OpenBLAS" not found` | an `OpenBLAS.pc` where pkg-config is confined to look, and an empty `libOpenBLAS.a` |
+| `C shared or static library 'foo' not found` | an empty archive the host's linker takes (an empty file crashes ld64) |
+| `Unknown compiler(s): [['cython']]`, `Program 'pythran' not found` | the build requirement, installed for the host from a wheel at the plan's version; a stub that answers its version otherwise |
+| `C header 'foo.h' not found` | that header, carrying version macros |
+| `ModuleNotFoundError` in a script Meson ran | the module: pandas' `generate_version.py` imports versioneer, matplotlib runs `python -m setuptools_scm` |
+| `Problem encountered: …` | blame by experiment, as for CMake |
+
+The cross file gives Meson this host's compilers with `needs_exe_wrapper =
+false`, which is the Meson equivalent of the CMake loop's pass-through
+emulator. What a check compiles runs here, and nothing riscv64 runs at all.
+The Meson is the one the build uses: numpy's vendored fork when
+`[tool.meson-python]` names it, otherwise meson at the version the plan
+resolved, installed from a wheel. A link check still runs against this
+host's own SDK. On a Mac, Accelerate answers numpy's `dependency('blas')`,
+and that is reported as claimed and unverifiable, not as found. What a
+build compiles from its own subprojects, like matplotlib's freetype and
+qhull, is noted, not listed as something to install.
+
+### Bazel builds are read for what they download
+
+Bazel is not run. Analysing jaxlib's build would mean fetching XLA and LLVM
+(gigabytes) to answer questions its `MODULE.bazel` already answers.
+Whatever a Bazel build fetches as source, Bazel builds for any platform
+with a C++ compiler. The things that can be missing on riscv64 are the
+things it downloads prebuilt:
+
+| what it downloads | what is checked |
+| --- | --- |
+| hermetic Python, `python.toolchain(python_version = "3.12")` | rules_python's own manifest, read from a sparse checkout of the version the build pins: 2.2.0 has CPython 3.12.13 for `riscv64-unknown-linux-gnu` |
+| hermetic C++, `register_toolchains(...linux_x86_64...)` | whether any is for the target; if not, whether a `.bazelrc` config builds with the machine's own compiler (jax's `clang_local`) |
+| wheels, `pip.parse(download_only = True, target_platforms = [...])` | whether the target is listed; if not, what `local_wheels` lets `dist/` supply. Those wheels are built first: numpy, scipy and ml-dtypes, already in the tree. The wheels the repository builds itself, jax and jaxlib, are left out |
+
+The build Bazel itself needs is the other half. jax pins Bazel 8.7.0 in
+`.bazelversion`, and Debian 13 has 4.2.3 for riscv64. So the recursion
+follows `bazel-bootstrap` upstream: a 2 MB sparse checkout of the `8.7.0`
+tag, just `compile.sh` and `scripts/bootstrap/`. It reads what the bootstrap
+needs from those scripts: `JAVA_VERSION=${JAVA_VERSION:-21}`, the `unzip`
+in its tool check, rules_python's autodetecting toolchain, `-std=c++17`.
+Each of those is checked against the archive. compile.sh builds Bazel with
+itself, so it is read, not run. jax's `build.py` downloads Bazel only for
+x86_64 and aarch64 Linux, macOS and Windows; anywhere else it takes
+`--bazel_path`, which is where the bootstrapped one goes.
 
 ### Meson projects are asked, not guessed at
 
@@ -574,6 +759,9 @@ $ will-it-riscv ~/src/MFC --plan examples/plans/mfc.json -f dot | dot -Tsvg > mf
 # then fetch and configure whatever it needs from source, all the way down
 $ will-it-riscv ~/src/MFC --plan examples/plans/mfc.json --recurse
 
+# have a model write the plan instead, then run it
+$ will-it-riscv ~/src/MFC --plan-from-model --save-plan mfc.json
+
 # just the names of everything that is not pure Python
 $ will-it-riscv -f list
 ```
@@ -649,8 +837,9 @@ code you would be willing to configure yourself.
 | setuptools | `libraries=[…]`, `find_library`, `pkgconfig` calls |
 | any C/C++ | `#include` directives, against a 130-entry header map |
 
-SCons and Bazel are detected but not scraped; the report says so rather than
-implying the project has no dependencies.
+SCons is detected but not scraped, and Bazel is read only for what it
+downloads prebuilt; the report says so rather than implying the project has
+no dependencies.
 
 **Repository scanning is inference too.** A CMake option you never enable is
 indistinguishable, statically, from one you always do — so an optional

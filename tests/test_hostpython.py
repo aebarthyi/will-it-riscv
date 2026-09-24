@@ -52,3 +52,10 @@ def test_a_script_and_a_module_run_with_their_own_directory_first(tmp_path):
     (tmp_path / "tools" / "main.py").write_text("import helper\nprint(helper.VALUE)\n")
     assert _run(python, str(tmp_path / "tools" / "main.py")).stdout.strip() == "7"
     assert _run(python, "-m", "helper", cwd=tmp_path / "tools").returncode == 0
+
+
+def test_a_module_run_with_dash_m_that_is_not_there_is_recorded(tmp_path):
+    """matplotlib's version comes from `python -m setuptools_scm`."""
+    python = HostPython.create(tmp_path)
+    assert _run(python, "-m", "wir_scm").returncode == 1
+    assert python.missing() == ["wir_scm"]

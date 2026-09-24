@@ -38,6 +38,8 @@ from .autoplan import auto_plan, configured
 from .plan import Plan
 from .planrun import BINARY, NONE, SOURCE, TOOLCHAIN, DepNode, PlanResult
 from .sources import SourceTree, fetch
+from .upstream import UPSTREAM
+from .upstream import fetch as fetch_upstream
 
 if TYPE_CHECKING:  # pragma: no cover
     from .distro import DistroIndex
@@ -116,7 +118,8 @@ def recurse(
     walk = Recursion(project=root.plan.repo)
 
     def visit(dep: DepNode, depth: int, path: tuple[str, ...], parent: str) -> str:
-        key = f"{dep.id}@{dep.version}" if dep.version else dep.id
+        version = dep.version or dep.wants
+        key = f"{dep.id}@{version}" if version else dep.id
         node = walk.nodes.get(key)
         if node is not None:
             # Seen before -- or still being worked out further up the path,
@@ -125,7 +128,7 @@ def recurse(
                 node.parents.append(parent)
             return key
         node = walk.nodes[key] = TreeNode(
-            key=key, id=dep.id, name=dep.name, version=dep.version,
+            key=key, id=dep.id, name=dep.name, version=version,
             ecosystem=dep.ecosystem, tier=dep.tier, detail=dep.detail, depth=depth,
             parents=[parent],
         )
@@ -134,14 +137,15 @@ def recurse(
         return key
 
     def _explore(node: TreeNode, dep: DepNode, depth: int, path: tuple[str, ...]) -> None:
-        if node.ecosystem != "pypi":
-            # A distro package or a tool: nothing, or only its source. Going
-            # into a distro tool's own source is not done yet.
+        tool = UPSTREAM.get(node.name) if node.ecosystem != "pypi" else None
+        if node.ecosystem != "pypi" and (tool is None or node.tier == NONE or not node.version):
+            # A distro package with nothing for the target, or with only a
+            # source nobody has said how to follow.
             if node.tier == NONE:
                 node.status, node.reason = BLOCKED, node.detail or "no package for the target"
             else:
                 node.status = UNKNOWN
-                node.reason = f"source only: {node.detail} (not recursed into yet)"
+                node.reason = f"source only: {node.detail} (not recursed into)"
             return
         if depth > max_depth:
             node.reason = f"not visited: deeper than {max_depth}"
@@ -153,7 +157,11 @@ def recurse(
             return
         if progress is not None:
             progress(f"fetching {node.name} {node.version or ''}")
-        node.source = fetch(index, node.name, node.version, cache_root)
+        if tool is not None:
+            assert node.version is not None
+            node.source = fetch_upstream(tool, node.version, cache_root)
+        else:
+            node.source = fetch(index, node.name, node.version, cache_root)
         if not node.source.ok:
             nothing = node.tier == NONE and "names no repository" in (node.source.error or "")
             node.status = BLOCKED if nothing else UNKNOWN
@@ -164,7 +172,10 @@ def recurse(
             return
         walk.fetched += 1
         assert node.source.path is not None
-        node.plan = auto_plan(node.source.path, node.name)
+        if tool is not None:
+            node.plan = tool.planner(node.source.path, node.version or "")
+        else:
+            node.plan = auto_plan(node.source.path, node.name, target.arch, cache_root)
         if progress is not None:
             progress(f"configuring {node.name} {node.version or ''}")
         node.result = planrun.execute(
@@ -202,6 +213,8 @@ def _judge(node: TreeNode, walk: Recursion) -> tuple[str, str]:
     blocked = [c for c in children if c.status == BLOCKED]
     if blocked:
         return BLOCKED, f"needs {', '.join(c.name for c in blocked)}, which cannot be had"
+    if node.plan.blocked:
+        return BLOCKED, node.plan.blocked[0]
     if stopped:
         first = stopped[0]
         return UNKNOWN, f"its {first.step.id} step {first.status}: {first.detail}"
@@ -253,7 +266,7 @@ def _build_order(walk: Recursion) -> list[str]:
         for child in walk.nodes[key].children:
             post(child)
         node = walk.nodes[key]
-        if node.ecosystem == "pypi" and node.source is not None and node.source.ok:
+        if node.source is not None and node.source.ok:
             order.append(key)
 
     for key in walk.top:
@@ -367,9 +380,11 @@ def render_text(walk: Recursion, console) -> None:
             line.append(f"   [{node.source.kind} {node.source.origin}]", style="dim")
         console.print(line, highlight=False)
         extension = "   " if last else "│  "
+        rail = "│  " if node.children else "   "
+        for finding in node.plan.read if node.plan is not None else []:
+            console.print(f"  {prefix}{extension}{rail}  {finding}", style="dim", highlight=False)
         archive = installed(node)
         if archive:
-            rail = "│  " if node.children else "   "
             console.print(
                 f"  {prefix}{extension}{rail}  installed first: " + ", ".join(archive),
                 style="dim", highlight=False,
@@ -425,13 +440,18 @@ def to_dict(walk: Recursion) -> dict:
                     if n.source else None
                 ),
                 "plan": (
-                    {"steps": [s.id for s in n.plan.steps], "unsure": n.plan.unsure}
+                    {"steps": [s.id for s in n.plan.steps], "unsure": n.plan.unsure,
+                     "read": n.plan.read, "blocked": n.plan.blocked}
                     if n.plan else None
                 ),
                 "answer": (
                     {"verdict": n.result.answer.verdict, "headline": n.result.answer.headline}
                     if n.result is not None and n.result.answer is not None else None
                 ),
+                "steps": [
+                    {"id": o.step.id, "kind": o.step.kind, "status": o.status, "detail": o.detail}
+                    for o in (n.result.steps if n.result is not None else [])
+                ],
             }
             for n in walk.nodes.values()
         ],

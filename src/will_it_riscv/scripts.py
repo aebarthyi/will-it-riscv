@@ -145,6 +145,30 @@ def find_script_installs(root: Path) -> list[ScriptInstall]:
     return list(installs.values())
 
 
+def reached_files(root: Path) -> dict[str, tuple[str, ...]]:
+    """Every file the root scripts source or run, with how each was reached.
+
+    The scripts themselves, and the Python drivers they hand over to: mfc.sh
+    reaches toolchain/bootstrap/python.sh, and then runs toolchain/main.py.
+    Keyed by path relative to the root; the entry scripts map to ``()``.
+    """
+    root = Path(root).resolve()
+    found: dict[str, tuple[str, ...]] = {}
+    for entry in entry_scripts(root):
+        reading = _Reading()
+        _read(entry, root, entry, {}, reading, ())
+        found.setdefault(_relative(entry.resolve(), root), ())
+        for command in reading.commands:
+            found.setdefault(_relative(command.file, root), command.chain[:-1])
+            for word in command.words:
+                if not word.endswith(".py") or "$" in word:
+                    continue
+                path = Path(word) if os.path.isabs(word) else root / word
+                if path.is_file() and _is_inside(path.resolve(), root):
+                    found.setdefault(_relative(path.resolve(), root), command.chain)
+    return found
+
+
 def _relative(path: Path, root: Path) -> str:
     try:
         return path.relative_to(root).as_posix()

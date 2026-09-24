@@ -255,7 +255,8 @@ def _blocker_label(graph, raw: str) -> str:
 
 def _availability(node) -> Text:
     if node.provided_by:
-        return Text("comes with the compiler", style="green")
+        # "the compiler (GCC's libgomp)" is more than the table needs.
+        return Text(f"comes with {node.provided_by.split(' (')[0]}", style="green")
     if not node.debian or node.guessed:
         return Text("no known package", style="yellow")
     if node.available:

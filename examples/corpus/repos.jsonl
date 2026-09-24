@@ -1,0 +1,45 @@
+{"name": "mfc", "git": "https://github.com/MFlowCode/MFC"}
+{"name": "gromacs", "git": "https://github.com/gromacs/gromacs"}
+{"name": "lammps", "git": "https://github.com/lammps/lammps"}
+{"name": "cp2k", "git": "https://github.com/cp2k/cp2k"}
+{"name": "quantum-espresso", "git": "https://github.com/QEF/q-e"}
+{"name": "amrex", "git": "https://github.com/AMReX-Codes/amrex"}
+{"name": "sundials", "git": "https://github.com/LLNL/sundials", "split": "test"}
+{"name": "hypre", "git": "https://github.com/hypre-space/hypre"}
+{"name": "mfem", "git": "https://github.com/mfem/mfem"}
+{"name": "kokkos", "git": "https://github.com/kokkos/kokkos"}
+{"name": "su2", "git": "https://github.com/su2code/SU2", "split": "test"}
+{"name": "cantera-repo", "git": "https://github.com/Cantera/cantera"}
+{"name": "qmcpack", "git": "https://github.com/QMCPACK/qmcpack"}
+{"name": "adios2", "git": "https://github.com/ornladios/ADIOS2"}
+{"name": "nwchem", "git": "https://github.com/nwchemgit/nwchem"}
+{"name": "wrf", "git": "https://github.com/wrf-model/WRF"}
+{"name": "petsc", "git": "https://github.com/petsc/petsc"}
+{"name": "gdal", "git": "https://github.com/OSGeo/gdal", "split": "test"}
+{"name": "opencv", "git": "https://github.com/opencv/opencv"}
+{"name": "curl", "git": "https://github.com/curl/curl"}
+{"name": "adaptivecpp", "git": "https://github.com/AdaptiveCpp/AdaptiveCpp"}
+{"name": "libvips", "git": "https://github.com/libvips/libvips"}
+{"name": "openblas", "git": "https://github.com/OpenMathLib/OpenBLAS"}
+{"name": "lapack", "git": "https://github.com/Reference-LAPACK/lapack"}
+{"name": "hdf5", "git": "https://github.com/HDFGroup/hdf5", "split": "test"}
+{"name": "netcdf-c", "git": "https://github.com/Unidata/netcdf-c"}
+{"name": "fftw3", "git": "https://github.com/FFTW/fftw3"}
+{"name": "llama.cpp", "git": "https://github.com/ggml-org/llama.cpp", "split": "test"}
+{"name": "whisper.cpp", "git": "https://github.com/ggml-org/whisper.cpp"}
+{"name": "jax", "git": "https://github.com/jax-ml/jax"}
+{"name": "xla", "git": "https://github.com/openxla/xla"}
+{"name": "protobuf", "git": "https://github.com/protocolbuffers/protobuf"}
+{"name": "abseil-cpp", "git": "https://github.com/abseil/abseil-cpp"}
+{"name": "zlib", "git": "https://github.com/madler/zlib"}
+{"name": "zstd", "git": "https://github.com/facebook/zstd"}
+{"name": "libjpeg-turbo", "git": "https://github.com/libjpeg-turbo/libjpeg-turbo"}
+{"name": "cpython", "git": "https://github.com/python/cpython"}
+{"name": "julia", "git": "https://github.com/JuliaLang/julia"}
+{"name": "godot", "git": "https://github.com/godotengine/godot"}
+{"name": "redis", "git": "https://github.com/redis/redis"}
+{"name": "postgres", "git": "https://github.com/postgres/postgres"}
+{"name": "ffmpeg", "git": "https://github.com/FFmpeg/FFmpeg"}
+{"name": "xtensor", "git": "https://github.com/xtensor-stack/xtensor"}
+{"name": "duckdb", "git": "https://github.com/duckdb/duckdb"}
+{"name": "arrow", "git": "https://github.com/apache/arrow"}

@@ -130,6 +130,9 @@ class PseudoBuild:
     configure imported them, as ``name==version``."""
     python_stubbed: list = field(default_factory=list)
     """Modules the configure imported that were stubbed instead, with why."""
+    build_tools: list = field(default_factory=list)
+    """Blockers a Python build requirement answers -- Cython, for a Meson
+    build -- and so are the build's own business, not the target's."""
     narration: str = ""
     """The configure's own output, kept so the next round can read what it
     asked for. Not part of the report."""
@@ -196,6 +199,7 @@ _REQUIRED_FIND = re.compile(
 )
 #: find_package(Boost 1.70 CONFIG REQUIRED), and nothing to find: cantera's.
 _NO_CONFIG = re.compile(r'Could not find a package configuration file provided by\s+"([^"]+)"')
+_UNKNOWN_COMMAND = re.compile(r'Unknown CMake command "([A-Za-z_][A-Za-z0-9_]*)"')
 #: An error raised from inside a package's own Find module or config file is
 #: that package's error, even when its message never names it.
 _ERROR_FILE = re.compile(r"^\s*CMake Error at (\S+?):\d+")
@@ -250,6 +254,9 @@ def _stanza_blockers(stanza: str) -> list[str]:
         first = match.group(2).split(",")[0].strip()
         names.append(first or match.group(1))
     names += _NO_CONFIG.findall(re.sub(r"\s+", " ", stanza))
+    for command in _UNKNOWN_COMMAND.findall(stanza):
+        # nanobind_add_module is nanobind's: its config defines it.
+        names.append(command.split("_", 1)[0] if "_" in command else command)
     if names:
         return names
     listing = False
@@ -1119,6 +1126,53 @@ def _stub_python(
     return overrides, [*(str(p) for p in stubs), str(library)]
 
 
+_MAKES_TARGET = re.compile(r"(?:^|_)add_(?:\w+_)?(?:module|library|executable|extension)$")
+
+_COMMAND_STUB = """\
+function({command} name)
+  # stub emitted by will-it-riscv: {command}, which its package's CMake would define.
+  # It makes the target it names, from whichever of its arguments are files.
+  set(_wir_sources)
+  foreach(_wir_arg IN LISTS ARGN)
+    if(EXISTS "${{CMAKE_CURRENT_SOURCE_DIR}}/${{_wir_arg}}" OR IS_ABSOLUTE "${{_wir_arg}}")
+      list(APPEND _wir_sources "${{_wir_arg}}")
+    endif()
+  endforeach()
+  if(NOT _wir_sources)
+    file(WRITE "${{CMAKE_CURRENT_BINARY_DIR}}/${{name}}_wir_stub.c" "")
+    set(_wir_sources "${{CMAKE_CURRENT_BINARY_DIR}}/${{name}}_wir_stub.c")
+  endif()
+  add_library(${{name}} MODULE ${{_wir_sources}})
+endfunction()
+"""
+
+
+def _stub_commands(commands: list[str], sysroot: Path) -> tuple[list[str], list]:
+    """Commands the configure called that a stubbed package would have defined.
+
+    nanobind_add_module and pybind11_add_module come from those packages'
+    CMake config files -- which, stubbed, define nothing. A command that
+    makes a target gets one made from the files it is given; any other is a
+    no-op. Each is its own file, included at the first project() before
+    anything calls it; a real definition loaded later wins.
+    """
+    directory = sysroot / "lib" / "cmake" / "will-it-riscv-commands"
+    directory.mkdir(parents=True, exist_ok=True)
+    created = []
+    for command in commands:
+        path = directory / f"{command}.cmake"
+        if path.exists():
+            continue
+        if _MAKES_TARGET.search(command):
+            path.write_text(_COMMAND_STUB.format(command=command))
+        else:
+            path.write_text(
+                f"function({command})\n  # stub emitted by will-it-riscv\nendfunction()\n"
+            )
+        created.append(str(path))
+    return sorted(str(p) for p in directory.glob("*.cmake")), created
+
+
 def _stub_mpi(sysroot: Path, suffix: str) -> tuple[dict, list]:
     """MPI, answered the way FindMPI asks its own questions.
 
@@ -1387,6 +1441,12 @@ def _synthesize(
     # status miss is a dependency the build did without, and stubbing it
     # would erase the evidence.
     for stanza in _error_stanzas(narration):
+        commands = _UNKNOWN_COMMAND.findall(stanza)
+        if commands:
+            includes, files = _stub_commands(commands, sysroot)
+            overrides["CMAKE_PROJECT_TOP_LEVEL_INCLUDES"] = ";".join(includes)
+            created += [f for f in files if f not in already]
+            continue
         variables: list[str] = []
         named = _ANY_MISS.search(stanza)
         package = named.group(1) if named else None

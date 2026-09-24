@@ -27,12 +27,16 @@ PLAN_VERSION = 1
 PYTHON_INSTALL = "python-install"
 SYSTEM_PACKAGES = "system-packages"
 CMAKE_CONFIGURE = "cmake-configure"
+MESON_SETUP = "meson-setup"
 PYTHON_RUN = "python-run"
-STEP_KINDS = (PYTHON_INSTALL, SYSTEM_PACKAGES, CMAKE_CONFIGURE, PYTHON_RUN)
+STEP_KINDS = (PYTHON_INSTALL, SYSTEM_PACKAGES, CMAKE_CONFIGURE, MESON_SETUP, PYTHON_RUN)
+#: The steps that configure a build, in the pretend environment.
+CONFIGURE_KINDS = (CMAKE_CONFIGURE, MESON_SETUP)
 
 _STEP_FIELDS = {
     "id", "kind", "evidence", "after", "note", "provides", "optional", "enabled_by",
     "manifest", "section", "extras", "packages", "source", "defines", "script", "args",
+    "meson",
 }
 #: What a python-install resolves: a project's dependencies, or what its
 #: build needs -- [build-system].requires, which recursion into a fetched
@@ -90,11 +94,17 @@ class Step:
     the project needs -- its [build-system].requires."""
     extras: list[str] = field(default_factory=list)
     packages: list[str] = field(default_factory=list)
-    """system-packages: distro package names."""
+    """system-packages: distro package names. python-install, in place of a
+    manifest: requirement specifiers, ``numpy==2.1.3``."""
     source: str = "."
-    """cmake-configure: the source directory, relative to the repository."""
+    """cmake-configure, meson-setup: the source directory, relative to the
+    repository."""
     defines: dict[str, str] = field(default_factory=dict)
-    """cmake-configure: the -D flags the build itself passes."""
+    """cmake-configure: the -D flags the build itself passes. meson-setup:
+    the -D options."""
+    meson: Optional[str] = None
+    """meson-setup: a Meson the project ships, relative to the source
+    directory -- numpy's ``vendored-meson/meson/meson.py``."""
     script: Optional[str] = None
     """python-run: the project's own build driver, relative to the repository."""
     args: list[str] = field(default_factory=list)
@@ -110,6 +120,11 @@ class Plan:
     entry_evidence: list[Evidence] = field(default_factory=list)
     unsure: list[str] = field(default_factory=list)
     """What the planner could not tell. Worth saying: the executor can test it."""
+    read: list[str] = field(default_factory=list)
+    """What reading a build it could not run found, one sentence each: what
+    jaxlib's MODULE.bazel downloads, and whether riscv64 has it."""
+    blocked: list[str] = field(default_factory=list)
+    """What reading found the target cannot have, as written."""
 
     def step(self, step_id: str) -> Step:
         return next(s for s in self.steps if s.id == step_id)
@@ -129,6 +144,62 @@ class Plan:
             else:  # pragma: no cover - parse_plan rejects cycles
                 raise PlanError(["steps depend on each other in a cycle"])
         return done
+
+
+# ------------------------------------------------------------------ writing
+
+
+def plan_to_dict(plan: Plan) -> dict:
+    """The plan as JSON, in the format :func:`parse_plan` reads back."""
+
+    def evidence(items: list[Evidence]) -> list:
+        return [
+            {"at": str(e), "quote": e.quote} if e.quote else str(e) for e in items
+        ]
+
+    steps = []
+    for step in plan.steps:
+        raw: dict[str, Any] = {"id": step.id, "kind": step.kind}
+        if step.after:
+            raw["after"] = list(step.after)
+        if step.optional:
+            raw["optional"] = True
+            raw["enabled_by"] = step.enabled_by
+        if step.note:
+            raw["note"] = step.note
+        if step.provides:
+            raw["provides"] = list(step.provides)
+        if step.kind == PYTHON_INSTALL:
+            if step.manifest is not None:
+                raw["manifest"] = step.manifest
+            else:
+                raw["packages"] = list(step.packages)
+            if step.section != "dependencies":
+                raw["section"] = step.section
+            if step.extras:
+                raw["extras"] = list(step.extras)
+        elif step.kind == SYSTEM_PACKAGES:
+            raw["packages"] = list(step.packages)
+        elif step.kind == PYTHON_RUN:
+            raw["script"] = step.script
+            if step.args:
+                raw["args"] = list(step.args)
+        else:
+            if step.source != ".":
+                raw["source"] = step.source
+            if step.defines:
+                raw["defines"] = dict(step.defines)
+            if step.meson:
+                raw["meson"] = step.meson
+        raw["evidence"] = evidence(step.evidence)
+        steps.append(raw)
+    data: dict[str, Any] = {"version": PLAN_VERSION, "repo": plan.repo}
+    if plan.entry is not None:
+        data["entry"] = {"command": plan.entry, "evidence": evidence(plan.entry_evidence)}
+    data["steps"] = steps
+    if plan.unsure:
+        data["unsure"] = list(plan.unsure)
+    return data
 
 
 # ------------------------------------------------------------------ reading
@@ -244,8 +315,14 @@ def _step(raw: Any, index: int, problems: list[str]) -> Optional[Step]:
         problems.append(f"{where}: 'enabled_by' only means something on an optional step")
     if kind == PYTHON_INSTALL:
         manifest = raw.get("manifest")
-        if not isinstance(manifest, str) or not manifest:
-            problems.append(f"{where}: a python-install names its 'manifest'")
+        if "packages" in raw and manifest is None:
+            # Requirements named in the plan itself, where no file lists
+            # them: the wheels jaxlib's Bazel build takes from dist/.
+            step.packages = _strings(raw.get("packages", []), f"{where}: 'packages'", problems)
+            if not step.packages:
+                problems.append(f"{where}: a python-install names its 'manifest' or 'packages'")
+        elif not isinstance(manifest, str) or not manifest:
+            problems.append(f"{where}: a python-install names its 'manifest' or 'packages'")
         else:
             step.manifest = manifest
         section = raw.get("section", "dependencies")
@@ -277,7 +354,13 @@ def _step(raw: Any, index: int, problems: list[str]) -> Optional[Step]:
             problems.append(f"{where}: 'source' must be a directory")
         else:
             step.source = source
-        step.defines = _defines(raw.get("defines", {}), where, problems)
+        step.defines = _defines(raw.get("defines", {}), where, problems, kind)
+        if kind == MESON_SETUP and raw.get("meson") is not None:
+            meson = raw.get("meson")
+            if not isinstance(meson, str) or not meson:
+                problems.append(f"{where}: 'meson' is the path of the Meson the project ships")
+            else:
+                step.meson = meson
     return step
 
 
@@ -302,14 +385,29 @@ def _strings(value: Any, where: str, problems: list[str]) -> list[str]:
     return list(value)
 
 
-def _defines(value: Any, where: str, problems: list[str]) -> dict[str, str]:
+#: A CMake variable -- LAMMPS's PKG_ML-PACE, with or without a :BOOL -- and a
+#: Meson option: allow-noblas, or a subproject's zlib:tests.
+_CMAKE_TYPE = re.compile(r":(BOOL|STRING|PATH|FILEPATH|INTERNAL|UNINITIALIZED)$", re.IGNORECASE)
+_DEFINE_NAMES = {
+    CMAKE_CONFIGURE: (re.compile(r"^[A-Za-z_][A-Za-z0-9_.+-]*$"), "a CMake variable name"),
+    MESON_SETUP: (re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*(:[A-Za-z_][A-Za-z0-9_.-]*)?$"),
+                  "a Meson option name"),
+}
+
+
+def _defines(
+    value: Any, where: str, problems: list[str], kind: str = CMAKE_CONFIGURE
+) -> dict[str, str]:
     if not isinstance(value, dict):
         problems.append(f"{where}: 'defines' must map variable names to values")
         return {}
+    pattern, what = _DEFINE_NAMES.get(kind, _DEFINE_NAMES[CMAKE_CONFIGURE])
     defines: dict[str, str] = {}
     for name, raw in value.items():
-        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(name)):
-            problems.append(f"{where}: {name!r} is not a CMake variable name")
+        if kind == CMAKE_CONFIGURE:
+            name = _CMAKE_TYPE.sub("", str(name))   # -DX:BOOL=ON sets X
+        if not pattern.match(str(name)):
+            problems.append(f"{where}: {name!r} is not {what}")
             continue
         if isinstance(raw, bool):
             defines[name] = "ON" if raw else "OFF"
@@ -449,6 +547,7 @@ PLAN_SCHEMA: dict = {
                     },
                     "script": {"type": "string"},
                     "args": {"type": "array", "items": {"type": "string"}},
+                    "meson": {"type": "string"},
                     "optional": {"type": "boolean"},
                     "enabled_by": {"type": "string"},
                 },

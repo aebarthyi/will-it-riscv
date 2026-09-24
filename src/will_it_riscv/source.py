@@ -24,6 +24,7 @@ from .meson_introspect import MesonDependency, MesonScan, scan_dependencies
 from .models import BuildProfile, SystemRequirement
 from .pseudobuild import PseudoBuild
 from .pseudobuild import run as run_pseudobuild
+from .pseudomeson import run as run_pseudomeson
 from .scripts import ScriptInstall, find_script_installs
 from .sdist import (
     ScanPolicy,
@@ -284,6 +285,27 @@ def _apply_meson_verdict(scan: MesonScan, found: dict, record) -> None:
         )
 
 
+def _meson_python_config(root: Path) -> tuple[dict, Optional[str], Optional[dict]]:
+    """Its meson-python options and Meson, and its build requirements.
+
+    Without a plan nothing has resolved a version, so a build requirement
+    the setup needs -- Cython -- is installed for the host at the latest.
+    """
+    from .autoplan import _build_requires, _meson_python
+
+    try:
+        import tomllib
+    except ImportError:  # pragma: no cover
+        import tomli as tomllib  # type: ignore[no-redef]
+    try:
+        data = tomllib.loads((root / "pyproject.toml").read_text(errors="replace"))
+    except (OSError, ValueError):
+        return {}, None, None
+    options, meson = _meson_python(data)
+    requires = _build_requires(root / "pyproject.toml")
+    return options, meson, (dict.fromkeys(requires) if requires else None)
+
+
 def _apply_pseudobuild(
     result: PseudoBuild, found: dict, record, inspection: RepositoryInspection
 ) -> None:
@@ -495,6 +517,14 @@ def inspect_repository(
         inspection.pseudobuild = run_pseudobuild(
             root, timeout=pseudobuild_timeout, arch=pseudobuild_arch
         )
+        if inspection.pseudobuild is None:
+            # No CMakeLists.txt at the top: a Meson project is set up instead,
+            # with the options and the Meson its [tool.meson-python] names.
+            options, meson, requires = _meson_python_config(root)
+            inspection.pseudobuild = run_pseudomeson(
+                root, timeout=pseudobuild_timeout, arch=pseudobuild_arch,
+                options=options, meson=meson, python_dists=requires,
+            )
         if inspection.pseudobuild is not None:
             _apply_pseudobuild(inspection.pseudobuild, found, record, inspection)
 

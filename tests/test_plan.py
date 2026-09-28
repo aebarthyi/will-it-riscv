@@ -33,6 +33,9 @@ class FakeDistro:
         self.arch = "riscv64"
         self.available = True
 
+    def contents(self):
+        return None
+
     def first_available(self, candidates):
         return next((c for c in candidates if c in self.names_), None)
 
@@ -373,6 +376,19 @@ def test_a_python_install_can_name_its_packages_instead_of_a_file():
         parse_plan({"repo": "r", "steps": [
             {"id": "w", "kind": "python-install", "evidence": []},
         ]})
+
+
+def test_a_manifest_is_a_pyproject_or_a_requirements_file():
+    """Read as requirements, setup.py skips every line and requires nothing."""
+    for manifest in ("pyproject.toml", "sub/pyproject.toml", "requirements/zstd.txt"):
+        parse_plan({"repo": "r", "steps": [{
+            "id": "i", "kind": "python-install", "manifest": manifest, "evidence": [],
+        }]})
+    for manifest in ("setup.py", "setup.cfg", "Cargo.toml"):
+        with pytest.raises(PlanError, match="not a manifest"):
+            parse_plan({"repo": "r", "steps": [{
+                "id": "i", "kind": "python-install", "manifest": manifest, "evidence": [],
+            }]})
 
 
 def test_a_meson_setup_names_the_meson_it_ships():

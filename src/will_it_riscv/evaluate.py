@@ -20,6 +20,11 @@ their -D flags agree; a python-install matches on its manifest and section.
 
 Baselines: ``autoplan`` (the build-file reader recursion uses today) and
 ``teacher-first`` (the teacher's plan before any of it was sent back).
+
+The table gives every planner a row over all of them, then one for each
+kind: script-driven repositories (``repo``) and PyPI packages (``pypi``).
+There are far more of the second, and the first is where a model has to
+beat reading build files, so an average over both hides what matters.
 """
 
 from __future__ import annotations
@@ -53,6 +58,7 @@ Planner = Callable[[Path, EvidencePack, dict], Optional[Plan]]
 class Score:
     key: str
     planner: str
+    kind: str = ""
     parsed: bool = False
     citations: int = 0
     holding: int = 0
@@ -194,6 +200,11 @@ def score(
     return result
 
 
+def kind(meta: dict) -> str:
+    """A script-driven repository (git) or a PyPI package (sdist, or its repo)."""
+    return "repo" if (meta.get("origin") or "").startswith("git ") else "pypi"
+
+
 # ------------------------------------------------------------------ planners
 
 
@@ -216,9 +227,24 @@ def teacher_first(directory: Path) -> Planner:
     return planner
 
 
-def model_planner(backend: modelplan.Backend, rounds: int = 1) -> Planner:
+def model_planner(
+    backend: modelplan.Backend, rounds: int = 1, transcripts: Optional[Path] = None,
+) -> Planner:
+    """``transcripts``: keep each answer and what was sent back, one file a key."""
+
     def planner(root: Path, pack: EvidencePack, meta: dict) -> Optional[Plan]:
         outcome = modelplan.plan_repository(root, backend, pack=pack, rounds=rounds)
+        if transcripts is not None:
+            transcripts.mkdir(parents=True, exist_ok=True)
+            (transcripts / f"{meta['key']}.json").write_text(json.dumps({
+                "backend": outcome.backend,
+                "error": outcome.error,
+                "attempts": [
+                    {"text": a.text, "problems": a.problems,
+                     "output_tokens": a.completion.output_tokens if a.completion else None}
+                    for a in outcome.attempts
+                ],
+            }, indent=2))
         return outcome.plan
 
     return planner
@@ -229,7 +255,7 @@ def model_planner(backend: modelplan.Backend, rounds: int = 1) -> Planner:
 
 def evaluate(
     out: Path, planners: dict[str, Planner], split: str = "test", execute: bool = False,
-    python: str = "3.12", progress=print,
+    python: str = "3.12", progress=print, keys: Optional[set[str]] = None,
 ) -> list[Score]:
     from . import dataset
 
@@ -239,10 +265,14 @@ def evaluate(
         meta = json.loads((directory / "meta.json").read_text())
         if meta.get("tier") != dataset.VERIFIED or meta.get("split") != split:
             continue
-        root = Path(meta["root"])
-        if not root.is_dir():
-            progress(f"{directory.name}: its tree is gone from {root}; skipped")
+        if keys is not None and directory.name not in keys:
             continue
+        found = dataset.tree(meta)
+        if found.root is None:
+            progress(f"{directory.name}: its tree is {found.error}; skipped "
+                     f"(will-it-riscv-dataset check --fetch brings it back)")
+            continue
+        root = found.root
         reference = load_plan(directory / "plan.json")
         pack = EvidencePack.from_dict(json.loads((directory / "pack.json").read_text()))
         reference_run = None
@@ -250,11 +280,12 @@ def evaluate(
             reference_run = json.loads((directory / "run.json").read_text())
         for name, planner in {**planners, "teacher-first": teacher_first(directory)}.items():
             try:
-                candidate = planner(root, pack, meta)
+                candidate = planner(root, pack, {**meta, "key": directory.name})
             except Exception as exc:  # noqa: BLE001 - a planner failing scores zero
                 progress(f"{directory.name}: {name} failed: {exc}")
                 candidate = None
             result = score(candidate, reference, root, pack, directory.name, name)
+            result.kind = kind(meta)
             if env is not None and candidate is not None and reference_run is not None:
                 ran = dataset.summary(dataset.run_plan(candidate, root, env))
                 result.verdict = ran["verdict"] == reference_run["verdict"]
@@ -268,10 +299,17 @@ def _overlap(a: set, b: set) -> float:
 
 
 def table(scores: list[Score]) -> list[dict]:
-    """One row per planner: every metric, averaged over the repositories."""
+    """Per planner, a row over every repository and one for each kind."""
     rows = []
-    for planner in dict.fromkeys(s.planner for s in scores):
-        mine = [s for s in scores if s.planner == planner]
+    groups = [
+        (planner, group)
+        for planner in dict.fromkeys(s.planner for s in scores)
+        for group in ("all", *sorted({s.kind for s in scores}))
+    ]
+    for planner, group in groups:
+        mine = [s for s in scores if s.planner == planner and group in ("all", s.kind)]
+        if not mine:
+            continue
 
         def mean(values: list) -> Optional[float]:
             present = [v for v in values if v is not None]
@@ -279,6 +317,7 @@ def table(scores: list[Score]) -> list[dict]:
 
         rows.append({
             "planner": planner,
+            "kind": group,
             "repos": len(mine),
             "parsed": mean([1.0 if s.parsed else 0.0 for s in mine]),
             "cited": mean([s.cited for s in mine]),
@@ -310,19 +349,24 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--execute", action="store_true",
                         help="also run every plan, and compare what the runs require")
     parser.add_argument("--json", type=Path, help="write every score here")
+    parser.add_argument("--transcripts", type=Path,
+                        help="keep what the model wrote, one file per repository, here")
     parser.add_argument("--python", default="3.12")
+    parser.add_argument("--keys", type=Path,
+                        help="score only these examples of the split: a file, one key a line")
     args = parser.parse_args(argv)
 
     planners: dict[str, Planner] = {"autoplan": autoplan_planner}
     if args.planner:
         backend = modelplan.backend(args.planner, args.planner_model, args.planner_url)
-        planners[backend.name] = model_planner(backend, args.rounds)
+        planners[backend.name] = model_planner(backend, args.rounds, args.transcripts)
+    keys = set(args.keys.read_text().split()) if args.keys else None
     scores = evaluate(
         args.out, planners, args.split, args.execute, args.python,
-        progress=lambda m: print(m, file=sys.stderr),
+        progress=lambda m: print(m, file=sys.stderr), keys=keys,
     )
     rows = table(scores)
-    columns = ["planner", "repos", "parsed", "cited", "grounded", "precision", "recall", "f1",
+    columns = ["planner", "kind", "repos", "parsed", "cited", "grounded", "precision", "recall", "f1",
                "optional", "order", "verdict", "required"]
     print("  ".join(f"{c:>9}" for c in columns))
     for row in rows:

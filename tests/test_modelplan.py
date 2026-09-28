@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -91,6 +92,28 @@ def test_the_wire_schema_is_strict_enough_for_constrained_decoding():
     closed(modelplan.WIRE_SCHEMA)
     text = json.dumps(modelplan.WIRE_SCHEMA)
     assert '"type": ["' not in text   # no type arrays
+
+
+def test_the_schema_lists_keys_in_the_order_the_wire_writes_them():
+    # A grammar writes keys in schema order; a model trained on to_wire's order
+    # stops early when made to write them in another.
+    schema = modelplan.WIRE_SCHEMA
+    top = list(schema["properties"])
+    step = list(schema["properties"]["steps"]["items"]["properties"])
+    for path in sorted(Path("examples/plans").glob("*.json")):
+        wire = modelplan.to_wire(load_plan(path))
+        assert list(wire) == [k for k in top if k in wire], path
+        for raw in wire["steps"]:
+            assert list(raw) == [k for k in step if k in raw], (path, raw["id"])
+
+
+def test_the_grammar_keeps_only_the_leading_keys_required():
+    grammar = modelplan.in_written_order(modelplan.WIRE_SCHEMA)
+    assert grammar["required"] == ["repo", "steps", "unsure"]
+    assert grammar["properties"]["steps"]["items"]["required"] == ["id", "kind"]
+    assert grammar["properties"]["entry"]["required"] == ["command", "evidence"]
+    assert modelplan.WIRE_SCHEMA["properties"]["steps"]["items"]["required"] == [
+        "id", "kind", "evidence"]
 
 
 def test_a_plan_goes_to_the_wire_and_back():
@@ -313,9 +336,36 @@ def test_the_harness_scores_baselines_on_held_out_repositories(tmp_path):
     entry = dataset.Entry(name="demo", path=str(repo), split="test")
     dataset.label(entry, repo, Scripted(wire(quote="nope"), wire()), out)
     scores = evaluate.evaluate(out, {"autoplan": evaluate.autoplan_planner})
-    rows = {row["planner"]: row for row in evaluate.table(scores)}
-    assert set(rows) == {"autoplan", "teacher-first"}
-    assert rows["teacher-first"]["recall"] == 1.0 and rows["teacher-first"]["cited"] == 0.5
+    rows = {(row["planner"], row["kind"]): row for row in evaluate.table(scores)}
+    # One local, non-git repository: a row over all, and one for its kind.
+    assert set(rows) == {(p, k) for p in ("autoplan", "teacher-first") for k in ("all", "pypi")}
+    teacher = rows["teacher-first", "all"]
+    assert teacher["recall"] == 1.0 and teacher["cited"] == 0.5
+
+
+def test_the_harness_scores_only_the_keys_it_is_given(tmp_path):
+    repo = write(tmp_path / "repo", REPO)
+    out = tmp_path / "out"
+    entry = dataset.Entry(name="demo", path=str(repo), split="test")
+    dataset.label(entry, repo, Scripted(wire()), out)
+    planners = {"autoplan": evaluate.autoplan_planner}
+    assert evaluate.evaluate(out, planners, keys=set()) == []
+    (key,) = [d.name for d in out.iterdir()]
+    assert {s.key for s in evaluate.evaluate(out, planners, keys={key})} == {key}
+
+
+def test_the_harness_keeps_what_the_model_wrote(tmp_path):
+    repo = write(tmp_path / "repo", REPO)
+    out = tmp_path / "out"
+    entry = dataset.Entry(name="demo", path=str(repo), split="test")
+    dataset.label(entry, repo, Scripted(wire()), out)
+    kept = tmp_path / "transcripts"
+    planner = evaluate.model_planner(Scripted(wire(quote="nope"), wire()), 3, kept)
+    scores = evaluate.evaluate(out, {"model": planner})
+    assert [s.parsed for s in scores if s.planner == "model"] == [True]
+    (saved,) = kept.iterdir()
+    attempts = json.loads(saved.read_text())["attempts"]
+    assert len(attempts) == 2 and attempts[0]["problems"] and not attempts[1]["problems"]
 
 
 def test_the_command_line_runs_the_plan_a_model_wrote(tmp_path, monkeypatch):

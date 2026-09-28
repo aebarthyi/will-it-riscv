@@ -62,15 +62,6 @@ WIRE_SCHEMA: dict = {
     "required": ["repo", "steps", "unsure"],
     "properties": {
         "repo": {"type": "string"},
-        "entry": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["command", "evidence"],
-            "properties": {
-                "command": {"type": "string"},
-                "evidence": {"$ref": "#/$defs/evidence"},
-            },
-        },
         "steps": {
             "type": "array",
             "minItems": 1,
@@ -81,16 +72,17 @@ WIRE_SCHEMA: dict = {
                 "properties": {
                     "id": {"type": "string"},
                     "kind": {"enum": list(STEP_KINDS)},
-                    "evidence": {"$ref": "#/$defs/evidence"},
                     "after": _STRINGS,
-                    "note": {"type": "string"},
                     "optional": {"type": "boolean"},
                     "enabled_by": {"type": "string"},
+                    "note": {"type": "string"},
                     "provides": _STRINGS,
                     "manifest": {"type": "string"},
+                    "packages": _STRINGS,
                     "section": {"enum": list(SECTIONS)},
                     "extras": _STRINGS,
-                    "packages": _STRINGS,
+                    "script": {"type": "string"},
+                    "args": _STRINGS,
                     "source": {"type": "string"},
                     "defines": {
                         "type": "array",
@@ -105,12 +97,20 @@ WIRE_SCHEMA: dict = {
                         },
                     },
                     "meson": {"type": "string"},
-                    "script": {"type": "string"},
-                    "args": _STRINGS,
+                    "evidence": {"$ref": "#/$defs/evidence"},
                 },
             },
         },
         "unsure": _STRINGS,
+        "entry": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["command", "evidence"],
+            "properties": {
+                "command": {"type": "string"},
+                "evidence": {"$ref": "#/$defs/evidence"},
+            },
+        },
     },
     "$defs": {
         "evidence": {
@@ -124,6 +124,32 @@ WIRE_SCHEMA: dict = {
         },
     },
 }
+
+
+
+def in_written_order(schema: Any) -> Any:
+    """The schema for a grammar that writes an object's keys in its listed order.
+
+    llama.cpp's grammar writes an object's required properties first and the
+    optional ones after, so a required ``evidence`` would come straight after
+    ``kind`` -- where no plan the model was trained on puts it, and the model
+    closes the step there. Only the required properties that lead the list
+    stay required; ``check`` asks for the rest.
+    """
+    if isinstance(schema, list):
+        return [in_written_order(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    out = {key: in_written_order(value) for key, value in schema.items()}
+    if "required" in schema and "properties" in schema:
+        leading = []
+        for name in schema["properties"]:
+            if name not in schema["required"]:
+                break
+            leading.append(name)
+        out["required"] = leading
+    return out
+
 
 SYSTEM_PROMPT = """\
 You write build plans for will-it-riscv, a tool that works out what a repository needs in \
@@ -271,7 +297,8 @@ class OpenAICompatible:
             "temperature": 0,
             # What vLLM, llama.cpp and Ollama constrain decoding with.
             "response_format": {
-                "type": "json_schema", "json_schema": {"name": "plan", "schema": schema},
+                "type": "json_schema",
+                "json_schema": {"name": "plan", "schema": in_written_order(schema)},
             },
         })
         response.raise_for_status()

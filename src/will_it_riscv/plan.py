@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
 PLAN_VERSION = 1
@@ -213,6 +213,11 @@ def load_plan(path: Path) -> Plan:
     return parse_plan(data)
 
 
+def _not_a_manifest(path: str) -> bool:
+    name = PurePosixPath(path).name
+    return name.endswith((".py", ".cfg")) or (name.endswith(".toml") and name != "pyproject.toml")
+
+
 def parse_plan(data: Any) -> Plan:
     problems: list[str] = []
     if not isinstance(data, dict):
@@ -323,6 +328,13 @@ def _step(raw: Any, index: int, problems: list[str]) -> Optional[Step]:
                 problems.append(f"{where}: a python-install names its 'manifest' or 'packages'")
         elif not isinstance(manifest, str) or not manifest:
             problems.append(f"{where}: a python-install names its 'manifest' or 'packages'")
+        elif _not_a_manifest(manifest):
+            # Read as a requirements file, setup.py is every line skipped and
+            # nothing required: a step that holds and says nothing.
+            problems.append(
+                f"{where}: {manifest!r} is not a manifest (a pyproject.toml or a requirements "
+                f"file); list what it installs as 'packages' instead"
+            )
         else:
             step.manifest = manifest
         section = raw.get("section", "dependencies")

@@ -205,6 +205,18 @@ def test_invoked_scripts_are_followed_too(tmp_path):
     assert only.chain == ("install.sh:2", "scripts/deps.sh:1")
 
 
+def test_a_script_outside_the_repository_is_not_followed(tmp_path):
+    host = tmp_path / "host" / "env.sh"      # this machine's file, not the repository's
+    host.parent.mkdir()
+    host.write_text("pip install -r host-requirements.txt\n")
+    repo = tmp_path / "repo"
+    build_repo(repo, {
+        "install.sh": f"#!/bin/sh\n. {host}\nsource ../host/env.sh\n",
+        "host-requirements.txt": "x\n",
+    })
+    assert find_script_installs(repo) == []
+
+
 def test_a_source_cycle_terminates(tmp_path):
     build_repo(tmp_path, {
         "a.sh": ". ./b.sh\npip install -r req.txt\n",

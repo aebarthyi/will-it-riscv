@@ -26,6 +26,7 @@ be reproducible from the repository alone.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -217,8 +218,8 @@ def _candidates(root: Path, name: Optional[str] = None):
                 tops.insert(0, root / candidate)
     for top in tops:
         for relative in _MANIFESTS:
-            path = top / relative
-            if not path.is_file():
+            path = _find(top, relative)
+            if path is None or not path.is_file():
                 continue
             if path.name == "pyproject.toml":
                 yield _pyproject(root, path)
@@ -230,8 +231,8 @@ def _candidates(root: Path, name: Optional[str] = None):
                 continue
             yield _whole(root, path, "a manifest", cap=120)
     for relative in _BUILD_FILES:
-        path = root / relative
-        if path.is_file():
+        path = _find(root, relative)
+        if path is not None and path.is_file():
             yield _build_file(root, path)
     yield from _ci(root)
     # Linting, formatting, completions: reached from the entry script, but
@@ -239,10 +240,34 @@ def _candidates(root: Path, name: Optional[str] = None):
     yield from _scripts(root, minor=True)
 
 
+def _find(top: Path, relative: str) -> Optional[Path]:
+    """``top / relative`` as it is spelled on disk, matching case only if it must.
+
+    A Mac's filesystem answers ``Makefile`` for mfem's ``makefile`` and
+    ``docs`` for amrex's ``Docs``; Linux's does not. Asking the directory
+    instead gives the same pack everywhere, citing names that exist.
+    """
+    path = top
+    for part in Path(relative).parts:
+        exact = path / part
+        try:
+            names = sorted(os.listdir(path))
+        except OSError:
+            return None
+        if part in names:
+            path = exact
+            continue
+        folded = [n for n in names if n.lower() == part.lower()]
+        if not folded:
+            return None
+        path = path / folded[0]
+    return path
+
+
 def _docs(root: Path):
     paths = [p for p in sorted(root.iterdir()) if p.is_file() and _DOC.match(p.name)]
-    docs = root / "docs"
-    if docs.is_dir():
+    docs = _find(root, "docs")
+    if docs is not None and docs.is_dir():
         paths += [
             p for p in sorted(docs.rglob("*"))
             if p.is_file() and p.suffix.lower() in (".md", ".rst", ".txt")

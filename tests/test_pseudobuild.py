@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -742,11 +743,14 @@ def test_python_is_answered_at_the_interpreters_version(tmp_path):
         '  (found version "3.14.3")\n',
         tmp_path,
     )
+    # Pinned to the interpreter running the build, not the version the error names.
+    major, minor, micro = sys.version_info[:3]
     include = Path(overrides["Python_INCLUDE_DIR"])
-    assert include.name == "python3.14"
-    assert '#define PY_VERSION "3.14.3"' in (include / "patchlevel.h").read_text()
-    assert overrides["Python3_LIBRARY"].endswith("libpython3.14.so") or overrides[
-        "Python3_LIBRARY"].endswith("libpython3.14.dylib")
+    assert include.name == f"python{major}.{minor}"
+    assert f'#define PY_VERSION "{major}.{minor}.{micro}"' in (
+        include / "patchlevel.h").read_text()
+    assert overrides["Python3_LIBRARY"].endswith(
+        (f"libpython{major}.{minor}.so", f"libpython{major}.{minor}.dylib"))
     assert "Python_INCLUDE_DIRS" not in overrides   # FindPython's result, not its input
 
 

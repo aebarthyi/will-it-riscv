@@ -369,7 +369,14 @@ def _follow(
     if not target or "$" in target:
         return
     path = Path(target) if os.path.isabs(target) else root / target
-    if path.is_file():
+    # Only the repository's own scripts: `source /root/.cargo/env` names the
+    # host it ran on, and reading this host's copy -- or failing to -- is not
+    # reading the repository.
+    try:
+        inside = path.resolve().is_relative_to(root.resolve()) and path.is_file()
+    except OSError:
+        inside = False
+    if inside:
         _read(path, root, entry, variables if shared else dict(variables), reading, chain)
 
 

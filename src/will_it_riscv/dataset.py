@@ -11,6 +11,7 @@ a training example: the pack in, the plan out.
 
   label     fetch each repository in a corpus, label it, verify it
   export    write the verified examples as chat-format JSONL for SFT
+  check     find each example's tree on this machine, rebuild its pack
   status    how far a labelling run has got, and what it cost
   seed-pypi a corpus of compiled PyPI packages with no riscv64 wheel
 
@@ -138,7 +139,8 @@ def _latest(index, name: str) -> Optional[str]:
     return str(max(stable or project.releases))
 
 
-def _git(entry: Entry, cache: Path) -> Fetched:
+def _git(entry: Entry, cache: Path, commit: Optional[str] = None) -> Fetched:
+    """A shallow clone at ``entry.ref``, or at ``commit`` when one is pinned."""
     assert entry.git
     destination = cache / entry.key
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
@@ -157,10 +159,98 @@ def _git(entry: Entry, cache: Path) -> Fetched:
         if process.returncode != 0:
             tail = (process.stderr or "").strip().splitlines()
             return Fetched(None, error=f"git clone {entry.git}: {tail[-1] if tail else 'failed'}")
-    commit = subprocess.run(
+    if commit and _head(destination) != commit:
+        # A shallow clone has only its tip: fetch the one commit, then stand on it.
+        for command in (["fetch", "--quiet", "--depth", "1", "origin", commit],
+                        ["checkout", "--quiet", "--detach", commit]):
+            process = subprocess.run(
+                ["git", "-C", str(destination), *command], capture_output=True, text=True,
+                timeout=900, env=env,
+            )
+            if process.returncode != 0:
+                tail = (process.stderr or "").strip().splitlines()
+                return Fetched(None, error=f"git {command[0]} {commit}: "
+                                           f"{tail[-1] if tail else 'failed'}")
+    head = _head(destination)
+    return Fetched(destination, f"git {entry.git}@{head or entry.ref or 'HEAD'}")
+
+
+def _head(destination: Path) -> str:
+    return subprocess.run(
         ["git", "-C", str(destination), "rev-parse", "HEAD"], capture_output=True, text=True
     ).stdout.strip()
-    return Fetched(destination, f"git {entry.git}@{commit or entry.ref or 'HEAD'}")
+
+
+# ------------------------------------------------------------------ finding a tree again
+
+
+def tree(
+    meta: dict, cache_root: Optional[Path] = None, index=None, fetch_missing: bool = False,
+) -> Fetched:
+    """Where an example's source tree is on this machine.
+
+    ``meta.json`` records the absolute root it was labelled from, which names
+    another machine's cache once the dataset moves. So the root is tried as
+    recorded, then the same place in this machine's cache -- everything
+    after the cache's ``dataset/`` directory is the same wherever the cache
+    is. Failing both, and when asked to, the tree is fetched again: git at
+    the commit ``origin`` recorded, PyPI at the recorded version.
+    """
+    if not meta.get("root"):
+        return Fetched(None, error="no tree was recorded")
+    recorded = Path(meta["root"])
+    if recorded.is_dir():
+        return Fetched(recorded, meta.get("origin", ""))
+    if cache_root is None:
+        from .cache import Cache
+
+        cache_root = Cache().root / "dataset"
+    relocated = _in_cache(recorded, cache_root)
+    if relocated is not None and relocated.is_dir():
+        return Fetched(relocated, meta.get("origin", ""))
+    if not fetch_missing:
+        return Fetched(None, error=f"not at {relocated or recorded}")
+    entry = Entry(**meta["entry"])
+    if entry.git:
+        origin = meta.get("origin") or ""
+        commit = origin.rsplit("@", 1)[1] if origin.startswith("git ") and "@" in origin else None
+        return _git(entry, cache_root / "git", commit)
+    return fetch(entry, cache_root, index)
+
+
+def _in_cache(recorded: Path, cache_root: Path) -> Optional[Path]:
+    """The recorded root, moved into ``cache_root``: the part below ``dataset/``."""
+    parts = recorded.parts
+    for i, part in enumerate(parts[:-1]):
+        if part == "dataset" and parts[i + 1] in ("git", "sources"):
+            return cache_root.joinpath(*parts[i + 1:])
+    return None
+
+
+def check(
+    out: Path, fetch_missing: bool = False, index=None, progress=print,
+) -> dict[str, list[str]]:
+    """Every verified example's tree found, and its pack rebuilt to the same digest.
+
+    A pack that rebuilds differently means the tree is not the one the label
+    was written from: the plan's citations may no longer hold against it.
+    """
+    outcomes: dict[str, list[str]] = {}
+    for directory in sorted(p for p in out.iterdir() if (p / "meta.json").is_file()):
+        meta = json.loads((directory / "meta.json").read_text())
+        if meta.get("tier") != VERIFIED:
+            continue
+        found = tree(meta, index=index, fetch_missing=fetch_missing)
+        if found.root is None:
+            outcome = "missing"
+            progress(f"{directory.name}: missing: {found.error}")
+        elif evidence.build(found.root, meta["entry"]["name"]).digest() != meta["pack_digest"]:
+            outcome = "differs"
+            progress(f"{directory.name}: the pack rebuilt from {found.root} differs")
+        else:
+            outcome = "ok"
+        outcomes.setdefault(outcome, []).append(directory.name)
+    return outcomes
 
 
 # ------------------------------------------------------------------ labelling
@@ -501,6 +591,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     exporting.add_argument("--to", required=True, type=Path)
     exporting.add_argument("--include-partial", action="store_true")
 
+    checking = sub.add_parser(
+        "check", help="find every verified example's tree and rebuild its pack")
+    checking.add_argument("--out", required=True, type=Path)
+    checking.add_argument("--fetch", action="store_true",
+                          help="fetch missing trees again, at the recorded commit or version")
+
     status = sub.add_parser("status", help="summarise a labelling run")
     status.add_argument("--out", required=True, type=Path)
 
@@ -531,6 +627,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         written = ", ".join(f"{split}: {n}" for split, n in sorted(counts.items()))
         print(written or "nothing to export")
         return 0
+    if args.command == "check":
+        index = environment().index if args.fetch else None
+        outcomes = check(args.out, fetch_missing=args.fetch, index=index)
+        print(", ".join(f"{k}: {len(v)}" for k, v in sorted(outcomes.items())) or "nothing")
+        return 0 if set(outcomes) <= {"ok"} else 1
     if args.command == "status":
         metas = [
             json.loads((p / "meta.json").read_text())

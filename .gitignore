@@ -1,6 +1,5 @@
 __pycache__/
 *.py[cod]
-.venv/
 venv/
 build/
 dist/
@@ -12,3 +11,4 @@ dist/
 htmlcov/
 dist/
 data/
+.venv

@@ -244,8 +244,15 @@ def build(
     for name in result.found:
         found.setdefault(_key(name), result.found_at.get(name, ""))
     soft = {_key(n) for n in result.soft_misses}
+    pruned = {_key(name): verdict for name, verdict in result.pruned.items()}
     for node in graph.nodes.values():
         if node.status == REQUIRED:
+            continue
+        if node.key in pruned:
+            needed, detail = pruned[node.key]
+            node.status, node.proof = (REQUIRED if needed else OPTIONAL), detail
+            if needed and node.key not in graph.order:
+                graph.order.append(node.key)
             continue
         if node.key in found:
             where = found[node.key]

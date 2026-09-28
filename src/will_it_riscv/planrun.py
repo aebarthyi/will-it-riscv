@@ -585,7 +585,7 @@ def _configure(
     else:
         outcome = run_pseudobuild(
             source, timeout=timeout, arch=target.arch, defines=step.defines,
-            python_dists=dists, pip_cache=pip_cache,
+            python_dists=dists, pip_cache=pip_cache, prune=True,
         )
         missing = "CMakeLists.txt"
     if outcome is None:

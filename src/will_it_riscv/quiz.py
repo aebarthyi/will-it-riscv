@@ -229,8 +229,11 @@ def classify(build, source: Source) -> dict[str, tuple[str, str, str]]:
         if probe.parent is not None and _site(probe.site or "")[0] not in source.files:
             continue
         where = probe.site or ""
+        verdict = next((v for n, v in build.pruned.items() if n.lower() == key), None)
         if key in blockers:
             settled[probe.name] = (REQUIRED, f"stopped the configure (round {probe.round})", where)
+        elif verdict is not None:
+            settled[probe.name] = (REQUIRED if verdict[0] else OPTIONAL, verdict[1][:80], where)
         elif probe.required and key in found and source.says_required(where):
             settled[probe.name] = (REQUIRED, "asked for REQUIRED, and found", where)
         elif key in soft:
@@ -404,7 +407,9 @@ def build(
             if saved.is_file():
                 result = _load_build(json.loads(saved.read_text()))
             else:
-                result = pseudobuild.run(root, defines=defines, max_rounds=8, timeout=300)
+                result = pseudobuild.run(
+                    root, defines=defines, max_rounds=12, timeout=600, prune=True
+                )
                 if result is None:
                     continue
                 saved.write_text(json.dumps(_dump_build(result)))
@@ -437,6 +442,7 @@ def _dump_build(result) -> dict:
         "blockers": list(result.blockers),
         "rounds": result.rounds,
         "lookups": {k: [list(x) for x in v] for k, v in result.lookups.items()},
+        "pruned": {k: list(v) for k, v in result.pruned.items()},
     }
 
 
@@ -451,6 +457,7 @@ def _load_build(raw: dict):
         blockers=raw["blockers"],
         rounds=raw["rounds"],
         lookups={k: [tuple(x) for x in v] for k, v in raw["lookups"].items()},
+        pruned={k: tuple(v) for k, v in raw.get("pruned", {}).items()},
     )
     for p in raw["probes"]:
         result.probes[p["name"].lower()] = Probe(**p)

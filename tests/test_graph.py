@@ -252,3 +252,16 @@ def test_the_archive_answers_what_the_map_could_only_guess():
     assert flurb.debian == ("libflurb-dev",) and not flurb.guessed
     assert flurb.resolved == "ships FlurbConfig.cmake" and flurb.available == "libflurb-dev"
     assert zorp.debian == ("libzorp2-dev",) and zorp.resolved == "ships zorp/zorp.h"
+
+
+def test_a_pruned_package_is_settled_by_what_its_absence_did():
+    result = pseudobuild(
+        found={"Foo", "Bar"},
+        probes=[probe("Foo"), probe("Bar")],
+        pruned={"Foo": (False, "the configure completed with it disabled"),
+                "Bar": (True, "the configure failed with it disabled: Bar is needed")},
+    )
+    built = graph.build(result, "demo")
+    assert built.nodes["foo"].status == graph.OPTIONAL
+    assert built.nodes["bar"].status == graph.REQUIRED
+    assert "bar" in built.order and "Bar is needed" in built.nodes["bar"].proof

@@ -232,6 +232,41 @@ def test_the_source_tree_is_left_alone(tmp_path):
     assert sorted(p.name for p in tmp_path.iterdir()) == before
 
 
+@needs_cmake
+def test_a_configure_writing_to_its_working_directory_writes_to_scratch(tmp_path, monkeypatch):
+    """gmsh's execute_process(... OUTPUT_FILE cmake_options.texi) names no directory."""
+    source, elsewhere = tmp_path / "src", tmp_path / "cwd"
+    source.mkdir()
+    elsewhere.mkdir()
+    (source / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\nproject(demo NONE)\n"
+        "execute_process(COMMAND echo hi OUTPUT_FILE leaked.txt)\n"
+    )
+    monkeypatch.chdir(elsewhere)
+    run(source, timeout=120)
+    assert list(elsewhere.iterdir()) == []
+
+
+@needs_cmake
+def test_pruning_settles_what_was_found_by_taking_it_away(tmp_path):
+    """Found says nothing; configuring without it says required or optional."""
+    for name in ("Foo", "Bar"):
+        (tmp_path / "cmake" / f"Find{name}.cmake").parent.mkdir(exist_ok=True)
+        (tmp_path / "cmake" / f"Find{name}.cmake").write_text(
+            f'set({name}_FOUND TRUE)\nmessage(STATUS "Found {name}: yes")\n'
+        )
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\nproject(demo NONE)\n"
+        'list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")\n'
+        "find_package(Foo)\nfind_package(Bar)\n"
+        'if(NOT Bar_FOUND)\n  message(FATAL_ERROR "Bar is needed")\nendif()\n'
+    )
+    result = run(tmp_path, timeout=120, prune=True)
+    assert result.completed
+    assert result.pruned["Foo"][0] is False
+    assert result.pruned["Bar"][0] is True and "Bar is needed" in result.pruned["Bar"][1]
+
+
 # -- synthesis --------------------------------------------------------------
 
 
@@ -310,6 +345,18 @@ def test_a_header_the_module_wanted_to_read_is_written_with_versions(tmp_path):
     body = target.read_text()
     assert "#define PROJ_VERSION_MAJOR 99" in body
     assert '#define PROJ_VERSION "99.9.9"' in body
+
+
+def test_a_file_strings_read_is_stubbed_and_boost_gets_its_packed_version(tmp_path):
+    target = tmp_path / "include" / "boost" / "version.hpp"
+    narration = (
+        "CMake Error at /usr/share/cmake-3.28/Modules/FindBoost.cmake:1842 (file):\n"
+        # CMake wraps it: the path gets a line of its own.
+        f'  file STRINGS file\n  "{target}" cannot be\n  read.\n'
+    )
+    _, created = synth(narration, tmp_path, blocking="Boost")
+    assert created == [str(target)]
+    assert "#define BOOST_VERSION 9900909" in target.read_text()
 
 
 def test_writing_a_file_counts_as_progress_even_without_an_override(tmp_path):
@@ -421,6 +468,38 @@ def test_a_component_named_by_fphsa_gets_its_library_variable(tmp_path):
     )
     assert "OPENSSL_SSL_LIBRARY" in overrides
     assert "SSL" not in overrides and "Crypto" not in overrides
+
+
+def test_lower_case_components_are_components_though_they_have_underscores(tmp_path):
+    overrides, _ = synth(ERROR + "Could NOT find Qux (missing: date_time QUX_INCLUDE_DIR)\n", tmp_path)
+    assert "Qux_DATE_TIME_LIBRARY_RELEASE" in overrides and "QUX_INCLUDE_DIR" in overrides
+    assert "date_time" not in overrides
+
+
+def test_boost_is_answered_as_a_config_package_with_its_components(tmp_path):
+    """FindBoost second-guesses preset paths, but defers to a BoostConfig.cmake."""
+    _, created = synth(
+        ERROR + "Could NOT find Boost (missing: date_time program_options) "
+        '(found suitable version "99.9.9", minimum required is "1.66")\n',
+        tmp_path,
+    )
+    config = tmp_path / "lib" / "cmake" / "Boost" / "BoostConfig.cmake"
+    assert str(config) in created
+    text = config.read_text()
+    assert "foreach(_stub_component IN LISTS Boost_FIND_COMPONENTS)" in text
+    assert "add_library(Boost::headers INTERFACE IMPORTED)" in text
+
+
+def test_a_property_asked_of_a_missing_stub_target_adds_the_target(tmp_path):
+    from will_it_riscv.pseudobuild import _stub_config_package
+
+    _stub_config_package("Kokkos", tmp_path, ".so")
+    _, created = synth(
+        "CMake Error at cmake/macros/macro_copy_target_properties.cmake:61 (get_target_property):\n"
+        '  get_target_property() called with non-existent target "Kokkos::cuda".\n',
+        tmp_path,
+    )
+    assert any(c.endswith("#Kokkos::cuda") for c in created)
 
 
 def test_a_missing_imported_target_gets_its_component_library(tmp_path):
@@ -679,6 +758,7 @@ def test_mpi_is_answered_the_way_findmpi_asks(tmp_path):
         tmp_path,
     )
     assert overrides["MPI_Fortran_WORKS"] == "TRUE"
+    assert overrides["MPI_C_VERSION"] == "3.1"  # or FindMPI reads its test binary
     assert overrides["MPI_SKIP_COMPILER_WRAPPER"] == "TRUE"
     assert "MPI_Fortran_FOUND" not in overrides
     assert {Path(p).name for p in created} >= {"mpi.h", "mpif.h"}

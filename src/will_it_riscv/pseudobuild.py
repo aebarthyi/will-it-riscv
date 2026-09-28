@@ -136,6 +136,10 @@ class PseudoBuild:
     narration: str = ""
     """The configure's own output, kept so the next round can read what it
     asked for. Not part of the report."""
+    pruned: dict = field(default_factory=dict)
+    """What taking each found package away did, once the configure had
+    completed: name to ``(True, detail)`` when the configure then failed --
+    required -- or ``(False, detail)`` when it completed without it."""
 
     @property
     def ok(self) -> bool:
@@ -174,6 +178,8 @@ _MISSING_VARS = re.compile(r"\(missing:\s*([^)]*?)\s*\)")
 #: A Find module reading a header that is not there names the exact path.
 _MISSING_FILE = re.compile(
     r"file failed to open for reading \(No such file or directory\):\s*\n\s*(\S+)"
+    # file(STRINGS) says it differently: FindBoost reading boost/version.hpp.
+    r'|file\s+STRINGS\s+file\s+"([^"]+)"\s+cannot\s+be\s+read'
 )
 _STATUS_FOUND = re.compile(r"^-- +Found ([A-Za-z0-9_.+-]+)", re.MULTILINE)
 _STATUS_FOUND_AT = re.compile(r"^-- +Found ([A-Za-z0-9_.+-]+): +(\S+)", re.MULTILINE)
@@ -208,6 +214,8 @@ _MODULE_FILE = re.compile(r"(?:^|/)(?:Find([A-Za-z0-9_+-]+)|([A-Za-z0-9_+-]+?)-?
 #: try_compile that links it then fails naming the target.
 _TARGET_NOT_FOUND = re.compile(
     r"links to:\s+([A-Za-z0-9_+.-]+)::([A-Za-z0-9_+.-]+)\s+but the target was not found"
+    # deal.II asks for a property of Kokkos::kokkos before anything links it.
+    r'|non-existent\s+target\s+"([A-Za-z0-9_+.-]+)::([A-Za-z0-9_+.-]+)"'
 )
 #: A header a check could not find, named in the configure's own error.
 _HEADER_NAME = re.compile(r"(?<![\w/.])([A-Za-z0-9_+-][A-Za-z0-9_+./-]*\.(?:h|hpp|hh|hxx))\b")
@@ -279,7 +287,7 @@ def _stanza_blockers(stanza: str) -> list[str]:
             elif line.strip():
                 listing = False
     for match in _TARGET_NOT_FOUND.finditer(stanza):
-        names.append(match.group(1))
+        names.append(match.group(1) or match.group(3))
     if not names:
         library = _header_blocker(stanza)
         if library:
@@ -589,6 +597,7 @@ def run(
     defines: Optional[dict] = None,
     python_dists: Optional[dict] = None,
     pip_cache: Optional[Path] = None,
+    prune: bool = False,
 ) -> Optional[PseudoBuild]:
     """Configure the project in a scratch directory, unblocking as it goes.
 
@@ -760,6 +769,11 @@ def run(
             written.update(created)
             aggregate.unblocked = sorted(overrides)
 
+        if prune and aggregate.completed:
+            _prune(
+                aggregate, root, scratch_path, {**given, **overrides, **fixed}, env,
+                toolchain, lambda: timeout - (time.monotonic() - started),
+            )
         aggregate.python_installed = list(interpreter.installed)
         aggregate.python_stubbed = list(interpreter.stubbed)
 
@@ -771,6 +785,40 @@ def run(
     aggregate.found -= set(aggregate.blockers)
     aggregate.duration = time.monotonic() - started
     return aggregate
+
+
+def _prune(aggregate: PseudoBuild, root: Path, scratch: Path, settings: dict, env: dict,
+           toolchain: Optional[Path], left) -> None:
+    """Settle every package the completed configure found, by taking it away.
+
+    A found package says nothing about whether the build needs it: nobody saw
+    the configure without it. CMAKE_DISABLE_FIND_PACKAGE_<Name> makes one
+    find_package act as if nothing were there -- a REQUIRED one then fails --
+    so one configure per package answers it: completed means optional,
+    failed means required. Stubbed blockers need no pruning; they already
+    stopped a round.
+    """
+    blockers = {b.lower() for b in aggregate.blockers}
+    found = {f.lower() for f in aggregate.found}
+    names = sorted({
+        probe.name for key, probe in aggregate.probes.items()
+        if probe.parent is None and probe.command == "find_package"
+        and key in found and key not in blockers
+    })
+    for index, name in enumerate(names):
+        remaining = int(left())
+        if remaining <= 0:
+            aggregate.notes.append(f"ran out of time pruning; {len(names) - index} left unsettled")
+            return
+        outcome = _configure(
+            root, scratch, {**settings, f"CMAKE_DISABLE_FIND_PACKAGE_{name}": "TRUE"}, env,
+            remaining, f"prune-{index}", toolchain,
+        )
+        if outcome.completed:
+            aggregate.pruned[name] = (False, "the configure completed with it disabled")
+        else:
+            aggregate.pruned[name] = (True, "the configure failed with it disabled: "
+                                      + (outcome.error or "")[:160])
 
 
 # --------------------------------------------------------- blame by experiment
@@ -964,6 +1012,36 @@ def _stub_config_package(name: str, sysroot: Path, suffix: str) -> list[str]:
             f'set({prefix}_LIBRARIES "{library.as_posix()}")',
             f'set({prefix}_LIBRARY_DIRS "{sysroot.as_posix()}/lib")',
         ]
+    # Whatever components were asked for are here, each with its target:
+    # find_package(Boost COMPONENTS program_options) links Boost::program_options.
+    where = f'IMPORTED_LOCATION "{library.as_posix()}" INTERFACE_INCLUDE_DIRECTORIES "{sysroot.as_posix()}/include"'
+    targets = [f"{name}::{name}", f"{name}::{name.lower()}"]
+    if name == "Boost":
+        targets += ["Boost::headers", "Boost::boost", "Boost::disable_autolinking",
+                    "Boost::dynamic_linking", "Boost::diagnostic_definitions"]
+        lines.append(f'set(Boost_INCLUDE_DIRS "{sysroot.as_posix()}/include")')
+    for target in dict.fromkeys(targets):
+        if target in ("Boost::headers", "Boost::boost"):
+            # Header-only, as the real ones are: spectre adds headers to them.
+            lines += [f"if(NOT TARGET {target})", f"  add_library({target} INTERFACE IMPORTED)",
+                      f"  set_target_properties({target} PROPERTIES "
+                      f'INTERFACE_INCLUDE_DIRECTORIES "{sysroot.as_posix()}/include")', "endif()"]
+            continue
+        lines += [f"if(NOT TARGET {target})", f"  add_library({target} UNKNOWN IMPORTED)",
+                  f"  set_target_properties({target} PROPERTIES {where})", "endif()"]
+    lines += [
+        f"foreach(_stub_component IN LISTS {name}_FIND_COMPONENTS)",
+        f"  set({name}_${{_stub_component}}_FOUND TRUE)",
+        "  string(TOUPPER \"${_stub_component}\" _stub_upper)",
+        f'  set({name}_${{_stub_upper}}_FOUND TRUE)',
+        f'  set({name}_${{_stub_upper}}_LIBRARY "{library.as_posix()}")',
+        f"  list(APPEND {name}_LIBRARIES {name}::${{_stub_component}})",
+        f"  if(NOT TARGET {name}::${{_stub_component}})",
+        f"    add_library({name}::${{_stub_component}} UNKNOWN IMPORTED)",
+        f"    set_target_properties({name}::${{_stub_component}} PROPERTIES {where})",
+        "  endif()",
+        "endforeach()",
+    ]
     config = directory / f"{name}Config.cmake"
     version = directory / f"{name}ConfigVersion.cmake"
     try:
@@ -1196,6 +1274,12 @@ def _stub_mpi(sysroot: Path, suffix: str) -> tuple[dict, list]:
     for language in ("C", "CXX", "Fortran"):
         overrides[f"MPI_{language}_LIB_NAMES"] = "mpi"
         overrides[f"MPI_{language}_WORKS"] = "TRUE"
+        # With a version already known, FindMPI does not read it out of the
+        # test program it would have built -- which a compile-only toolchain
+        # never links, so there is no test_mpi_C.bin to read.
+        overrides[f"MPI_{language}_VERSION"] = "3.1"
+        overrides[f"MPI_{language}_VERSION_MAJOR"] = "3"
+        overrides[f"MPI_{language}_VERSION_MINOR"] = "1"
         overrides[f"MPI_{language}_HEADER_DIR"] = include
     overrides["MPI_Fortran_F77_HEADER_DIR"] = include
     overrides["MPI_Fortran_MODULE_DIR"] = include
@@ -1272,10 +1356,12 @@ def _configure(
     command += [f"-D{key}={value}" for key, value in sorted(overrides.items())]
 
     try:
-        # No stdin: nothing a configure runs may sit waiting for input.
+        # No stdin: nothing a configure runs may sit waiting for input. And
+        # run from the scratch directory: gmsh's execute_process writes
+        # cmake_options.texi to whatever directory cmake was started in.
         process = subprocess.run(
             command, capture_output=True, text=True, timeout=timeout, env=env,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, cwd=scratch,
         )
     except subprocess.TimeoutExpired:
         probes, traced = _parse_trace(trace, root)
@@ -1341,6 +1427,12 @@ def _fake_header(name: str) -> str:
     stem = re.sub(r"[^A-Za-z0-9]", "_", name).upper().strip("_")
     major, minor, patch = FAKE_VERSION
     lines = [f"/* stub emitted by will-it-riscv for {name} */"]
+    if stem == "BOOST" or name.endswith("boost/version.hpp"):
+        # FindBoost reads one packed number: major * 100000 + minor * 100 + patch.
+        return "\n".join(lines + [
+            f"#define BOOST_VERSION {int(major) * 100000 + int(minor) * 100 + int(patch)}",
+            f'#define BOOST_LIB_VERSION "{major}_{minor}"',
+        ]) + "\n"
     for prefix in dict.fromkeys([stem, stem.rstrip("_0123456789")]):
         if not prefix:
             continue
@@ -1455,6 +1547,14 @@ def _synthesize(
             overrides.update(stubbed)
             created += [f for f in files if f not in already]
             continue
+        if package and package.lower() == "boost":
+            # FindBoost second-guesses preset library paths whenever its
+            # version or include dir moves, but asks for a BoostConfig.cmake
+            # first and defers to it. So Boost is answered as a config package.
+            config = sysroot / "lib" / "cmake" / "Boost" / "BoostConfig.cmake"
+            if not config.is_file():
+                created += _stub_config_package("Boost", sysroot, suffix)
+                continue
         if package and package.split("_", 1)[0].lower() == "mpi":
             # FPHSA's "(missing: MPI_Fortran_FOUND Fortran)" names results,
             # not inputs; faking those gets nowhere. Answer FindMPI instead.
@@ -1467,7 +1567,9 @@ def _synthesize(
         #    variable behind a component is <PKG>_<COMPONENT>_LIBRARY.
         for match in _MISSING_VARS.finditer(stanza):
             for token in match.group(1).split():
-                if "_" in token:
+                # A cache variable has capitals; FindBoost's components are
+                # spelled in lower case, underscores and all: date_time.
+                if "_" in token and not token.islower():
                     variables.append(token)
                 elif package and token.isidentifier():
                     variables += _component_variables(package, token)
@@ -1487,7 +1589,8 @@ def _synthesize(
         #     for a package that is here as a stub config, the imported
         #     target itself: Boost::headers, which cantera links.
         for match in _TARGET_NOT_FOUND.finditer(stanza):
-            package, component = match.group(1), match.group(2)
+            package = match.group(1) or match.group(3)
+            component = match.group(2) or match.group(4)
             config = sysroot / "lib" / "cmake" / package / f"{package}Config.cmake"
             if config.is_file():
                 if _add_imported_target(config, f"{package}::{component}", sysroot, suffix):
@@ -1519,8 +1622,8 @@ def _synthesize(
                 created += _stub_pkgconfig(module, sysroot, suffix)
 
         # 4. Files a Find module tried to read. The error gives the full path.
-        for path_text in _MISSING_FILE.findall(stanza):
-            path = Path(path_text)
+        for read, strings in _MISSING_FILE.findall(stanza):
+            path = Path(read or strings)
             # Only ever write inside our own scratch directory.
             if not str(path).startswith(str(sysroot)) or str(path) in already:
                 continue
@@ -1561,6 +1664,8 @@ def _component_variables(package: str, component: str) -> list[str]:
     spellings = [
         f"{package.upper()}_{component.upper()}_LIBRARY",
         f"{package}_{component.upper()}_LIBRARY",
+        # FindBoost rebuilds <Pkg>_<COMP>_LIBRARY from its _RELEASE entry.
+        f"{package}_{component.upper()}_LIBRARY_RELEASE",
     ]
     return list(dict.fromkeys(spellings))
 

@@ -1,0 +1,15 @@
+# Qwen3-4B at 16k, sharded across both cards (FSDP2), trained harder than the 12k run,
+# which underfit: 54 steps at rank 16 and 1e-4 left train loss at 0.64, level with validation.
+# Measured on the longest sequences: 11.4 GiB peak with offload (13.9 without, no faster),
+# ~150 tok/s across both cards, so ~3.4 h an epoch; 36 steps an epoch, 216 in all.
+model: Qwen/Qwen3-4B-Instruct-2507
+data: data/prepared/16384
+fsdp: true
+attention_block: 512
+offload: true
+lora_r: 64
+lora_alpha: 128
+lr: 2.0e-4
+epochs: 6
+accumulation: 4
+save_every: 5

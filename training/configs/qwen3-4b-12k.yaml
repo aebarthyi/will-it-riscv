@@ -1,0 +1,9 @@
+# Qwen3-4B at 12k on both cards: the probe fits it with offload and a 512 block.
+model: Qwen/Qwen3-4B-Instruct-2507
+data: data/prepared/12288
+attention_block: 512
+offload: true
+epochs: 3
+accumulation: 8
+lr: 1.0e-4
+save_every: 5

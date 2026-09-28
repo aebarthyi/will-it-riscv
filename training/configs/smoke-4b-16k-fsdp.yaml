@@ -1,0 +1,13 @@
+# A few steps sharded across both cards on the longest 16k sequences: memory, speed, resume.
+model: Qwen/Qwen3-4B-Instruct-2507
+data: data/prepared/16384
+fsdp: true
+attention_block: 512
+offload: true
+lora_r: 64
+lora_alpha: 128
+longest_first: true
+accumulation: 2
+max_steps: 2
+save_every: 1
+eval_every: 1000

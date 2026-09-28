@@ -1,0 +1,9 @@
+# ~10 minutes on both cards: memory, speed and temperature before the real run.
+model: Qwen/Qwen3-4B-Instruct-2507
+data: data/prepared/12288
+attention_block: 512
+offload: true
+accumulation: 2
+max_steps: 4
+save_every: 2
+eval_every: 1000

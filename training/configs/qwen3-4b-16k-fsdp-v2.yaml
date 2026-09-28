@@ -1,0 +1,13 @@
+# qwen3-4b-16k-fsdp's settings on the v2 data: 147 script-driven repos in training, not 27.
+# 403 train, 29 valid, 2.64M tokens an epoch: 51 steps an epoch, 306 in all, ~3.2 h an epoch.
+model: Qwen/Qwen3-4B-Instruct-2507
+data: data/prepared-v2/16384
+fsdp: true
+attention_block: 512
+offload: true
+lora_r: 64
+lora_alpha: 128
+lr: 2.0e-4
+epochs: 6
+accumulation: 4
+save_every: 5

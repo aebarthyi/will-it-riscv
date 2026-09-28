@@ -468,14 +468,21 @@ def label_corpus(
 # ------------------------------------------------------------------ export
 
 
-def examples(out: Path, tiers: tuple[str, ...] = (VERIFIED,)) -> list[dict]:
-    """Every labelled example of these tiers: the pack in, the plan out."""
+def examples(
+    out: Path, tiers: tuple[str, ...] = (VERIFIED,), relabelled: bool = False,
+) -> list[dict]:
+    """Every labelled example of these tiers: the pack in, the plan out.
+
+    ``relabelled``: the plan as the executor re-marked it, where there is one
+    (``will-it-riscv-dataset relabel``), rather than as the teacher wrote it.
+    """
     found = []
     for directory in sorted(p for p in out.iterdir() if (p / "meta.json").is_file()):
         meta = json.loads((directory / "meta.json").read_text())
         if meta.get("tier") not in tiers or not (directory / "plan.json").is_file():
             continue
-        plan = load_plan(directory / "plan.json")
+        chosen = directory / "plan.relabelled.json"
+        plan = load_plan(chosen if relabelled and chosen.is_file() else directory / "plan.json")
         pack = (directory / "pack.txt").read_text()
         found.append({
             "messages": [
@@ -492,12 +499,14 @@ def examples(out: Path, tiers: tuple[str, ...] = (VERIFIED,)) -> list[dict]:
     return found
 
 
-def export(out: Path, destination: Path, tiers: tuple[str, ...] = (VERIFIED,)) -> dict:
+def export(
+    out: Path, destination: Path, tiers: tuple[str, ...] = (VERIFIED,), relabelled: bool = False,
+) -> dict:
     destination.mkdir(parents=True, exist_ok=True)
     counts: dict[str, int] = {}
     handles = {}
     try:
-        for example in examples(out, tiers):
+        for example in examples(out, tiers, relabelled):
             split = example["meta"]["split"]
             if split not in handles:
                 handles[split] = (destination / f"{split}.jsonl").open("w")
@@ -567,6 +576,57 @@ def top_pypi(limit: int) -> list[str]:
 # ------------------------------------------------------------------ cli
 
 
+_RELABEL_ENV: dict = {}
+
+
+def _relabel_one(directory: Path) -> tuple[str, Optional[dict], Optional[str]]:
+    """One example, in a worker that keeps its distro index between examples."""
+    from . import quiz, relabel
+    from .cache import Cache
+
+    try:
+        if not _RELABEL_ENV:
+            _RELABEL_ENV["distro"] = environment().distro
+            traces = Cache().root / "quiz" / quiz.TRACES
+            traces.mkdir(parents=True, exist_ok=True)
+            _RELABEL_ENV["trace"] = lambda key, root, defines: quiz._trace(
+                key, root, defines, traces)
+        report = relabel.relabel_example(directory, _RELABEL_ENV["distro"], _RELABEL_ENV["trace"])
+        return directory.name, report, None
+    except Exception as exc:  # noqa: BLE001 - one example's trouble is its own
+        return directory.name, None, str(exc)[:200]
+
+
+def _relabel_all(out: Path, only: list[str], jobs: int) -> int:
+    directories = [
+        p for p in sorted(out.iterdir())
+        if (p / "meta.json").is_file() and (p / "plan.json").is_file()
+        and json.loads((p / "meta.json").read_text()).get("tier") == VERIFIED
+        and (not only or p.name in only)
+    ]
+    if jobs > 1:
+        from concurrent.futures import ProcessPoolExecutor
+
+        with ProcessPoolExecutor(jobs) as pool:
+            results = list(pool.map(_relabel_one, directories))
+    else:
+        results = [_relabel_one(d) for d in directories]
+    moved = {"optional": 0, "required": 0}
+    for key, report, error in results:
+        if error:
+            print(f"{key}: {error}", file=sys.stderr)
+        elif report:
+            for change in report["changes"]:
+                moved[change["to"]] += 1
+            if report["changes"]:
+                moves = ", ".join(f"{c['package']} -> {c['to']}" for c in report["changes"])
+                print(f"{key}: {moves}")
+    ran = sum(1 for _, r, _ in results if r)
+    print(f"{ran} of {len(results)} examples had a default configure; "
+          f"{moved['optional']} packages now optional, {moved['required']} now required")
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="will-it-riscv-dataset",
@@ -593,6 +653,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     exporting.add_argument("--out", required=True, type=Path)
     exporting.add_argument("--to", required=True, type=Path)
     exporting.add_argument("--include-partial", action="store_true")
+    exporting.add_argument("--relabelled", action="store_true",
+                           help="use the executor's marks where relabel wrote them")
+
+    relabelling = sub.add_parser(
+        "relabel", help="let the default configures mark each stated package required or not")
+    relabelling.add_argument("--out", required=True, type=Path)
+    relabelling.add_argument("--only", action="append", default=[], metavar="KEY")
+    relabelling.add_argument("--jobs", type=int, default=1)
 
     checking = sub.add_parser(
         "check", help="find every verified example's tree and rebuild its pack")
@@ -626,10 +694,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
     if args.command == "export":
         tiers = (VERIFIED, PARTIAL) if args.include_partial else (VERIFIED,)
-        counts = export(args.out, args.to, tiers)
+        counts = export(args.out, args.to, tiers, relabelled=args.relabelled)
         written = ", ".join(f"{split}: {n}" for split, n in sorted(counts.items()))
         print(written or "nothing to export")
         return 0
+    if args.command == "relabel":
+        return _relabel_all(args.out, args.only, args.jobs)
     if args.command == "check":
         index = environment().index if args.fetch else None
         outcomes = check(args.out, fetch_missing=args.fetch, index=index)

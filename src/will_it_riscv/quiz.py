@@ -381,16 +381,42 @@ def pkgmap_questions(asked: dict[str, tuple[str, list]], contents) -> list[Quest
 # ------------------------------------------------------------------ building
 
 
+#: Bump when the executor changes what a trace says: traces made before are
+#: kept apart and never read. v2: CMake 3.31, pruning, the stub fixes.
+TRACES = "traces-v2"
+
+
+def _trace(key: str, root: Path, defines: dict, traces: Path):
+    """One configure of one project, from the cache or run and cached."""
+    from . import pseudobuild
+
+    saved = traces / f"{key}.{_id(json.dumps(defines, sort_keys=True))}.json"
+    if saved.is_file():
+        return _load_build(json.loads(saved.read_text()))
+    result = pseudobuild.run(root, defines=defines, timeout=600, prune=True)
+    if result is not None:
+        saved.write_text(json.dumps(_dump_build(result)))
+    return result
+
+
+def _trace_quietly(task) -> str:
+    key, root, defines, traces = task
+    try:
+        _trace(key, root, defines, traces)
+    except Exception as exc:  # noqa: BLE001 - one project's trouble is its own
+        return f"{key} {defines or 'plain'}: {exc}"
+    return ""
+
+
 def build(
-    out: Path, dataset_dir: Path, cache: Path, flags: int = 8, progress=print
+    out: Path, dataset_dir: Path, cache: Path, flags: int = 8, progress=print, jobs: int = 1,
 ) -> list[Question]:
     """Trace every verified CMake project in the dataset; each trace is cached."""
-    from . import dataset, pseudobuild
+    from . import dataset
 
-    traces = cache / "traces"
+    traces = cache / TRACES
     traces.mkdir(parents=True, exist_ok=True)
-    questions: list[Question] = []
-    asked: dict[str, tuple[str, list]] = {}
+    projects = []
     for directory in sorted(p for p in dataset_dir.iterdir() if (p / "meta.json").is_file()):
         meta = json.loads((directory / "meta.json").read_text())
         if meta.get("tier") != dataset.VERIFIED:
@@ -398,19 +424,29 @@ def build(
         root = dataset.tree(meta).root
         if root is None or not (root / "CMakeLists.txt").is_file():
             continue
-        key = directory.name
         source = Source.read(root)
         configs = [{}] + [{name: "ON"} for name in source.guarding(flags)]
+        projects.append((directory.name, meta, root, source, configs))
+    if jobs > 1:
+        # Every configure of every project at once, so one slow project does
+        # not hold a worker while the rest wait.
+        from concurrent.futures import ProcessPoolExecutor
+
+        tasks = [(key, root, d, traces) for key, _, root, _, configs in projects for d in configs]
+        with ProcessPoolExecutor(jobs) as pool:
+            for done, trouble in enumerate(pool.map(_trace_quietly, tasks), 1):
+                if trouble:
+                    progress(trouble)
+                if done % 50 == 0:
+                    progress(f"{done}/{len(tasks)} configures traced")
+    questions: list[Question] = []
+    asked: dict[str, tuple[str, list]] = {}
+    for key, meta, root, source, configs in projects:
         runs = []
         for defines in configs:
-            saved = traces / f"{key}.{_id(json.dumps(defines, sort_keys=True))}.json"
-            if saved.is_file():
-                result = _load_build(json.loads(saved.read_text()))
-            else:
-                result = pseudobuild.run(root, defines=defines, timeout=600, prune=True)
-                if result is None:
-                    continue
-                saved.write_text(json.dumps(_dump_build(result)))
+            result = _trace(key, root, defines, traces)
+            if result is None:
+                continue
             if result.error and not result.probes:
                 progress(f"{key} {defines or 'plain'}: {result.error[:120]}")
                 continue
@@ -595,6 +631,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--cache", type=Path, help="traces and Debian's Contents (default: the cache)"
     )
     making.add_argument("--flags", type=int, default=8, help="options to turn on, per project")
+    making.add_argument("--jobs", type=int, default=1, help="configures to run at once")
     asking = sub.add_parser("ask", help="put the questions to a model and score it")
     asking.add_argument("--quiz", required=True, type=Path)
     asking.add_argument("--split", default="test")
@@ -615,7 +652,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             from .cache import Cache
 
             args.cache = Cache().root / "quiz"
-        made = build(args.out, args.data, args.cache, args.flags, progress=err)
+        made = build(args.out, args.data, args.cache, args.flags, progress=err, jobs=args.jobs)
         counts = Counter(
             (q.family, q.split, q.answer[0] if q.family == "trace" else "") for q in made
         )

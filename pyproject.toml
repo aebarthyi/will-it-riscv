@@ -43,6 +43,7 @@ Issues = "https://github.com/tactcomplabs/will-it-riscv/issues"
 will-it-riscv = "will_it_riscv.cli:main"
 will-it-riscv-dataset = "will_it_riscv.dataset:main"
 will-it-riscv-eval = "will_it_riscv.evaluate:main"
+will-it-riscv-quiz = "will_it_riscv.quiz:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/will_it_riscv"]

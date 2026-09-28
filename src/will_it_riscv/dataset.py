@@ -171,6 +171,9 @@ def _git(entry: Entry, cache: Path, commit: Optional[str] = None) -> Fetched:
                 tail = (process.stderr or "").strip().splitlines()
                 return Fetched(None, error=f"git {command[0]} {commit}: "
                                            f"{tail[-1] if tail else 'failed'}")
+    from .sources import init_submodules
+
+    init_submodules(destination)
     head = _head(destination)
     return Fetched(destination, f"git {entry.git}@{head or entry.ref or 'HEAD'}")
 

@@ -85,3 +85,35 @@ def test_check_tells_a_tree_that_rebuilds_its_pack_from_one_that_does_not(
     monkeypatch.setenv("WILL_IT_RISCV_CACHE", str(tmp_path / "cache"))
     outcomes = dataset.check(out, progress=lambda m: None)
     assert outcomes == {"ok": ["good"], "differs": ["changed"], "missing": ["gone"]}
+
+
+def test_a_clone_gets_its_submodules(tmp_path, monkeypatch):
+    """A build that vendors through submodules stops at add_subdirectory without them."""
+    import subprocess
+
+    from will_it_riscv.sources import init_submodules
+
+    def git(*args, cwd):
+        subprocess.run(["git", "-c", "protocol.file.allow=always", *args], cwd=cwd, check=True,
+                       capture_output=True)
+
+    inner, outer = tmp_path / "inner", tmp_path / "outer"
+    for repo in (inner, outer):
+        repo.mkdir()
+        git("init", "-q", cwd=repo)
+        git("config", "user.email", "t@t", cwd=repo)
+        git("config", "user.name", "t", cwd=repo)
+    (inner / "CMakeLists.txt").write_text("# vendored\n")
+    git("add", ".", cwd=inner)
+    git("commit", "-qm", "inner", cwd=inner)
+    git("submodule", "add", "-q", str(inner), "third_party/inner", cwd=outer)
+    git("commit", "-qm", "outer", cwd=outer)
+    clone = tmp_path / "clone"
+    git("clone", "-q", str(outer), str(clone), cwd=tmp_path)
+    assert not (clone / "third_party" / "inner" / "CMakeLists.txt").exists()
+    # Local paths stand in for remotes here; git refuses them unless told.
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "protocol.file.allow")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "always")
+    assert init_submodules(clone) is None
+    assert (clone / "third_party" / "inner" / "CMakeLists.txt").is_file()

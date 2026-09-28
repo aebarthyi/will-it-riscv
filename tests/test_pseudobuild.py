@@ -129,7 +129,7 @@ def test_no_cmakelists_means_nothing_to_do(tmp_path):
 
 def test_missing_cmake_is_reported_not_raised(tmp_path, monkeypatch):
     (tmp_path / "CMakeLists.txt").write_text("project(x)\n")
-    monkeypatch.setattr(pseudobuild.shutil, "which", lambda _: None)
+    monkeypatch.setattr(pseudobuild, "cmake", lambda: None)
     assert "not installed" in run(tmp_path).error
 
 
@@ -468,6 +468,16 @@ def test_a_component_named_by_fphsa_gets_its_library_variable(tmp_path):
     )
     assert "OPENSSL_SSL_LIBRARY" in overrides
     assert "SSL" not in overrides and "Crypto" not in overrides
+
+
+def test_a_default_build_that_enables_cuda_is_blocked_by_cuda():
+    from will_it_riscv.pseudobuild import _stanza_blockers
+
+    stanza = (
+        "CMake Error at /usr/share/cmake-3.31/Modules/Internal/CMakeCUDAFindToolkit.cmake:104"
+        " (message):\n  Failed to find nvcc.\n\n  Compiler requires the CUDA toolkit.\n"
+    )
+    assert _stanza_blockers(stanza) == ["CUDA"]
 
 
 def test_lower_case_components_are_components_though_they_have_underscores(tmp_path):

@@ -407,9 +407,7 @@ def build(
             if saved.is_file():
                 result = _load_build(json.loads(saved.read_text()))
             else:
-                result = pseudobuild.run(
-                    root, defines=defines, max_rounds=12, timeout=600, prune=True
-                )
+                result = pseudobuild.run(root, defines=defines, timeout=600, prune=True)
                 if result is None:
                     continue
                 saved.write_text(json.dumps(_dump_build(result)))

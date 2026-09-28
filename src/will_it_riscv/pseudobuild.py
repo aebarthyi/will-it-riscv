@@ -28,9 +28,11 @@ to a temporary directory, and never runs the compiler on the project itself.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, field, replace
@@ -165,8 +167,20 @@ class PseudoBuild:
         return None
 
 
+def cmake() -> Optional[str]:
+    """The cmake to configure with: $WILL_IT_RISCV_CMAKE, then the one installed
+    beside this Python (the pinned wheel), then whatever is on PATH."""
+    chosen = os.environ.get("WILL_IT_RISCV_CMAKE")
+    if chosen:
+        return chosen
+    beside = Path(sys.executable).parent / "cmake"
+    if beside.is_file() and os.access(beside, os.X_OK):
+        return str(beside)
+    return shutil.which("cmake")
+
+
 def available() -> bool:
-    return shutil.which("cmake") is not None
+    return cmake() is not None
 
 
 #: CMake prefixes its STATUS output with "-- ". A miss reported that way is a
@@ -248,10 +262,22 @@ def _error_blocks(text: str) -> str:
     return "\n".join(_error_stanzas(text))
 
 
+#: A GPU language the configure enabled, and no compiler for it. Nothing can
+#: stub nvcc; that the default build turns CUDA on is the answer itself.
+_GPU_LANGUAGE = (
+    (re.compile(r"Failed to find nvcc|No CMAKE_CUDA_COMPILER could be found"), "CUDA"),
+    (re.compile(r"No CMAKE_HIP_COMPILER could be found"), "HIP"),
+)
+
+
 def _stanza_blockers(stanza: str) -> list[str]:
     """What a single error stanza says was missing, in the order it says it."""
     names: list[str] = []
     lines = stanza.splitlines()
+    flat = re.sub(r"\s+", " ", stanza)
+    for pattern, language in _GPU_LANGUAGE:
+        if pattern.search(flat):
+            return [language]
     if _NOTFOUND_HEADER in stanza:
         for line in lines[1:]:
             match = _NOTFOUND_VAR.match(line)
@@ -591,7 +617,7 @@ def run(
     root: Path,
     timeout: int = TIMEOUT_SECONDS,
     deny_pkg_config: bool = True,
-    max_rounds: int = 12,
+    max_rounds: int = 20,
     arch: str = "riscv64",
     confine: bool = True,
     defines: Optional[dict] = None,
@@ -1342,7 +1368,7 @@ def _configure(
     build.mkdir(parents=True, exist_ok=True)
 
     command = [
-        "cmake",
+        cmake() or "cmake",
         "-S", str(root),
         "-B", str(build),
         # Expanded, so ${_brotli_pc_requires} arrives as the module names it

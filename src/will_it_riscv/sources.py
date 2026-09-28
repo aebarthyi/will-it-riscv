@@ -214,6 +214,31 @@ def choose_tag(tags: list[str], name: str, version: str) -> Optional[str]:
     return ranked[0]
 
 
+def init_submodules(destination: Path, timeout: int = 1800) -> Optional[str]:
+    """Check out a clone's submodules, shallow, the way a recursive clone would.
+
+    Builds that vendor their dependencies as submodules stop at the first
+    add_subdirectory otherwise ("Submodules not found. Execute `git submodule
+    update --init`"). A submodule that will not fetch is reported, not fatal:
+    the configure then says what it missed.
+    """
+    if not (destination / ".gitmodules").is_file():
+        return None
+    try:
+        process = subprocess.run(
+            ["git", "-C", str(destination), "submodule", "update", "--init", "--recursive",
+             "--depth", "1", "--jobs", "8"],
+            capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"git submodule update: {exc}"
+    if process.returncode != 0:
+        tail = (process.stderr or "").strip().splitlines()
+        return f"git submodule update: {tail[-1] if tail else 'failed'}"
+    return None
+
+
 def _clone(url: str, tag: str, destination: Path) -> Optional[str]:
     if destination.exists():
         shutil.rmtree(destination)
@@ -229,5 +254,6 @@ def _clone(url: str, tag: str, destination: Path) -> Optional[str]:
     if process.returncode != 0:
         tail = (process.stderr or "").strip().splitlines()
         return f"git clone {url} at {tag}: {tail[-1] if tail else 'failed'}"
+    init_submodules(destination)
     (destination / ".unpacked").touch()
     return None

@@ -28,6 +28,9 @@ dependencies = [
     "platformdirs>=4.0",
     "rich>=13.0",
     "tomli>=2.0; python_version<'3.11'",
+    # The pretend configure runs Debian 13's CMake, whatever the host has:
+    # projects now ask for 3.29 and 3.30, and 4.x drops CMake < 3.5 projects.
+    "cmake>=3.31,<3.32",
 ]
 
 [project.optional-dependencies]

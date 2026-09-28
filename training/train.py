@@ -46,6 +46,9 @@ DEFAULTS = {
     "lora_r": 16, "lora_alpha": 32,
     "lr": 1e-4, "warmup": 0.03, "epochs": 3, "accumulation": 8, "clip": 1.0,
     "attention_block": 512, "offload": True,
+    # gfx906 has no bf16 and no flash attention: float16 and the chunked kernel.
+    # A datacentre card takes "bfloat16" and "sdpa" (or "flash_attention_2").
+    "dtype": "float16", "attention": "chunked",
     "fsdp": False,                # shard the model across the cards (FSDP2) instead of copying it
     "longest_first": False,       # a smoke test: take the longest sequences first
     "eval_every": 100, "save_every": 25,   # optimizer steps
@@ -164,7 +167,7 @@ def evaluate(loss_fn, examples: list[dict], device: int, sensor: Path | None, co
     # Sharded, every card must run as many forwards as the others: the one
     # short of an example runs the first one again and doesn't count it.
     turns = math.ceil(len(examples) / world)
-    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+    with torch.no_grad(), torch.autocast("cuda", dtype=getattr(torch, config["dtype"])):
         for turn in range(turns):
             index = turn * world + rank
             example = examples[index] if index < len(examples) else examples[0]
@@ -203,9 +206,11 @@ def main(argv=None) -> int:
     train = load(tokenizer, data / "train.jsonl")
     valid = load(tokenizer, data / "valid.jsonl")
 
-    chunked_attention.register(config["attention_block"])
+    dtype = getattr(torch, config["dtype"])
+    if config["attention"] == "chunked":
+        chunked_attention.register(config["attention_block"])
     model = AutoModelForCausalLM.from_pretrained(
-        config["model"], dtype=torch.float16, attn_implementation="chunked").to(device)
+        config["model"], dtype=dtype, attn_implementation=config["attention"]).to(device)
     model.config.use_cache = False
     model.train()
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -235,7 +240,9 @@ def main(argv=None) -> int:
         optimizer, math.ceil(config["warmup"] * total_steps), total_steps)
     # Sharded gradients are DTensors, which GradScaler doesn't take: the same
     # dynamic loss scale by hand, the overflow check agreed across the cards.
-    scaler = None if config["fsdp"] else torch.amp.GradScaler("cuda")
+    # bf16 has float32's range: nothing to scale, but the same checkpoint shape.
+    scaler = None if config["fsdp"] else torch.amp.GradScaler(
+        "cuda", enabled=config["dtype"] == "float16")
     scale = {"value": 2.0 ** 16, "good": 0}
 
     step = 0
@@ -299,7 +306,7 @@ def main(argv=None) -> int:
             example = train[index]
             ids = torch.tensor([example["input_ids"]], device=device)
             labels = torch.tensor([example["labels"]], device=device)
-            with offload(), torch.autocast("cuda", dtype=torch.float16):
+            with offload(), torch.autocast("cuda", dtype=dtype):
                 loss = loss_fn(ids, labels)
             if scaler is not None:
                 scaler.scale(loss / len(batch)).backward()

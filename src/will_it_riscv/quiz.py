@@ -590,6 +590,33 @@ def summary(questions: list[Question], results: list[dict]) -> list[tuple[str, i
     return sorted(rows)
 
 
+def explanation(q: Question) -> str:
+    """A short, true account of the answer, from how it is known: what a model
+    trained on the quiz learns to say before it answers."""
+    if q.family == "pkgmap":
+        return f"{q.answer[0]} {q.why}, which is what the lookup finds."
+    site = q.why.rsplit("; ", 1)[-1]
+    flag = f" with -D{q.command.split(' -D', 1)[1]}" if q.command and " -D" in q.command else ""
+    return {
+        REQUIRED: f"{site} asks for {q.subject}, and the configure{flag} cannot go on without it.",
+        OPTIONAL: f"{site} looks for {q.subject}; the configure{flag} carries on without it.",
+        NOT_ASKED: f"The configure{flag} never reaches the lookup of {q.subject} at {site}.",
+    }[q.answer[0]]
+
+
+def to_chat(q: Question) -> dict:
+    """One question as a fine-tuning example, in the dataset's chat format."""
+    answer = {"reasoning": explanation(q), "answer": q.answer[0]}
+    return {
+        "messages": [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": render(q)},
+            {"role": "assistant", "content": json.dumps(answer)},
+        ],
+        "meta": {"key": f"quiz:{q.id}", "split": q.split, "family": q.family, "repo": q.repo},
+    }
+
+
 def sample(
     questions: list[Question], trace: int = 24, pkgmap: int = 12, seed: int = 0
 ) -> list[Question]:
@@ -639,6 +666,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     asking.add_argument("--model", required=True)
     asking.add_argument("--url", required=True, help="an OpenAI-compatible endpoint")
     asking.add_argument("--json", type=Path, help="write every answer here")
+    exporting = sub.add_parser("export", help="questions as chat JSONL, for fine-tuning")
+    exporting.add_argument("--quiz", required=True, type=Path)
+    exporting.add_argument("--split", default="train")
+    exporting.add_argument("--to", required=True, type=Path)
+    exporting.add_argument("--exclude", type=Path, action="append", default=[],
+                           help="a quiz JSONL whose questions must never be trained on")
     sampling = sub.add_parser("sample", help="a small balanced test set, for people")
     sampling.add_argument("--quiz", required=True, type=Path)
     sampling.add_argument("--out", required=True, type=Path)
@@ -660,6 +693,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(*key, n)
         return 0
     questions = load(args.quiz)
+    if args.command == "export":
+        held = {json.loads(line)["id"] for path in args.exclude
+                for line in path.read_text().splitlines() if line.strip()}
+        chosen = [q for q in questions if q.split == args.split and q.id not in held]
+        args.to.parent.mkdir(parents=True, exist_ok=True)
+        args.to.write_text("".join(json.dumps(to_chat(q)) + "\n" for q in chosen))
+        print(f"{len(chosen)} questions written to {args.to}")
+        return 0
     if args.command == "sample":
         chosen = sample(questions, args.trace, args.pkgmap)
         args.out.write_text("".join(json.dumps(asdict(q)) + "\n" for q in chosen))

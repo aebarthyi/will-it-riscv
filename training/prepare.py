@@ -33,7 +33,10 @@ VALID_EVERY = 16
 
 
 def kind(example: dict) -> str:
-    """A script-driven repository (git) or a PyPI package (sdist, or its repo)."""
+    """A script-driven repository (git), a PyPI package (sdist, or its repo), or
+    a quiz question (will-it-riscv-quiz export), so each keeps its share of valid."""
+    if str(example["meta"].get("key", "")).startswith("quiz:"):
+        return "quiz"
     return evaluate.kind(example["meta"])
 
 

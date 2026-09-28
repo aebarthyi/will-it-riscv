@@ -1,5 +1,7 @@
 """The quiz: questions whose answers come from real configures and Debian's index."""
 
+import json
+
 from will_it_riscv import quiz
 from will_it_riscv.pseudobuild import Probe, PseudoBuild
 
@@ -60,3 +62,16 @@ def test_grade_accepts_any_listed_answer():
     assert not quiz.grade(q, "tbb")
     assert not quiz.grade(q, None)
 
+
+
+def test_a_question_becomes_a_training_example_that_explains_itself():
+    q = quiz.Question(
+        "x", "trace", "train", "MPI", "?", ["not-asked"], choices=list(quiz.CLASSES),
+        repo="hdf5", command="cmake -S . -B build",
+        why="the configure completed without reaching it; CMakeLists.txt:833",
+    )
+    example = quiz.to_chat(q)
+    answer = json.loads(example["messages"][-1]["content"])
+    assert answer["answer"] == "not-asked"
+    assert "CMakeLists.txt:833" in answer["reasoning"]
+    assert example["meta"]["split"] == "train"

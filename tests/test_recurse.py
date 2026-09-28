@@ -191,6 +191,9 @@ class FakeDistro:
         self.arch = "riscv64"
         self.available = True
 
+    def contents(self):
+        return None
+
     def first_available(self, candidates):
         return next((c for c in candidates if c in self.names_), None)
 

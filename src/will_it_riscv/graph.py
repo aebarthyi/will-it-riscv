@@ -43,6 +43,9 @@ TOOLCHAIN = {
     "python": "the target's Python (python3-dev)",
     "python3": "the target's Python (python3-dev)",
     "pythonlibs": "the target's Python (python3-dev)",
+    # glibc carries these; FindIconv and FindIntl find them in libc itself.
+    "iconv": "the C library (glibc)",
+    "intl": "the C library (glibc)",
 }
 
 #: What a blocker is provided by when a Python build requirement answers it.
@@ -72,6 +75,9 @@ class Node:
     """The blocker this was only reachable past."""
     debian: tuple[str, ...] = ()
     guessed: bool = False
+    resolved: Optional[str] = None
+    """How the archive's file lists answered for it -- ``ships TBBConfig.cmake``
+    -- when the curated map had only a guess."""
     provided_by: Optional[str] = None
     checked: bool = False
     available: Optional[str] = None
@@ -280,6 +286,12 @@ def build(
         if key not in linked:
             graph.edges.append((ROOT, key))
 
+    contents = distro.contents() if distro is not None else None
+    if contents is not None:
+        for node in graph.nodes.values():
+            if node.guessed and not node.provided_by:
+                _resolve(node, contents, result)
+
     if distro is not None and distro.available:
         for node in graph.nodes.values():
             if node.debian:
@@ -288,6 +300,21 @@ def build(
 
     graph.answer = _answer(graph, result, distro)
     return graph
+
+
+def _resolve(node: Node, contents, result: PseudoBuild) -> None:
+    """Replace a guessed package name with the one that ships what was looked for."""
+    for spelling in node.aliases or [node.name]:
+        probe = result.probes.get(spelling.lower())
+        command = probe.command if probe is not None else (
+            "find_program" if node.kind == "tool" else "find_package"
+        )
+        packages, how = contents.providers(
+            spelling, command, result.lookups.get(spelling.lower(), []),
+        )
+        if packages:
+            node.debian, node.guessed, node.resolved = packages, False, how
+            return
 
 
 def _as_tool(node: Node) -> None:
@@ -535,6 +562,7 @@ def _node_attributes(node: Node) -> str:
             f"reached once {node.behind} existed" if node.behind else "",
             "no package for the target" if node.missing else "",
             "package name guessed" if node.guessed else "",
+            f"package: {node.resolved}" if node.resolved else "",
         ) if part
     )
     attributes.append(f"tooltip={_quote(tooltip)}")
@@ -573,6 +601,7 @@ def to_dict(graph: Graph) -> dict:
                 "reached_after": n.behind,
                 "debian": list(n.debian),
                 "guessed": n.guessed,
+                "resolved": n.resolved,
                 "provided_by": n.provided_by,
                 "available": n.available if n.checked else None,
                 "missing_for_target": n.missing,

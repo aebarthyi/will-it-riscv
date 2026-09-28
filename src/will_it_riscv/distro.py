@@ -103,6 +103,8 @@ class DistroIndex:
         self._names: Optional[set[str]] = None
         self._versions: Optional[dict[str, str]] = None
         self.error: Optional[str] = None
+        self._contents = None
+        self._contents_tried = False
 
     @property
     def available(self) -> bool:
@@ -192,6 +194,15 @@ class DistroIndex:
         )
         self._names = collected
         self._versions = versions
+
+    def contents(self):
+        """Which package ships which file, for this distro and arch; None if unavailable."""
+        if not self._contents_tried:
+            from .contents import ContentsIndex
+
+            self._contents_tried = True
+            self._contents = ContentsIndex.load(self.client, self.cache, self.spec, self.arch)
+        return self._contents
 
     def has(self, package: str) -> bool:
         names = self.names()

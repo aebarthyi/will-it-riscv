@@ -9,11 +9,15 @@ from will_it_riscv.pseudobuild import Probe, PseudoBuild
 class FakeDistro:
     """Just enough of DistroIndex: a label, an arch and a set of names."""
 
-    def __init__(self, names):
+    def __init__(self, names, contents=None):
         self.names_ = set(names)
+        self.contents_ = contents
         self.spec = SimpleNamespace(label="Debian 13 (trixie)", id="debian:trixie")
         self.arch = "riscv64"
         self.available = True
+
+    def contents(self):
+        return self.contents_
 
     def first_available(self, candidates):
         return next((c for c in candidates if c in self.names_), None)
@@ -227,3 +231,24 @@ def test_a_miss_before_a_configure_that_died_is_left_open():
     )
     llvm = graph.build(result, "adaptivecpp").nodes["llvm"]
     assert llvm.status == graph.UNKNOWN
+
+
+def test_the_archive_answers_what_the_map_could_only_guess():
+    from will_it_riscv.contents import ContentsIndex
+
+    index = ContentsIndex()
+    index.read_contents([
+        "usr/lib/riscv64-linux-gnu/cmake/Flurb/FlurbConfig.cmake    libdevel/libflurb-dev\n",
+        "usr/include/zorp/zorp.h    libdevel/libzorp2-dev\n",
+    ])
+    result = pseudobuild(
+        blockers=["Flurb"],
+        soft_misses={"Zorp"},
+        probes=[probe("Flurb"), probe("Zorp")],
+        lookups={"zorp": [("find_path", "ZORP_INCLUDE_DIR", ("zorp/zorp.h",))]},
+    )
+    built = graph.build(result, "demo", FakeDistro({"libflurb-dev", "libzorp2-dev"}, index))
+    flurb, zorp = built.nodes["flurb"], built.nodes["zorp"]
+    assert flurb.debian == ("libflurb-dev",) and not flurb.guessed
+    assert flurb.resolved == "ships FlurbConfig.cmake" and flurb.available == "libflurb-dev"
+    assert zorp.debian == ("libzorp2-dev",) and zorp.resolved == "ships zorp/zorp.h"

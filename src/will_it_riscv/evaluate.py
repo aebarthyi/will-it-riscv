@@ -13,6 +13,9 @@ verified one.
   order       of the orderings the reference insists on, how many it keeps
   verdict     with --execute: run it, and does it reach the same answer
   required    with --execute: overlap of what its run and the reference's require
+  tokens      what the example cost in model tokens, in and out: the planner's,
+              and with --unblock the unblocker agent's (in thousands, per repo)
+  usd         the same in dollars, where the backend says
 
 Each score also keeps how long its planner and run took (``seconds``), which
 is what orders a later --jobs run slowest first.
@@ -73,6 +76,25 @@ class Score:
     verdict: Optional[bool] = None
     required: Optional[float] = None
     seconds: Optional[float] = None
+    planner_tokens_in: int = 0
+    planner_tokens_out: int = 0
+    planner_usd: Optional[float] = None
+    unblock_sessions: int = 0
+    unblock_replays: int = 0
+    unblock_tokens_in: int = 0
+    unblock_tokens_out: int = 0
+    unblock_usd: float = 0.0
+
+    @property
+    def tokens(self) -> int:
+        return (self.planner_tokens_in + self.planner_tokens_out
+                + self.unblock_tokens_in + self.unblock_tokens_out)
+
+    @property
+    def usd(self) -> Optional[float]:
+        if self.planner_usd is None and not self.unblock_usd:
+            return None
+        return (self.planner_usd or 0.0) + self.unblock_usd
 
     @property
     def f1(self) -> float:
@@ -255,6 +277,7 @@ def model_planner(
 
         outcome = modelplan.plan_repository(
             root, backend, pack=pack, rounds=rounds, verify=verify)
+        meta["usage"] = (*outcome.tokens, outcome.cost_usd)
         if transcripts is not None:
             transcripts.mkdir(parents=True, exist_ok=True)
             (transcripts / f"{meta['key']}.json").write_text(json.dumps({
@@ -363,7 +386,7 @@ def _example(directory: Path, planners: dict[str, Planner], env, baselines: bool
              progress) -> list[Score]:
     import time
 
-    from . import dataset
+    from . import dataset, unblock
 
     meta = json.loads((directory / "meta.json").read_text())
     found = dataset.tree(meta)
@@ -387,6 +410,7 @@ def _example(directory: Path, planners: dict[str, Planner], env, baselines: bool
     scores = []
     for name, planner in everyone.items():
         began = time.monotonic()
+        unblock.reset_spent()
         context = {**meta, "key": directory.name}
         try:
             candidate = planner(root, pack, context)
@@ -403,6 +427,14 @@ def _example(directory: Path, planners: dict[str, Planner], env, baselines: bool
                 ran = dataset.summary(dataset.run_plan(candidate, root, env))
             result.verdict = ran["verdict"] == reference_run["verdict"]
             result.required = _overlap(set(ran["required"]), set(reference_run["required"]))
+        if "usage" in context:
+            result.planner_tokens_in, result.planner_tokens_out, result.planner_usd = \
+                context["usage"]
+        agent = unblock.spent()
+        result.unblock_sessions, result.unblock_replays = agent["sessions"], agent["replays"]
+        result.unblock_tokens_in = agent["tokens_in"]
+        result.unblock_tokens_out = agent["tokens_out"]
+        result.unblock_usd = agent["cost"]
         result.seconds = round(time.monotonic() - began, 1)
         scores.append(result)
     return scores
@@ -443,6 +475,9 @@ def table(scores: list[Score]) -> list[dict]:
             "order": mean([s.order for s in mine]),
             "verdict": mean([None if s.verdict is None else float(s.verdict) for s in mine]),
             "required": mean([s.required for s in mine]),
+            "ktokens": mean([s.tokens / 1000 for s in mine]),
+            "usd": mean([s.usd for s in mine]),
+            "sessions": mean([float(s.unblock_sessions) for s in mine]),
         })
     return rows
 
@@ -483,12 +518,23 @@ def main(argv: Optional[list[str]] = None) -> int:
                              "with --jobs they start in its order, so list the slow ones first")
     parser.add_argument("--jobs", type=int, default=1,
                         help="examples to score at once, each in its own process")
+    parser.add_argument("--unblock", metavar="claude[:MODEL]",
+                        help="with --execute: hand the configures the executor's rules cannot get "
+                             "past to an agent (see will_it_riscv.unblock), and count what it "
+                             "spends; the references should have been run the same way")
     args = parser.parse_args(argv)
 
     if args.run_feedback and not args.execute:
         parser.error("--run-feedback needs --execute")
     if args.no_baselines and not args.planner:
         parser.error("--no-baselines needs --planner")
+    if args.unblock:
+        if not args.execute:
+            parser.error("--unblock needs --execute")
+        import os
+
+        # Read by every configure, in this process and the workers it forks.
+        os.environ["WILL_IT_RISCV_UNBLOCK"] = args.unblock
     env = None
     if args.execute:
         from . import dataset
@@ -508,13 +554,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     rows = table(scores)
     columns = ["planner", "kind", "repos", "parsed", "cited", "grounded", "precision", "recall", "f1",
-               "optional", "order", "verdict", "required"]
+               "optional", "order", "verdict", "required", "ktokens", "usd", "sessions"]
     print("  ".join(f"{c:>9}" for c in columns))
     for row in rows:
         print("  ".join(f"{'-' if row[c] is None else row[c]!s:>9}" for c in columns))
     if args.json:
         args.json.write_text(json.dumps(
-            {"summary": rows, "scores": [asdict(s) | {"f1": s.f1} for s in scores]}, indent=2,
+            {"summary": rows, "scores": [
+                asdict(s) | {"f1": s.f1, "tokens": s.tokens, "usd": s.usd} for s in scores]},
+            indent=2,
         ))
     return 0
 

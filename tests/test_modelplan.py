@@ -531,6 +531,31 @@ def test_the_harness_keeps_what_the_model_wrote(tmp_path):
     assert len(attempts) == 2 and attempts[0]["problems"] and not attempts[1]["problems"]
 
 
+def test_the_harness_counts_what_every_example_cost(tmp_path, monkeypatch):
+    """Two attempts at 10 in, 5 out and a cent each; and an unblocker that
+    spent on its own during the run, counted with the example it ran for."""
+    from will_it_riscv import unblock
+
+    repo = write(tmp_path / "repo", REPO)
+    out = tmp_path / "out"
+    dataset.label(dataset.Entry(name="demo", path=str(repo), split="test"), repo,
+                  Scripted(wire()), out)
+
+    def planner(root, pack, meta):
+        unblock.SPENT.append({"cost": 0.5, "tokens_in": 1000, "tokens_out": 200})
+        unblock.SPENT.append({"cost": 0.0, "tokens_in": 0, "tokens_out": 0, "replayed": "x"})
+        return evaluate.model_planner(Scripted(wire(quote="nope"), wire()), 3)(root, pack, meta)
+
+    unblock.SPENT.append({"cost": 9.0})   # an earlier example's, not this one's
+    (score,) = evaluate.evaluate(out, {"model": planner}, baselines=False)
+    assert (score.planner_tokens_in, score.planner_tokens_out) == (20, 10)
+    assert score.planner_usd == pytest.approx(0.02)
+    assert (score.unblock_sessions, score.unblock_replays) == (1, 1)
+    assert score.tokens == 20 + 10 + 1000 + 200 and score.usd == pytest.approx(0.52)
+    (row, _) = evaluate.table([score])
+    assert row["ktokens"] == 1.23 and row["usd"] == 0.52 and row["sessions"] == 1.0
+
+
 def test_the_command_line_runs_the_plan_a_model_wrote(tmp_path, monkeypatch):
     from will_it_riscv import cli
     from will_it_riscv.pseudobuild import available

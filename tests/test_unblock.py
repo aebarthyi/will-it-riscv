@@ -312,6 +312,8 @@ def test_the_same_stuck_point_again_is_replayed_not_asked(tmp_path, monkeypatch)
     assert first.completed and second.completed and second.blockers == ["frob"]
     assert unblocker.asked == 1
     assert second.unblocker[0]["cost"] == 0.0 and second.unblocker[0]["confirmed"] is True
+    # What the scoreboard adds up: one session, then one replay.
+    assert [bool(r["replayed"]) for r in unblock.SPENT[-2:]] == [False, True]
     # The replayed program names the second run's sysroot, not the first's.
     replayed = []
     original = unblock._replay

@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import pseudobuild as pb
+from .modelplan import claude_environment
 
 #: What a session may end with.
 UNBLOCKED = "unblocked"
@@ -126,6 +127,8 @@ class Result:
     """Files it changed, path to what they said before."""
     log: Optional[str] = None
     cost: Optional[float] = None
+    tokens_in: int = 0
+    tokens_out: int = 0
     configures: int = 0
     memo: Optional[tuple] = None
     """Where it is remembered for replay, to forget it if it is rejected."""
@@ -144,6 +147,7 @@ class Result:
             "reason": self.reason, "flags": self.flags, "overrides": sorted(self.overrides),
             "files": len(self.files) + len(self.restore), "confirmed": None,
             "configures": self.configures, "cost": self.cost, "log": self.log,
+            "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
         }
 
 
@@ -849,11 +853,13 @@ class ClaudeUnblocker:
         key = (str(stuck.root.resolve()), pb._signature(stuck.outcome.error))
         memo = self._recall(key)
         if memo is not None:
-            return _replay(memo, stuck, key)
-        result = self._session(stuck)
-        if result.outcome != GAVE_UP:
-            self._store(key, _remember(result, stuck))
-            result.memo = key
+            result = _replay(memo, stuck, key)
+        else:
+            result = self._session(stuck)
+            if result.outcome != GAVE_UP:
+                self._store(key, _remember(result, stuck))
+                result.memo = key
+        SPENT.append(result.record())
         return result
 
     # -- what earlier sessions found, kept on disk
@@ -941,10 +947,7 @@ class ClaudeUnblocker:
             "--no-session-persistence",
             "--max-budget-usd", f"{self.budget_usd:.2f}",
         ]
-        # A session of its own, not a child of whatever Claude Code session
-        # started this process.
-        env = {k: v for k, v in os.environ.items() if k not in _PARENT_SESSION}
-        env["MCP_TOOL_TIMEOUT"] = str(self.timeout * 1000)
+        env = {**claude_environment(), "MCP_TOOL_TIMEOUT": str(self.timeout * 1000)}
         transcript = session / "transcript.jsonl"
         started = time.monotonic()
         failure = None
@@ -960,7 +963,7 @@ class ClaudeUnblocker:
         result = bench.result()
         if failure and result.outcome == GAVE_UP:
             result.reason = failure
-        result.cost = _cost(transcript)
+        result.cost, result.tokens_in, result.tokens_out = _usage(transcript)
         result.log = self._keep(session, stuck, result, time.monotonic() - started)
         return result
 
@@ -1060,25 +1063,40 @@ def _replay(memo: dict, stuck: Stuck, key: tuple) -> Result:
     return result
 
 
-#: What ties a ``claude`` process to the Claude Code session that started it.
-_PARENT_SESSION = {
-    "CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "CLAUDE_CODE_CHILD_SESSION",
-    "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
-    "CLAUDE_CODE_SSE_PORT", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ATTENDED",
-    "CLAUDE_CODE_EXECPATH",
-}
+#: Every session and replay this process has had, as records, in order: what
+#: a scoreboard adds up per repository (``reset_spent``, then ``spent``).
+SPENT: list = []
 
 
-def _cost(transcript: Path) -> Optional[float]:
-    """What the session cost, from the final message ``claude -p`` streams."""
+def reset_spent() -> None:
+    SPENT.clear()
+
+
+def spent() -> dict:
+    """Sessions, replays, tokens and dollars since the last ``reset_spent``."""
+    return {
+        "sessions": sum(1 for r in SPENT if not r.get("replayed")),
+        "replays": sum(1 for r in SPENT if r.get("replayed")),
+        "tokens_in": sum(r.get("tokens_in") or 0 for r in SPENT),
+        "tokens_out": sum(r.get("tokens_out") or 0 for r in SPENT),
+        "cost": round(sum(r.get("cost") or 0 for r in SPENT), 4),
+    }
+
+
+def _usage(transcript: Path) -> tuple[Optional[float], int, int]:
+    """Dollars and tokens in and out, from the final message ``claude -p``
+    streams. Read from its cache is still read."""
     try:
         for line in reversed(transcript.read_text().splitlines()):
             message = json.loads(line)
             if message.get("type") == "result":
-                return message.get("total_cost_usd")
+                usage = message.get("usage") or {}
+                read = sum(usage.get(k) or 0 for k in (
+                    "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+                return message.get("total_cost_usd"), read, usage.get("output_tokens") or 0
     except (OSError, ValueError):
         pass
-    return None
+    return None, 0, 0
 
 
 def from_environment() -> Optional[ClaudeUnblocker]:

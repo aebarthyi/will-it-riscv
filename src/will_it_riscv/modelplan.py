@@ -451,7 +451,7 @@ class ClaudeCLI:
         ]
         process = subprocess.run(
             command, input=_as_one_prompt(messages), capture_output=True, text=True,
-            timeout=self.timeout,
+            timeout=self.timeout, env=claude_environment(),
         )
         try:
             result = json.loads(process.stdout)
@@ -472,6 +472,21 @@ class ClaudeCLI:
             output_tokens=usage.get("output_tokens", 0),
             cost_usd=result.get("total_cost_usd"),
         )
+
+
+#: What ties a ``claude`` process to the Claude Code session that started it.
+#: A ``claude -p`` started from inside one is a session of its own.
+_PARENT_SESSION = {
+    "CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_SSE_PORT", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_EXECPATH",
+}
+
+
+def claude_environment() -> dict:
+    """This process's environment, for a ``claude -p`` of its own."""
+    return {k: v for k, v in os.environ.items() if k not in _PARENT_SESSION}
 
 
 def _as_one_prompt(messages: list[dict]) -> str:
@@ -533,6 +548,12 @@ class ModelPlan:
     @property
     def ok(self) -> bool:
         return self.plan is not None and not self.attempts[-1].problems
+
+    @property
+    def tokens(self) -> tuple[int, int]:
+        """Input and output tokens, over every attempt."""
+        done = [a.completion for a in self.attempts if a.completion]
+        return sum(c.input_tokens for c in done), sum(c.output_tokens for c in done)
 
     @property
     def cost_usd(self) -> Optional[float]:

@@ -32,6 +32,8 @@ a smaller unblocker on.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import functools
 import hashlib
 import json
@@ -719,11 +721,20 @@ def call(bench: Workbench, name: str, arguments: dict) -> tuple[str, bool]:
 
 
 def serve(session: Path, stdin=None, stdout=None) -> None:
-    """The workbench as an MCP server on stdio: newline-delimited JSON-RPC."""
+    """The workbench as an MCP server on stdio."""
+    bench = Workbench(session)
+    serve_tools(TOOLS, lambda name, arguments: call(bench, name, arguments),
+                Path(session) / "calls.jsonl", stdin, stdout)
+
+
+def serve_tools(tools: list, dispatch, log: Path, stdin=None, stdout=None,
+                closing=None) -> None:
+    """Tools as an MCP server on stdio: newline-delimited JSON-RPC.
+    ``dispatch(name, arguments)`` answers ``(text, refused)``; every call is
+    logged; ``closing`` runs when the client goes away."""
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
-    bench = Workbench(session)
-    log = (Path(session) / "calls.jsonl").open("a")
+    calls = Path(log).open("a")
 
     def reply(message_id, result=None, error=None) -> None:
         body = {"jsonrpc": "2.0", "id": message_id}
@@ -731,37 +742,42 @@ def serve(session: Path, stdin=None, stdout=None) -> None:
         stdout.write(json.dumps(body) + "\n")
         stdout.flush()
 
-    for line in stdin:
-        try:
-            message = json.loads(line)
-        except ValueError:
-            continue
-        method, message_id = message.get("method"), message.get("id")
-        if message_id is None:
-            continue   # a notification: initialized, cancelled
-        if method == "initialize":
-            version = (message.get("params") or {}).get("protocolVersion", "2024-11-05")
-            reply(message_id, {
-                "protocolVersion": version, "capabilities": {"tools": {}},
-                "serverInfo": {"name": "will-it-riscv-unblock", "version": "0.1"},
-            })
-        elif method == "ping":
-            reply(message_id, {})
-        elif method == "tools/list":
-            reply(message_id, {"tools": TOOLS})
-        elif method == "tools/call":
-            params = message.get("params") or {}
-            started = time.monotonic()
-            text, refused = call(bench, params.get("name", ""), params.get("arguments") or {})
-            log.write(json.dumps({
-                "tool": params.get("name"), "arguments": params.get("arguments"),
-                "refused": refused, "seconds": round(time.monotonic() - started, 1),
-                "answer": text[:2000],
-            }) + "\n")
-            log.flush()
-            reply(message_id, {"content": [{"type": "text", "text": text}], "isError": refused})
-        else:
-            reply(message_id, error={"code": -32601, "message": f"no method {method}"})
+    try:
+        for line in stdin:
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            method, message_id = message.get("method"), message.get("id")
+            if message_id is None:
+                continue   # a notification: initialized, cancelled
+            if method == "initialize":
+                version = (message.get("params") or {}).get("protocolVersion", "2024-11-05")
+                reply(message_id, {
+                    "protocolVersion": version, "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "will-it-riscv", "version": "0.1"},
+                })
+            elif method == "ping":
+                reply(message_id, {})
+            elif method == "tools/list":
+                reply(message_id, {"tools": tools})
+            elif method == "tools/call":
+                params = message.get("params") or {}
+                started = time.monotonic()
+                text, refused = dispatch(params.get("name", ""), params.get("arguments") or {})
+                calls.write(json.dumps({
+                    "tool": params.get("name"), "arguments": params.get("arguments"),
+                    "refused": refused, "seconds": round(time.monotonic() - started, 1),
+                    "answer": text[:2000],
+                }) + "\n")
+                calls.flush()
+                reply(message_id, {"content": [{"type": "text", "text": text}], "isError": refused})
+            else:
+                reply(message_id, error={"code": -32601, "message": f"no method {method}"})
+    finally:
+        if closing is not None:
+            closing()
+        calls.close()
 
 
 # ------------------------------------------------------------------ the agent
@@ -835,34 +851,11 @@ def prompt(stuck: Stuck, bench: Workbench, configures: int) -> str:
     ])
 
 
-@dataclass
-class ClaudeUnblocker:
-    """Sessions with Claude through ``claude -p``, the workbench over MCP."""
+class Replays:
+    """What earlier sessions found at a stuck point, kept on disk under the log
+    directory's replay/, for any later run to put back without asking again."""
 
-    model: str = "sonnet"
-    budget_usd: float = 2.0
-    """Per session."""
-    timeout: int = 1200
-    """Seconds per session, configures included."""
-    max_configures: int = MAX_CONFIGURES
-    sessions: int = SESSIONS
     log_dir: Optional[Path] = None
-    command: str = "claude"
-
-    def __call__(self, stuck: Stuck) -> Result:
-        key = (str(stuck.root.resolve()), pb._signature(stuck.outcome.error))
-        memo = self._recall(key)
-        if memo is not None:
-            result = _replay(memo, stuck, key)
-        else:
-            result = self._session(stuck)
-            if result.outcome != GAVE_UP:
-                self._store(key, _remember(result, stuck))
-                result.memo = key
-        SPENT.append(result.record())
-        return result
-
-    # -- what earlier sessions found, kept on disk
 
     def base(self) -> Path:
         return Path(self.log_dir or os.environ.get(
@@ -902,27 +895,61 @@ class ClaudeUnblocker:
         _REPLAYS.pop(key, None)
         self._replay_file(key).unlink(missing_ok=True)
 
+
+def open_session(stuck: Stuck, max_configures: int = MAX_CONFIGURES) -> Path:
+    """A session directory at a stuck point: what the workbench serves."""
+    number = len(stuck.earlier) + 1
+    session = stuck.scratch / "unblock" / f"session-{number}"
+    session.mkdir(parents=True, exist_ok=True)
+    state = {
+        "session": number, "root": str(stuck.root), "scratch": str(stuck.scratch),
+        "sysroot": str(stuck.sysroot),
+        "toolchain": str(stuck.toolchain) if stuck.toolchain else None,
+        # Only what the executor changed: the rest is this process's own
+        # environment, and has no business in a log.
+        "env": {k: v for k, v in stuck.env.items() if os.environ.get(k) != v},
+        "settings": stuck.settings, "fixed": stuck.fixed,
+        "overrides": sorted(stuck.overrides),
+        "signature": pb._signature(stuck.outcome.error), "error": stuck.outcome.error,
+        "stanzas": pb._error_stanzas(stuck.outcome.narration),
+        "status": _status_before_error(stuck.outcome.narration),
+        "round": stuck.round, "trace": str(stuck.trace), "build": str(stuck.build),
+        "blockers": list(stuck.blockers), "timeout": stuck.timeout,
+        "max_configures": max_configures, "earlier": stuck.earlier,
+    }
+    (session / "state.json").write_text(json.dumps(state, indent=1))
+    return session
+
+
+@dataclass
+class ClaudeUnblocker(Replays):
+    """Sessions with Claude through ``claude -p``, the workbench over MCP."""
+
+    model: str = "sonnet"
+    budget_usd: float = 2.0
+    """Per session."""
+    timeout: int = 1200
+    """Seconds per session, configures included."""
+    max_configures: int = MAX_CONFIGURES
+    sessions: int = SESSIONS
+    log_dir: Optional[Path] = None
+    command: str = "claude"
+
+    def __call__(self, stuck: Stuck) -> Result:
+        key = (str(stuck.root.resolve()), pb._signature(stuck.outcome.error))
+        memo = self._recall(key)
+        if memo is not None:
+            result = _replay(memo, stuck, key)
+        else:
+            result = self._session(stuck)
+            if result.outcome != GAVE_UP:
+                self._store(key, _remember(result, stuck))
+                result.memo = key
+        SPENT.append(result.record())
+        return result
+
     def _session(self, stuck: Stuck) -> Result:
-        number = len(stuck.earlier) + 1
-        session = stuck.scratch / "unblock" / f"session-{number}"
-        session.mkdir(parents=True, exist_ok=True)
-        state = {
-            "session": number, "root": str(stuck.root), "scratch": str(stuck.scratch),
-            "sysroot": str(stuck.sysroot),
-            "toolchain": str(stuck.toolchain) if stuck.toolchain else None,
-            # Only what the executor changed: the rest is this process's own
-            # environment, and has no business in a log.
-            "env": {k: v for k, v in stuck.env.items() if os.environ.get(k) != v},
-            "settings": stuck.settings, "fixed": stuck.fixed,
-            "overrides": sorted(stuck.overrides),
-            "signature": pb._signature(stuck.outcome.error), "error": stuck.outcome.error,
-            "stanzas": pb._error_stanzas(stuck.outcome.narration),
-            "status": _status_before_error(stuck.outcome.narration),
-            "round": stuck.round, "trace": str(stuck.trace), "build": str(stuck.build),
-            "blockers": list(stuck.blockers), "timeout": stuck.timeout,
-            "max_configures": self.max_configures, "earlier": stuck.earlier,
-        }
-        (session / "state.json").write_text(json.dumps(state, indent=1))
+        session = open_session(stuck, self.max_configures)
         bench = Workbench(session)
         text = prompt(stuck, bench, self.max_configures)
         (session / "prompt.txt").write_text(text)
@@ -1099,19 +1126,60 @@ def _usage(transcript: Path) -> tuple[Optional[float], int, int]:
     return None, 0, 0
 
 
-def from_environment() -> Optional[ClaudeUnblocker]:
-    """``WILL_IT_RISCV_UNBLOCK=claude[:model]``, else nothing.
-    ``WILL_IT_RISCV_UNBLOCK_BUDGET`` is dollars per session."""
+#: An unblocker set for this thread's configures (``using``), ahead of the
+#: environment's: the agent pauses its own plan's run at each stuck point.
+_CHOSEN: contextvars.ContextVar = contextvars.ContextVar("unblocker", default=None)
+
+
+@contextlib.contextmanager
+def using(unblocker):
+    token = _CHOSEN.set(unblocker)
+    try:
+        yield unblocker
+    finally:
+        _CHOSEN.reset(token)
+
+
+def from_environment():
+    """What ``using`` set; else ``WILL_IT_RISCV_UNBLOCK=claude[:model]``, or
+    ``replay`` (only what earlier sessions found, never a new one); else
+    nothing. ``WILL_IT_RISCV_UNBLOCK_BUDGET`` is dollars per session."""
+    chosen = _CHOSEN.get()
+    if chosen is not None:
+        return chosen
     spec = os.environ.get("WILL_IT_RISCV_UNBLOCK", "").strip()
     if not spec:
         return None
     kind, _, model = spec.partition(":")
+    if kind == "replay":
+        return ReplayOnly()
     if kind != "claude":
-        raise ValueError(f"WILL_IT_RISCV_UNBLOCK={spec}: only claude[:model] is known")
+        raise ValueError(f"WILL_IT_RISCV_UNBLOCK={spec}: claude[:model] or replay")
     unblocker = ClaudeUnblocker(model=model or "sonnet")
     if os.environ.get("WILL_IT_RISCV_UNBLOCK_BUDGET"):
         unblocker.budget_usd = float(os.environ["WILL_IT_RISCV_UNBLOCK_BUDGET"])
     return unblocker
+
+
+@dataclass
+class ReplayOnly(Replays):
+    """Puts back what earlier sessions found and asks nothing new: a run that
+    must cost nothing, such as rescoring a plan an agent already ran."""
+
+    log_dir: Optional[Path] = None
+    sessions: int = SESSIONS
+
+    def __call__(self, stuck: Stuck) -> Result:
+        key = (str(stuck.root.resolve()), pb._signature(stuck.outcome.error))
+        memo = self._recall(key)
+        result = (_replay(memo, stuck, key) if memo is not None
+                  else Result(GAVE_UP, reason="no earlier session at this stuck point"))
+        SPENT.append(result.record())
+        return result
+
+    def judged(self, result: Result, confirmed: bool) -> None:
+        if not confirmed and result.memo:
+            self._forget(result.memo)
 
 
 def main(argv: Optional[list] = None) -> int:

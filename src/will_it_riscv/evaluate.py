@@ -294,6 +294,22 @@ def model_planner(
     return planner
 
 
+def agent_planner(agent, env) -> Planner:
+    """The agent (:mod:`agent`): it plans, runs, fixes and stops on its own;
+    what it spent goes in ``meta["usage"]``. Its fixes at stuck points are
+    kept for replay, so scoring its plan again (``--unblock replay``) is free."""
+
+    def planner(root: Path, pack: EvidencePack, meta: dict) -> Optional[Plan]:
+        name = (meta.get("entry") or {}).get("name") or meta["key"]
+        outcome = agent(root, pack, name, arch=env.target.arch, distro=env.distro.spec.id,
+                        python=".".join(map(str, env.target.python_version)),
+                        distro_label=env.distro.spec.label)
+        meta["usage"] = (outcome.tokens_in, outcome.tokens_out, outcome.cost)
+        return outcome.plan
+
+    return planner
+
+
 # ------------------------------------------------------------------ running
 
 
@@ -489,8 +505,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument("--out", required=True, type=Path, help="a labelled dataset directory")
     parser.add_argument("--split", default="test")
-    parser.add_argument("--planner", choices=("claude-cli", "anthropic", "openai"),
-                        help="a model to score beside the baselines")
+    parser.add_argument("--planner", choices=("claude-cli", "anthropic", "openai", "agent"),
+                        help="a model to score beside the baselines; agent: Claude (via claude "
+                             "-p, --planner-model) planning with tools, needs --execute")
     parser.add_argument("--planner-model")
     parser.add_argument("--planner-url",
                         help="for openai: the server, or several of the same model, comma-separated")
@@ -541,7 +558,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         env = dataset.environment(args.python, distro=args.distro)
     planners: dict[str, Planner] = {} if args.no_baselines else {"autoplan": autoplan_planner}
-    if args.planner:
+    if args.planner == "agent":
+        if env is None:
+            parser.error("--planner agent needs --execute")
+        from .agent import ClaudeAgent
+
+        model = args.planner_model or "sonnet"
+        planners[f"agent:{model}"] = agent_planner(ClaudeAgent(model=model), env)
+    elif args.planner:
         backend = modelplan.backend(
             args.planner, args.planner_model, args.planner_url, args.planner_slots)
         planners[backend.name] = model_planner(

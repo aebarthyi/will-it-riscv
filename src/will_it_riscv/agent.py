@@ -192,7 +192,7 @@ class Session:
         event = self.events.get()
         if event[0] == "stuck":
             _, directory, stuck = event
-            self.bench = unblock.Workbench(directory)
+            self.bench = unblock.Workbench(directory, finish_tool="resume")
             return self._paused(stuck)
         self.bench = None
         if self.thread is not None:

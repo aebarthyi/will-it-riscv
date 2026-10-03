@@ -187,8 +187,9 @@ class Workbench:
     whatever state the agent stopped in.
     """
 
-    def __init__(self, session: Path):
+    def __init__(self, session: Path, finish_tool: str = "finish"):
         self.session = Path(session)
+        self.finish_tool = finish_tool   # what ends the work here: the agent's is resume
         state = json.loads((self.session / "state.json").read_text())
         self.state = state
         self.root = Path(state["root"])
@@ -464,7 +465,8 @@ class Workbench:
     def configure(self) -> str:
         runs = self.ledger["configures"]
         if len(runs) >= self.max_configures:
-            raise Refused(f"all {self.max_configures} configures are spent; finish now")
+            raise Refused(f"all {self.max_configures} configures are spent; "
+                          f"{self.finish_tool} now")
         label = f"unblock-{self.state['session']}-{len(runs) + 1}"
         started = time.monotonic()
         outcome = pb._configure(
@@ -480,11 +482,13 @@ class Workbench:
         self._save()
         left = self.max_configures - len(runs)
         if outcome.completed:
-            return (f"configure {len(runs)}: COMPLETED. The error moved. Call finish now "
+            return (f"configure {len(runs)}: COMPLETED. The error moved. "
+                    f"Call {self.finish_tool} now "
                     f"({left} configures left).")
         stanzas = pb._error_stanzas(outcome.narration)
         verdict = ("the error MOVED: it is no longer the one you were given. If this is a "
-                   "different problem, call finish now; the executor takes it from here."
+                   f"different problem, call {self.finish_tool} now; the executor takes it "
+                   "from here."
                    if moved else "the SAME error as before: not past it yet.")
         return "\n".join([
             f"configure {len(runs)}: stopped; {verdict} ({left} configures left)",

@@ -67,6 +67,7 @@ def test_a_stuck_run_pauses_for_the_agent_and_goes_on_when_it_resumes(session):
     paused = session.run_plan()
     assert "The run paused" in paused and "cannot go on without the data" in paused
     _stub(session)
+    assert "COMPLETED" in (moved := call(session, "configure", {})[0]) and "Call resume" in moved
     done = call(session, "resume", {"outcome": "unblocked", "blocker": "frob",
                                     "reason": "find_file wanted frob.dat"})[0]
     assert done.startswith("verdict:") and "configure (cmake-configure): completed" in done

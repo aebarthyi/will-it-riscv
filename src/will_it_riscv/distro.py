@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import gzip
 import re
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
@@ -39,6 +40,11 @@ class DistroSpec:
     base: str
     components: tuple[str, ...]
     family: str = "debian"
+
+    @property
+    def vendor(self) -> str:
+        """Whose archive: ``debian`` or ``ubuntu`` (both are of the Debian family)."""
+        return self.id.split(":", 1)[0]
 
 
 KNOWN_DISTROS = {
@@ -81,6 +87,44 @@ FAMILY_DEFAULTS = {
     "debian": "debian:trixie",
     "ubuntu": "ubuntu:resolute",
 }
+
+#: Where to look for "does this name exist at all": the fullest arch, with
+#: the components a riscv64 check leaves out (CUDA is in Debian's non-free).
+REFERENCE_ARCH = "amd64"
+REFERENCE_COMPONENTS = {
+    "debian": ("non-free", "non-free-firmware"),
+    "ubuntu": ("restricted", "multiverse"),
+}
+REFERENCE_BASES = {"ubuntu": "http://archive.ubuntu.com/ubuntu"}
+
+
+def _get(client: httpx.Client, url: str, tries: int = 3) -> httpx.Response:
+    """A GET that survives an archive mirror dropping the connection once or twice."""
+    for attempt in range(tries):
+        try:
+            return client.get(url, timeout=120.0, follow_redirects=True)
+        except httpx.TransportError:
+            if attempt == tries - 1:
+                raise
+            time.sleep(2 * (attempt + 1))
+    raise AssertionError("unreachable")
+
+
+def _core(package: str) -> str:
+    """What a package name is about: libpcre3-dev -> pcre, postgresql-16 -> postgresql."""
+    core = package.lower()
+    core = re.sub(r"-(dev|devel|bin|tools|utils)$", "", core)
+    if core.startswith("lib") and len(core) > 5:
+        core = core[3:]
+    return re.sub(r"[-.]?[\d.]+$", "", core) or core
+
+
+#: Near names that are never what a build means: docs, cross toolchains,
+#: another language's bindings.
+_ASIDE = re.compile(
+    r"-doc$|-cross$|-dbg$|^(lib)?(rust|ghc|ocaml|lua[\d.]*|perl|ruby|node|golang|r-cran|php)-|-ocaml-"
+)
+
 
 _PACKAGE_LINE = re.compile(rb"^Package: (\S+)$", re.MULTILINE)
 _PROVIDES_LINE = re.compile(rb"^Provides: (.+)$", re.MULTILINE)
@@ -153,7 +197,7 @@ class DistroIndex:
                 f"binary-{self.arch}/Packages.gz"
             )
             try:
-                response = self.client.get(url, timeout=120.0, follow_redirects=True)
+                response = _get(self.client, url)
             except httpx.HTTPError as exc:
                 self.error = f"{url}: {exc}"
                 return
@@ -207,6 +251,56 @@ class DistroIndex:
     def has(self, package: str) -> bool:
         names = self.names()
         return bool(names and package in names)
+
+    def named(self, package: str) -> Optional[bool]:
+        """Whether the distro has a package by this name at all, on any arch.
+
+        Not having it for the target is an answer; not having it anywhere is
+        a wrong name -- openmpi for libopenmpi-dev, Alpine's build-base, a
+        package another release or distro has and this one does not. The same
+        release's amd64, with every component, stands in for "anywhere" (for
+        Ubuntu, from the main archive: ports has no amd64). None when that
+        list cannot be had.
+        """
+        if self.has(package):
+            return True
+        reference = self._reference()
+        names = reference.names() if reference is not None else None
+        if names is None:
+            return None
+        return package in names
+
+    def similar(self, package: str, limit: int = 3) -> list[str]:
+        """Names for the target that look like a wrong one, the likeliest first."""
+        import difflib
+
+        core = _core(package)
+        names = self.names()
+        if not names or len(core) < 2:
+            return []
+        canonical = [f"lib{core}-dev", f"{core}-dev", core, f"{core}-bin", f"lib{core}"]
+
+        def rank(name: str) -> tuple:
+            return (
+                canonical.index(name) if name in canonical else len(canonical),
+                -difflib.SequenceMatcher(None, package, name).ratio(), name,
+            )
+
+        return sorted((n for n in names if core in n and not _ASIDE.search(n)), key=rank)[:limit]
+
+    def _reference(self) -> Optional[DistroIndex]:
+        vendor = self.spec.vendor
+        if self.arch == REFERENCE_ARCH and not REFERENCE_COMPONENTS.get(vendor):
+            return self
+        if not hasattr(self, "_reference_index"):
+            extra = REFERENCE_COMPONENTS.get(vendor, ())
+            spec = replace(
+                self.spec, base=REFERENCE_BASES.get(vendor, self.spec.base),
+                components=self.spec.components + tuple(
+                    c for c in extra if c not in self.spec.components),
+            )
+            self._reference_index = DistroIndex(self.client, self.cache, spec, REFERENCE_ARCH)
+        return self._reference_index
 
     def first_available(self, candidates) -> Optional[str]:
         names = self.names()

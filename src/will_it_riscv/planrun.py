@@ -21,6 +21,7 @@ resolved to that step rather than looked for in the archive.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
@@ -168,6 +169,10 @@ class PlanResult:
     answer: Optional[PlanAnswer] = None
     used_as_provided: set = field(default_factory=set)
     """Python packages a later step used for what they provide: fypp."""
+    unknown_names: list[tuple[str, str, list[str], str]] = field(default_factory=list)
+    """``(step, name, near names, distro)``: system packages the distro has no package called."""
+    arch: str = "riscv64"
+    """The target, for an error that refuses it by name."""
 
     def why(self, node_id: str) -> list[str]:
         """The shortest chain from a step to this node: step, ..., node."""
@@ -205,7 +210,8 @@ def execute(
 ) -> PlanResult:
     """Run every step, in order, and join what they need into one graph."""
     root = Path(root)
-    result = PlanResult(plan=plan, root=root, evidence_problems=check_evidence(plan, root))
+    result = PlanResult(plan=plan, root=root, evidence_problems=check_evidence(plan, root),
+                        arch=target.arch)
     provided: dict[str, str] = {}   # normalised name -> id of the step that provides it
 
     for step in plan.ordered():
@@ -353,6 +359,13 @@ def _system_packages(
             _settle(node, UNKNOWN, "archive not checked")
             continue
         where = f"{distro.spec.label} for {distro.arch}"
+        if not distro.has(package) and _unnamed(distro, package):
+            # Not an answer about the target: nobody ships anything by that name.
+            near = distro.similar(package)
+            _settle(node, UNKNOWN, f"{distro.spec.label} has no package named {package}"
+                    + (f"; it has {', '.join(near)}" if near else ""))
+            result.unknown_names.append((step.id, package, near, distro.spec.label))
+            continue
         have = distro.version(package) if wanted and distro.has(package) else None
         shortfall = None
         if not distro.has(package):
@@ -528,6 +541,12 @@ def _same_source(planned: str, observed: str) -> bool:
     return norm(planned) == norm(observed)
 
 
+def _unnamed(distro: DistroIndex, package: str) -> bool:
+    """No package by this name on any arch: a wrong name, not a missing package."""
+    named = getattr(distro, "named", None)
+    return named is not None and named(package) is False
+
+
 def _elsewhere(package: str, arch: str, shortfall: str) -> tuple[str, str]:
     """Where a tool the archive cannot supply can be had instead, if anywhere."""
     upstream = UPSTREAM_BINARIES.get(package)
@@ -590,7 +609,9 @@ def _configure(
         missing = "CMakeLists.txt"
     if outcome is None:
         return StepResult(step, "failed", f"no {missing} in {step.source}")
-    if outcome.error and not outcome.probes and not outcome.completed:
+    if outcome.error and not outcome.probes and not outcome.blockers and not outcome.completed:
+        # Nothing asked for and nothing blamed. A default build that turns on
+        # CUDA dies at project(), before any find_package, with CUDA to blame.
         return StepResult(step, "failed", outcome.error, pseudobuild=outcome)
     graph = depgraph.build(outcome, f"{plan.repo}/{step.id}", distro)
     here = f"step:{step.id}"
@@ -624,6 +645,17 @@ def _configure(
     return StepResult(step, status, detail, pseudobuild=outcome, graph=graph)
 
 
+#: What no riscv64 system can have: NVIDIA ships CUDA for x86-64, arm64 and
+#: ppc64le. A default build that will not configure without it is a "no".
+#: (ROCm is left out: its libraries are found, not demanded, and stubs make
+#: an auto-detected backend look present.)
+NO_RISCV64 = {
+    "cuda": "NVIDIA's CUDA has no riscv64 build",
+    "cudatoolkit": "NVIDIA's CUDA has no riscv64 build",
+    "nvcc": "NVIDIA's CUDA compiler has no riscv64 build",
+}
+
+
 def _cmake_tier(
     node: depgraph.Node, provided: dict[str, str]
 ) -> tuple[str, str, Optional[str]]:
@@ -631,6 +663,8 @@ def _cmake_tier(
         step_id = provided.get(_normal(name))
         if step_id:
             return PROVIDED, f"provided by step {step_id!r}", step_id
+    if node.key in NO_RISCV64 and (node.status == depgraph.REQUIRED or node.asked_required):
+        return NONE, NO_RISCV64[node.key], None
     if node.provided_by:
         return TOOLCHAIN, f"comes with {node.provided_by}", None
     if node.available:
@@ -679,6 +713,13 @@ def _answer(result: PlanResult) -> PlanAnswer:
             "in the index or archive checked",
             **lists,
         )
+    for outcome in stopped:
+        refusal = _refuses_target(outcome, result.arch)
+        if refusal:
+            return PlanAnswer(
+                "no", f"step {outcome.step.id!r}: the default build refuses {result.arch}: "
+                f"{refusal}", **lists,
+            )
     if stopped:
         first = stopped[0]
         return PlanAnswer(
@@ -703,6 +744,28 @@ def _answer(result: PlanResult) -> PlanAnswer:
         "every default step completes, and everything it needs exists for the target",
         **lists,
     )
+
+
+#: The names an error might call the target by.
+_ARCH_NAMES = {"riscv64": r"riscv64|riscv|risc-v", "aarch64": r"aarch64|arm64"}
+_REFUSES = re.compile(
+    r"unsupported|not supported|isn'?t supported|not a supported|does not support"
+    r"|unknown|unrecogni[sz]ed|no support", re.IGNORECASE,
+)
+
+
+def _refuses_target(outcome: StepResult, arch: str) -> Optional[str]:
+    """The configure's own error, when it refuses the target by name: acts's
+    "Unsupported architecture: riscv64". That is an answer, not a stop."""
+    error = getattr(outcome.pseudobuild, "error", None) or ""
+    message = re.sub(r"^CMake Error at \S+ \(\w+\):\s*", "", error.strip())
+    names = re.compile(rf"(?<![a-z0-9])(?:{_ARCH_NAMES.get(arch, re.escape(arch))})(?![a-z0-9])",
+                       re.IGNORECASE)
+    named = names.search(message)
+    refused = _REFUSES.search(message)
+    if named and refused and abs(named.start() - refused.start()) < 80:
+        return message[:200]
+    return None
 
 
 # ------------------------------------------------------------------- output

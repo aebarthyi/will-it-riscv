@@ -27,9 +27,11 @@ to a temporary directory, and never runs the compiler on the project itself.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -122,6 +124,18 @@ class PseudoBuild:
     """What each package's Find module looked for in the last round, keyed
     by package: ``(command, variable, names)``. How a suspect gets stubbed
     exactly the way its own module searches for it."""
+    searches: list = field(default_factory=list)
+    """``(command, variable, names)``: every find_library, find_path,
+    find_file and find_program this round, whoever ran it -- the project's
+    own ``find_program(EXE_SQLITE3 sqlite3)`` included."""
+    exists: list = field(default_factory=list)
+    """``(path, module)``: files an ``if(EXISTS)`` asked about, and the
+    .cmake file asking -- FindArmadillo checks for its version header
+    before it reads one."""
+    reads: list = field(default_factory=list)
+    """``(file, regex)``: what the configure grepped files for, this round --
+    ``file(STRINGS ... REGEX)``, and ``string(REGEX ...)`` on what a stub
+    header said. A stub that does not match is given a line that does."""
     experiments: list = field(default_factory=list)
     """Suspects stubbed to find what a configure died of when it did not
     say, as ``(name, confirmed)``. Confirmed means the error moved once the
@@ -197,7 +211,8 @@ _MISSING_FILE = re.compile(
 )
 _STATUS_FOUND = re.compile(r"^-- +Found ([A-Za-z0-9_.+-]+)", re.MULTILINE)
 _STATUS_FOUND_AT = re.compile(r"^-- +Found ([A-Za-z0-9_.+-]+): +(\S+)", re.MULTILINE)
-_ANY_MISS = re.compile(r"Could NOT find ([A-Za-z0-9_.+-]+)")
+#: FPHSA's two ways of saying so; the second is its HANDLE_COMPONENTS failure.
+_ANY_MISS = re.compile(r"(?:Could NOT find|Failed to find all) ([A-Za-z0-9_.+-]+)")
 #: pkg_check_modules(... REQUIRED) lists what it could not find, one per line.
 _PKG_REQUIRED = "required packages were not found"
 _PKG_MODULE = re.compile(r"^\s+-\s+([A-Za-z0-9_.+-]+)")
@@ -218,8 +233,15 @@ _REQUIRED_FIND = re.compile(
     r"Could not find ([A-Za-z_][A-Za-z0-9_]*) using the following names:\s*([^\n]+)"
 )
 #: find_package(Boost 1.70 CONFIG REQUIRED), and nothing to find: cantera's.
-_NO_CONFIG = re.compile(r'Could not find a package configuration file provided by\s+"([^"]+)"')
+_NO_CONFIG = re.compile(
+    r'(?:Could not find|to find) a package configuration file provided by\s+"([^"]+)"'
+)
+#: FPHSA's CONFIG_MODE way of saying the same.
+_NEITHER_CONFIG = re.compile(r"found neither ([A-Za-z0-9_+-]+)Config\.cmake nor")
+#: The files it searched for, as CMake lists them under "the following names".
+_CONFIG_NAMES = re.compile(r"^\s+([A-Za-z0-9_+.-]+?)(?:Config|-config)\.cmake\s*$", re.MULTILINE)
 _UNKNOWN_COMMAND = re.compile(r'Unknown CMake command "([A-Za-z_][A-Za-z0-9_]*)"')
+_MISSING_MODULE = re.compile(r"include could not find requested file:\s+(\S+)")
 #: An error raised from inside a package's own Find module or config file is
 #: that package's error, even when its message never names it.
 _ERROR_FILE = re.compile(r"^\s*CMake Error at (\S+?):\d+")
@@ -234,7 +256,8 @@ _TARGET_NOT_FOUND = re.compile(
 #: A header a check could not find, named in the configure's own error.
 _HEADER_NAME = re.compile(r"(?<![\w/.])([A-Za-z0-9_+-][A-Za-z0-9_+./-]*\.(?:h|hpp|hh|hxx))\b")
 _HEADER_MISSING = re.compile(
-    r"not found|cannot find|could not find|missing|no such file|not exist", re.IGNORECASE
+    r"not found|cannot find|could not find|missing|no such file|not exist|not be found",
+    re.IGNORECASE,
 )
 
 
@@ -288,6 +311,12 @@ def _stanza_blockers(stanza: str) -> list[str]:
         first = match.group(2).split(",")[0].strip()
         names.append(first or match.group(1))
     names += _NO_CONFIG.findall(re.sub(r"\s+", " ", stanza))
+    names += _NEITHER_CONFIG.findall(re.sub(r"\s+", " ", stanza))
+    names += _NO_FIND_MODULE.findall(re.sub(r"\s+", " ", stanza))
+    # "RAJA_DIR was not provided": RAJA. "set MPI_BASE_DIR": MPI. A _PATH or
+    # _HOME is a place, not a package: TRITON_CACHE_PATH.
+    names += [_variable_package(v) for v in _named_variables(stanza)
+              if re.search(r"_(DIR|ROOT)$", v)]
     for command in _UNKNOWN_COMMAND.findall(stanza):
         # nanobind_add_module is nanobind's: its config defines it.
         names.append(command.split("_", 1)[0] if "_" in command else command)
@@ -333,7 +362,9 @@ def _raised_by(stanza: str) -> Optional[str]:
     module = _MODULE_FILE.search(match.group(1))
     if not module:
         return None
-    return module.group(1) or module.group(2)
+    name = module.group(1) or module.group(2)
+    # FPHSA raises every Find module's failure from its own file.
+    return None if name in ("PackageHandleStandardArgs", "PackageMessage") else name
 
 
 def _missing_headers(stanza: str) -> list[str]:
@@ -385,10 +416,13 @@ def _read_outcomes(text: str) -> tuple[set, set, list]:
 LOOKUP_COMMANDS = {
     "find_library", "find_path", "find_file", "pkg_check_modules", "pkg_search_module",
 }
+_SEARCH_COMMANDS = ("find_library", "find_path", "find_file", "find_program")
 
 
 def _parse_trace(
-    path: Path, root: Optional[Path] = None, lookups: Optional[dict] = None
+    path: Path, root: Optional[Path] = None, lookups: Optional[dict] = None,
+    reads: Optional[list] = None, exists: Optional[list] = None,
+    searches: Optional[list] = None,
 ) -> tuple[dict[str, Probe], int]:
     """Every dependency question in the trace, and who asked it.
 
@@ -403,6 +437,7 @@ def _parse_trace(
     stack: list[dict] = []
     wrappers: set[str] = set()
     prefixes = _prefixes(root)
+    last_read: list = []   # the file the last file(READ) read
     try:
         handle = path.open(encoding="utf-8", errors="replace")
     except OSError:
@@ -434,6 +469,25 @@ def _parse_trace(
                 defined = event.get("args") or []
                 if defined and _inside(str(event.get("file", "")), prefixes):
                     wrappers.add(str(defined[0]).lower())
+                continue
+            if searches is not None and command in _SEARCH_COMMANDS:
+                found_args = [str(a) for a in event.get("args", []) if str(a).strip()]
+                if len(found_args) > 1:
+                    entry = (command, found_args[0], tuple(_lookup_names(found_args[1:])))
+                    if entry[2] and entry not in searches:
+                        searches.append(entry)
+            if command in ("if", "elseif"):
+                args = [str(a) for a in event.get("args", [])]
+                for at, word in enumerate(args[:-1]):
+                    if word == "EXISTS" and exists is not None:
+                        exists.append((args[at + 1], str(event.get("file", ""))))
+                    elif word == "MATCHES" and reads is not None:
+                        # FindHDF5: if("${HDF5_VERSION_DEFINE}" MATCHES "H5_VERSION ...")
+                        _note_read("if", ["MATCHES", args[at + 1], args[at - 1] if at else ""],
+                                   reads, last_read)
+                continue
+            if reads is not None and command in ("file", "string"):
+                _note_read(command, [str(a) for a in event.get("args", [])], reads, last_read)
                 continue
             if command not in FIND_COMMANDS and command not in LOOKUP_COMMANDS:
                 continue
@@ -474,6 +528,52 @@ def _parse_trace(
     return probes, traced
 
 
+#: What every stub header starts with, so a regex run over one is known.
+STUB_MARK = "stub emitted by will-it-riscv"
+
+
+#: How many trace events after reading a file a string(REGEX) is still taken
+#: to be parsing what it read.
+_READ_REACH = 40
+
+
+def _note_read(command: str, args: list[str], reads: list, last_read: list) -> None:
+    """Record a grep of a file: which file, and for what.
+
+    ``file(STRINGS ... REGEX)`` names both. A ``string(REGEX ...)`` soon
+    after a ``file(READ)`` or ``file(STRINGS)`` is taken to be parsing what
+    was read when it is over a stub's text, or looks for a version or a
+    ``#define`` -- FindArmadillo greps every ARMA_VERSION_ line, then takes
+    MAJOR, MINOR and PATCH apart from those lines with REPLACE.
+    """
+    word = [a.upper() for a in args[:2]]
+    if last_read:
+        last_read[1] += 1
+    if command == "file" and word[:1] in (["READ"], ["STRINGS"]) and len(args) > 1:
+        last_read[:] = [args[1], 0]
+        if word[0] == "STRINGS" and "REGEX" in args[2:]:
+            at = args.index("REGEX", 2)
+            if at + 1 < len(args):
+                reads.append((args[1], args[at + 1]))
+    elif (command == "string" and word[:1] == ["REGEX"] and len(args) > 3
+          or command == "if") and last_read:
+        # string(REGEX MATCH <rx> <out> <input>...), REPLACE has <replacement> too;
+        # if(<input> MATCHES <rx>) arrives as ["MATCHES", <rx>, <input>].
+        if command == "if":
+            given, regex = args[2:], args[1]
+        elif word[1] in ("MATCH", "MATCHALL"):
+            given, regex = args[4:], args[2]
+        elif word[1] == "REPLACE":
+            given, regex = args[5:], args[2]
+        else:
+            return
+        parsing = any(STUB_MARK in a for a in given) or (
+            last_read[1] <= _READ_REACH and re.search(r"version|#define", regex, re.IGNORECASE)
+        )
+        if parsing and (last_read[0], regex) not in reads:
+            reads.append((last_read[0], regex))
+
+
 def _prefixes(root: Optional[Path]) -> tuple[str, ...]:
     if root is None:
         return ()
@@ -495,9 +595,13 @@ def _owner(ancestors: list) -> Optional[str]:
 
 
 def _lookup_names(args: list[str]) -> list[str]:
-    """The file or module names a lookup was after, up to its first keyword."""
+    """The file or module names a lookup was after, up to its first keyword.
+
+    A list variable arrives as one argument -- FindZLIB's NAMES ${ZLIB_NAMES}
+    is "z;zlib;zdll;zlib1;..." -- so arguments are split on semicolons.
+    """
     names: list[str] = []
-    for arg in args:
+    for arg in [part for given in args for part in given.split(";")]:
         upper = arg.upper()
         if upper in _STOP_KEYWORDS:
             break
@@ -617,7 +721,7 @@ def run(
     root: Path,
     timeout: int = TIMEOUT_SECONDS,
     deny_pkg_config: bool = True,
-    max_rounds: int = 20,
+    max_rounds: int = 30,
     arch: str = "riscv64",
     confine: bool = True,
     defines: Optional[dict] = None,
@@ -648,10 +752,12 @@ def run(
 
     started = time.monotonic()
     aggregate = PseudoBuild(rounds=0)
+    negotiation = _NEGOTIATED.set({})
     overrides: dict[str, str] = {}
     written: set = set()
     trial: Optional[_Trial] = None
     tried: set = set()
+    answered: set = set()   # (file, regex) given a matching line already
     fixed = {str(k): str(v) for k, v in (defines or {}).items()}
 
     with tempfile.TemporaryDirectory(prefix="will-it-riscv-") as scratch:
@@ -722,21 +828,46 @@ def run(
                 # the previous round died of. If not, it was innocent: take
                 # every trace of it back out, or later rounds would find it.
                 if outcome.completed or _signature(outcome.error) != trial.signature:
-                    if trial.name not in aggregate.blockers:
-                        aggregate.blockers.append(trial.name)
+                    for name in (trial.name, *trial.also):
+                        if name not in aggregate.blockers:
+                            aggregate.blockers.append(name)
+                        aggregate.experiments.append((name, True))
                     aggregate.round_blockers[-1] = trial.name
-                    aggregate.experiments.append((trial.name, True))
                     tried = set()
+                    trial = None
                 else:
+                    # Not moved yet -- but if its stubs are still being
+                    # finished (a version grep to answer, a version header to
+                    # write), give it the round that takes before judging.
+                    stanzas = _error_stanzas(outcome.narration)
+                    pending = _answer_reads(outcome.reads, sysroot, answered,
+                                            stanzas[0] if stanzas else "")
+                    made = _version_headers(outcome, sysroot, [trial.name, *trial.also])
+                    if trial.prefix:
+                        for search in outcome.searches:
+                            if search[1].startswith(trial.prefix) and search[1] not in overrides \
+                                    and search[2]:
+                                more, files = _stub_search(
+                                    search, sysroot, ".so" if toolchain else _library_suffix())
+                                overrides.update(more)
+                                trial.overrides.update(more)
+                                made += files
+                                pending += list(more)
+                    if (pending or made) and trial.extended < 3:
+                        trial.extended += 1
+                        trial.files += [m for m in made if m not in trial.files]
+                        written.update(pending + made)
+                        continue
                     for key in trial.overrides:
                         overrides.pop(key, None)
                     for path in trial.files:
                         Path(path).unlink(missing_ok=True)
                         written.discard(path)
-                    aggregate.experiments.append((trial.name, False))
+                    for name in (trial.name, *trial.also):
+                        aggregate.experiments.append((name, False))
                     outcome.narration = trial.narration
                     aggregate.unblocked = sorted(overrides)
-                trial = None
+                    trial = None
 
             if outcome.completed:
                 aggregate.error = None
@@ -758,6 +889,12 @@ def run(
                 shared_suffix=suffix, lookups=outcome.lookups,
                 interpreter=str(interpreter.executable),
             )
+            stanzas = _error_stanzas(outcome.narration)
+            for changed in _answer_reads(outcome.reads, sysroot, answered,
+                                         stanzas[0] if stanzas else ""):
+                created.append(changed)
+            created += _version_headers(outcome, sysroot, aggregate.blockers)
+            created += _negotiate(outcome.narration, sysroot, answered, written)
             imported = interpreter.provide()
             if imported and aggregate.round_blockers[-1] is None:
                 # Nothing CMake looked for stopped it: its own interpreter
@@ -785,7 +922,8 @@ def run(
                 # The configure died without naming anything this can fake.
                 # Blame by experiment: stub the likeliest suspect and see.
                 trial = _next_trial(
-                    outcome, tried, aggregate.blockers, overrides, sysroot, suffix
+                    outcome, tried, aggregate.blockers, overrides, sysroot, suffix,
+                    str(interpreter.executable),
                 )
                 if trial is None:
                     break   # nothing left to try; the configure is stuck here
@@ -803,6 +941,7 @@ def run(
         aggregate.python_installed = list(interpreter.installed)
         aggregate.python_stubbed = list(interpreter.stubbed)
 
+    _NEGOTIATED.reset(negotiation)
     aggregate.blocking = aggregate.blockers[0] if aggregate.blockers else None
     # A blocker that a later round walked past is still a hard requirement,
     # but it no longer stops anything -- and it was "found" only because a
@@ -866,6 +1005,16 @@ class _Trial:
     narration: str
     """The stuck round's narration, to pick the next suspect from if this
     one turns out to be innocent."""
+    extended: int = 0
+    """Rounds it was given beyond the first, while its stubs were still being
+    finished: FindZLIB greps the zlib.h it was just given for its version."""
+    prefix: Optional[str] = None
+    """For lookups the error named: the variable prefix whose later lookups
+    are its too -- mlpack looks for ARMADILLO_LIBRARY once it has the header."""
+    also: list = field(default_factory=list)
+    """Stubbed with it and blamed with it: the other dependencies a refused
+    package's own module asked for (FindX11's Xft wants Freetype and
+    Fontconfig both)."""
 
 
 def _signature(error: Optional[str]) -> str:
@@ -877,9 +1026,18 @@ def _signature(error: Optional[str]) -> str:
 
 
 def _mentions(message: str, name: str) -> bool:
-    """Whether an error message names this package, as itself or as a lib."""
-    pattern = rf"(?<![a-z0-9])(?:lib)?{re.escape(name.lower())}(?![a-z0-9])"
-    return bool(re.search(pattern, message))
+    """Whether an error message names this package, as itself or as a lib --
+    or without the major version its name carries: "requires Python >= 3.6"
+    names Python3, "Eigen not found" Eigen3."""
+    spellings = [name.lower()]
+    versioned = re.match(r"^([a-z][a-z0-9_+-]*?[a-z])([0-9]+)$", name.lower())
+    if versioned:
+        # "Qt 5.15 was not found" names Qt5; "a valid Qt installation", Qt6 and Qt5.
+        spellings += [f"{versioned.group(1)} {versioned.group(2)}", versioned.group(1)]
+    return any(
+        re.search(rf"(?<![a-z0-9])(?:lib)?{re.escape(s)}(?![a-z0-9])", message.lower())
+        for s in spellings
+    )
 
 
 def _suspects(narration: str, probes: Optional[dict] = None) -> list[tuple[str, list[str]]]:
@@ -918,6 +1076,76 @@ def _suspects(narration: str, probes: Optional[dict] = None) -> list[tuple[str, 
     return [(root, grouped[root]) for root in ranked]
 
 
+def _named_searches(narration: str, searches: list) -> list[tuple[str, list]]:
+    """Lookups the error names in its own words: ``find_program(EXE_SQLITE3
+    sqlite3)`` and then "sqlite3 binary not found!", with no package
+    involved. Named by the name the error used, which goes first."""
+    stanzas = _error_stanzas(narration)
+    message = stanzas[0].lower() if stanzas else ""
+    named: list[tuple[str, tuple]] = []
+    seen: set = set()
+    for search in searches:
+        command, variable, names = search
+        if variable.upper().startswith(("CMAKE_", "_CMAKE")):
+            # CMake's own: a stub make program would pass every try_compile,
+            # and an error quoting a try_compile's log always names gmake.
+            continue
+        if re.match(r"^python[0-9.]*$", names[0], re.IGNORECASE):
+            continue   # the interpreter is pinned, and its headers are _stub_python's
+        for name in names:
+            if name.startswith("lib") and command == "find_library" and len(name) > 3:
+                name = name[3:]
+            stem = re.sub(r"[/.].*$", "", name)
+            if stem.lower() in seen or len(stem) < 2:
+                continue
+            if _mentions(message, stem) or _mentions(message, variable):
+                seen.add(stem.lower())
+                # Stubbed as the name the error used: pocl's llvm-config, not llvmtce-config.
+                first = (command, variable, (name, *[n for n in names if n != name]))
+                named.append((stem, [first]))
+                break
+    # mlpack's own find_armadillo looks for ARMADILLO_INCLUDE_DIR and then
+    # ARMADILLO_LIBRARY: the lookups of one prefix are stubbed together.
+    for _, group in named:
+        prefix = group[0][1].split("_", 1)[0] + "_"
+        if len(prefix) > 2:
+            group += [s for s in searches if s[1].startswith(prefix) and s[1] != group[0][1]
+                      and s[2] and not s[1].upper().startswith(("CMAKE_", "_CMAKE"))]
+    return named
+
+
+def _stub_search(search: tuple, sysroot: Path, suffix: str) -> tuple[dict, list]:
+    """Fill a lookup's own variable with a stub of what it looked for."""
+    command, variable, names = search
+    name = names[0]
+    try:
+        # Only what this made is the trial's to take back out.
+        if command == "find_library":
+            base = name[3:] if name.startswith("lib") and len(name) > 3 else name
+            path = sysroot / "lib" / f"lib{base}{suffix}"
+            made = [] if path.exists() else [str(path)]
+            path.touch()
+            return {variable: str(path)}, made
+        if command == "find_program":
+            path = sysroot / "bin" / Path(name).name
+            made = [] if path.exists() else [str(path)]
+            if made:
+                path.write_text(_fake_program(path.name, sysroot.parent))
+                path.chmod(0o755)
+            return {variable: str(path)}, made
+        path = sysroot / "include" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        made = [] if path.exists() else [str(path)]
+        if made:
+            path.write_text(_fake_header(Path(name).stem))
+        value = str(path) if command == "find_file" else str(path.parent)
+        if command == "find_path" and "/" in name:
+            value = str(sysroot / "include")   # find_path(... openssl/ssl.h) gives the root
+        return {variable: value}, made
+    except OSError:
+        return {}, []
+
+
 def _next_trial(
     outcome: PseudoBuild,
     tried: set,
@@ -925,14 +1153,55 @@ def _next_trial(
     overrides: dict,
     sysroot: Path,
     suffix: str,
+    interpreter: Optional[str] = None,
 ) -> Optional[_Trial]:
     if len(tried) >= MAX_SUSPECTS:
         return None
-    for name, details in _suspects(outcome.narration, outcome.probes):
+    suspects = _suspects(outcome.narration, outcome.probes)
+    stanzas = _error_stanzas(outcome.narration)
+    message = stanzas[0].lower() if stanzas else ""
+    # Packages the error names, then lookups it names, then the other misses.
+    named = [(n, d, None) for n, d in suspects if _mentions(message, n)]
+    rest = [(n, d, None) for n, d in suspects if not _mentions(message, n)]
+    searched = [(n, [], group) for n, group in _named_searches(outcome.narration,
+                                                               outcome.searches)]
+    for name, details, search in named + searched:
+        if name in tried or name in blockers or name in outcome.found:
+            continue
+        prefix = None
+        if search is not None:
+            stubbed, files = {}, []
+            for one in search:
+                more, made = _stub_search(one, sysroot, suffix)
+                stubbed.update(more)
+                files += made
+            prefix = search[0][1].split("_", 1)[0] + "_"
+        else:
+            stubbed, files = _stub_package(
+                name, details, sysroot, suffix, outcome.lookups.get(name.lower(), []),
+                interpreter,
+            )
+        stubbed = {k: v for k, v in stubbed.items() if overrides.get(k) != v}
+        if not stubbed and not files:
+            tried.add(name)
+            continue
+        return _Trial(
+            name=name,
+            signature=_signature(outcome.error),
+            overrides=stubbed,
+            files=files,
+            narration=outcome.narration,
+            prefix=prefix if prefix and len(prefix) > 2 else None,
+        )
+    group = _nested_trial(outcome, stanzas[0] if stanzas else "", tried, blockers, overrides,
+                          sysroot, suffix)
+    if group is not None:
+        return group
+    for name, details, _ in rest:
         if name in tried or name in blockers or name in outcome.found:
             continue
         stubbed, files = _stub_package(
-            name, details, sysroot, suffix, outcome.lookups.get(name.lower(), [])
+            name, details, sysroot, suffix, outcome.lookups.get(name.lower(), []), interpreter,
         )
         stubbed = {k: v for k, v in stubbed.items() if overrides.get(k) != v}
         if not stubbed and not files:
@@ -948,10 +1217,54 @@ def _next_trial(
     return None
 
 
+def _nested_trial(
+    outcome: PseudoBuild, stanza: str, tried: set, blockers: list, overrides: dict,
+    sysroot: Path, suffix: str,
+) -> Optional[_Trial]:
+    """Every package a refused package's own module asked for, stubbed together.
+
+    "Could NOT find X11 (missing: Xft)" with Xft's header and library both
+    there: FindX11 counts Xft found only if Freetype and Fontconfig are,
+    and asks for them QUIET, so nothing names them. One at a time, neither
+    moves the error.
+    """
+    refused = {m.lower() for m in _ANY_MISS.findall(stanza)}
+    nested = [
+        probe.name for probe in outcome.probes.values()
+        if probe.command == "find_package" and probe.parent
+        and probe.parent.lower() in refused and probe.name.lower() not in refused
+        and probe.name not in tried and probe.name not in blockers
+    ]
+    nested = list(dict.fromkeys(nested))
+    if not nested:
+        return None
+    stubbed: dict = {}
+    files: list = []
+    for name in nested:
+        more, made = _stub_package(name, [], sysroot, suffix, outcome.lookups.get(name.lower(), []))
+        stubbed.update(more)
+        files += made
+        tried.add(name)
+    stubbed = {k: v for k, v in stubbed.items() if overrides.get(k) != v}
+    if not stubbed and not files:
+        return None
+    return _Trial(
+        name=nested[0], also=nested[1:], signature=_signature(outcome.error),
+        overrides=stubbed, files=files, narration=outcome.narration,
+    )
+
+
 def _stub_package(
-    name: str, details: list[str], sysroot: Path, suffix: str, lookups: Optional[list] = None
+    name: str, details: list[str], sysroot: Path, suffix: str, lookups: Optional[list] = None,
+    interpreter: Optional[str] = None,
 ) -> tuple[dict, list]:
     """Make a package the configure shrugged off exist after all."""
+    if name.lower() in _PYTHON_PACKAGES:
+        return _stub_python("", sysroot, suffix, interpreter)
+    if name.lower() == "boost":
+        # As when FPHSA names it: FindBoost defers to a BoostConfig.cmake.
+        files = _stub_config_package("Boost", sysroot, suffix)
+        return {"Boost_DIR": str(sysroot / "lib" / "cmake" / "Boost")}, files
     if name.lower() == "openmp":
         return _stub_openmp(sysroot, suffix)
     if name.lower() == "mpi":
@@ -975,8 +1288,12 @@ def _stub_package(
             overrides[token] = value
             if value.startswith(str(sysroot)) and Path(value).is_file():
                 files.append(value)
-    if wants_config:
+    if wants_config or not (overrides or files):
+        # Nothing of its own module's to put in place: a config package then,
+        # as paraview's find_package(Qt6 QUIET COMPONENTS Core) looks for.
         files += _stub_config_package(name, sysroot, suffix)
+        if files:
+            overrides[f"{name}_DIR"] = str(sysroot / "lib" / "cmake" / name)
     return overrides, files
 
 
@@ -1025,14 +1342,30 @@ def _stub_config_package(name: str, sysroot: Path, suffix: str) -> list[str]:
         return []
     directory = sysroot / "lib" / "cmake" / name
     library = sysroot / "lib" / f"lib{name.lower()}{suffix}"
-    major, minor, patch = FAKE_VERSION
-    lines = [f"# stub emitted by will-it-riscv for {name}", f"set({name}_FOUND TRUE)"]
+    major, minor, patch = _fake_version(name)
+    dotted = f"{major}.{minor}.{patch}"
+    modules = _modules_directory(sysroot).as_posix()
+    lines = [
+        f"# stub emitted by will-it-riscv for {name}", f"set({name}_FOUND TRUE)",
+        # A package that ships CMake modules puts them on the path, or says
+        # where they are: ECM_MODULE_PATH, which KDE projects set it from.
+        f'list(APPEND CMAKE_MODULE_PATH "{modules}")',
+    ]
+    use_file = _modules_directory(sysroot) / f"Use{name}.cmake"
     for prefix in dict.fromkeys([name, name.upper()]):
         lines += [
-            f'set({prefix}_VERSION "{FAKE_VERSION_STRING}")',
+            f'set({prefix}_MODULE_PATH "{modules}")',
+            # include(${Geant4_USE_FILE}), as VTK, ITK and ROOT have it too.
+            f'set({prefix}_USE_FILE "{use_file.as_posix()}")',
+            f'set({prefix}_VERSION "{dotted}")',
             f"set({prefix}_VERSION_MAJOR {major})",
             f"set({prefix}_VERSION_MINOR {minor})",
             f"set({prefix}_VERSION_PATCH {patch})",
+            # CGAL_MAJOR_VERSION and CGAL_BUGFIX_VERSION, as CGAL spells them.
+            f"set({prefix}_MAJOR_VERSION {major})",
+            f"set({prefix}_MINOR_VERSION {minor})",
+            f"set({prefix}_PATCH_VERSION {patch})",
+            f"set({prefix}_BUGFIX_VERSION {patch})",
             f'set({prefix}_INCLUDE_DIRS "{sysroot.as_posix()}/include")',
             f'set({prefix}_INCLUDE_DIR "{sysroot.as_posix()}/include")',
             f'set({prefix}_LIBRARIES "{library.as_posix()}")',
@@ -1058,6 +1391,9 @@ def _stub_config_package(name: str, sysroot: Path, suffix: str) -> list[str]:
     lines += [
         f"foreach(_stub_component IN LISTS {name}_FIND_COMPONENTS)",
         f"  set({name}_${{_stub_component}}_FOUND TRUE)",
+        # Qt6's components are packages of their own: Qt6Core_VERSION.
+        f"  set({name}${{_stub_component}}_FOUND TRUE)",
+        f'  set({name}${{_stub_component}}_VERSION "{dotted}")',
         "  string(TOUPPER \"${_stub_component}\" _stub_upper)",
         f'  set({name}_${{_stub_upper}}_FOUND TRUE)',
         f'  set({name}_${{_stub_upper}}_LIBRARY "{library.as_posix()}")',
@@ -1068,20 +1404,96 @@ def _stub_config_package(name: str, sysroot: Path, suffix: str) -> list[str]:
         "  endif()",
         "endforeach()",
     ]
+    qt = re.match(r"^Qt([56])$", name)
+    if qt:
+        lines += _qt_lines(name, qt.group(1), dotted, sysroot)
+    if name.lower() == "llvm":
+        lines += _llvm_lines(dotted, sysroot)
     config = directory / f"{name}Config.cmake"
     version = directory / f"{name}ConfigVersion.cmake"
     try:
         directory.mkdir(parents=True, exist_ok=True)
+        use_file.parent.mkdir(parents=True, exist_ok=True)
+        if not use_file.exists():
+            use_file.write_text(f"# stub emitted by will-it-riscv: {name}'s use file\n")
         library.touch()
         config.write_text("\n".join(lines) + "\n")
+        # find_package(Hwloc) never looks for HWLOCConfig.cmake, but every
+        # spelling looks for hwloc-config.cmake.
+        lower = directory / f"{name.lower()}-config.cmake"
+        if lower.name != config.name and not lower.exists():
+            lower.write_text(f'include("${{CMAKE_CURRENT_LIST_DIR}}/{config.name}")\n')
+            (directory / f"{name.lower()}-config-version.cmake").write_text(
+                f'include("${{CMAKE_CURRENT_LIST_DIR}}/{version.name}")\n')
         version.write_text(
-            f'set(PACKAGE_VERSION "{FAKE_VERSION_STRING}")\n'
+            f'set(PACKAGE_VERSION "{dotted}")\n'
             "set(PACKAGE_VERSION_COMPATIBLE TRUE)\n"
             "set(PACKAGE_VERSION_EXACT FALSE)\n"
         )
     except OSError:
         return []
     return [str(config), str(version), str(library)]
+
+
+#: The tools a Qt build runs, as targets: AUTORCC wants Qt5::rcc, and KDAB's
+#: QtInstallPaths asks Qt::qmake where Qt is.
+_QT_TOOLS = ("qmake", "moc", "rcc", "uic", "lrelease", "lupdate", "qmlcachegen")
+
+
+def _qt_lines(name: str, major: str, dotted: str, sysroot: Path) -> list[str]:
+    """What a Qt5Config or Qt6Config says beyond any package's stub."""
+    bin_dir = sysroot / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"set(QT_VERSION_MAJOR {major})", f'set(QT_VERSION "{dotted}")',
+        f"set(QT_DEFAULT_MAJOR_VERSION {major})",
+        f"set(Qt_VERSION_MAJOR {major})",
+    ]
+    for tool in _QT_TOOLS:
+        program = bin_dir / tool
+        if not program.exists():
+            program.write_text(_fake_program(tool, sysroot.parent, dotted))
+            program.chmod(0o755)
+        for namespace in dict.fromkeys([name, f"Qt{major}", "Qt"]):
+            target = f"{namespace}::{tool}"
+            lines += [f"if(NOT TARGET {target})",
+                      f"  add_executable({target} IMPORTED)",
+                      f'  set_target_properties({target} PROPERTIES IMPORTED_LOCATION '
+                      f'"{program.as_posix()}")',
+                      "endif()"]
+    # Versionless component targets, Qt::Core for Qt6::Core.
+    lines += [
+        f"foreach(_stub_component IN LISTS {name}_FIND_COMPONENTS)",
+        "  if(NOT TARGET Qt::${_stub_component})",
+        "    add_library(Qt::${_stub_component} INTERFACE IMPORTED)",
+        f"    set_target_properties(Qt::${{_stub_component}} PROPERTIES "
+        f"INTERFACE_LINK_LIBRARIES {name}::${{_stub_component}})",
+        "  endif()",
+        "endforeach()",
+    ]
+    return lines
+
+
+def _llvm_lines(dotted: str, sysroot: Path) -> list[str]:
+    """What an LLVMConfig says beyond any package's stub: where its tools are."""
+    bin_dir = sysroot / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    tool = bin_dir / "llvm-config"
+    if not tool.exists():
+        tool.write_text(_fake_program("llvm-config", sysroot.parent))
+        tool.chmod(0o755)
+    root = sysroot.as_posix()
+    return [
+        f'set(LLVM_PACKAGE_VERSION "{dotted}")',
+        f'set(LLVM_TOOLS_BINARY_DIR "{root}/bin")',
+        f'set(LLVM_INCLUDE_DIRS "{root}/include")',
+        f'set(LLVM_LIBRARY_DIRS "{root}/lib")',
+        f'set(LLVM_CMAKE_DIR "{root}/lib/cmake/LLVM")',
+        'set(LLVM_DEFINITIONS "")',
+        "set(LLVM_TARGETS_TO_BUILD RISCV)",
+        "set(LLVM_ENABLE_RTTI ON)",
+        "set(LLVM_LINK_LLVM_DYLIB ON)",
+    ]
 
 
 def _add_imported_target(config: Path, target: str, sysroot: Path, suffix: str) -> bool:
@@ -1246,9 +1658,109 @@ function({command} name)
     file(WRITE "${{CMAKE_CURRENT_BINARY_DIR}}/${{name}}_wir_stub.c" "")
     set(_wir_sources "${{CMAKE_CURRENT_BINARY_DIR}}/${{name}}_wir_stub.c")
   endif()
-  add_library(${{name}} MODULE ${{_wir_sources}})
+  add_library(${{name}} {kind} ${{_wir_sources}})
 endfunction()
 """
+
+
+_DEFERRED_TARGETS = """\
+# stub emitted by will-it-riscv: targets the build links that nothing it found
+# defines. Made once the top directory is done, so a real one always comes first.
+cmake_language(DEFER DIRECTORY "${{CMAKE_SOURCE_DIR}}" CALL _wir_deferred_targets)
+function(_wir_deferred_targets)
+  foreach(_wir_target IN ITEMS {targets})
+    if(NOT TARGET ${{_wir_target}})
+      add_library(${{_wir_target}} INTERFACE IMPORTED GLOBAL)
+    endif()
+  endforeach()
+endfunction()
+"""
+
+
+_NO_FIND_MODULE = re.compile(r'No "Find([A-Za-z0-9_+-]+)\.cmake" found in CMAKE_MODULE_PATH')
+#: An install location an error tells you to set, and the words telling you.
+_LOCATION_VARIABLE = re.compile(
+    # Not a module's own: FindMPI's _MPI_BASE_DIR is nobody's to set.
+    r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)*_(?:DIR|ROOT|PATH|HOME))\b"
+)
+_TELLS_YOU = re.compile(
+    r"not provided|not set|not defined|must (?:be )?(?:set|specif|provid)|please (?:set|"
+    r"specify|provide|define)|needs? expli?ci?t|specify (?:the )?path|you (?:may )?need to set"
+    r"|(?:are|is) provided",
+    re.IGNORECASE,
+)
+
+
+def _variable_package(variable: str) -> str:
+    """The package an install-location variable is for: MPI_BASE_DIR is MPI's."""
+    stem = re.sub(r"_(DIR|ROOT|PATH|HOME)$", "", variable)
+    return re.sub(r"_(BASE|INSTALL|PREFIX|TOP|INSTALL_ROOT)$", "", stem, flags=re.IGNORECASE)
+
+
+def _named_variables(stanza: str) -> list[str]:
+    flat = re.sub(r"\s+", " ", stanza)
+    if not _TELLS_YOU.search(flat):
+        return []
+    return [
+        v for v in dict.fromkeys(_LOCATION_VARIABLE.findall(flat))
+        if not v.upper().startswith(("CMAKE_", "_CMAKE", "ENV_"))
+    ]
+
+
+def _stub_named_variable(
+    variable: str, sysroot: Path, suffix: str,
+) -> tuple[Optional[str], list]:
+    """The sysroot as the install the variable names. A ``<Pkg>_DIR`` is read
+    both ways -- the directory of PkgConfig.cmake, or an install prefix -- so
+    the sysroot gets a config at its top that leads to the package's stub."""
+    if not variable.upper().endswith("_DIR") or _variable_package(variable) != variable[:-4]:
+        return str(sysroot), []   # an install prefix: MPI_BASE_DIR, HWLOC_ROOT
+    name = variable[:-4]
+    files = _stub_config_package(name, sysroot, suffix)
+    config = sysroot / "lib" / "cmake" / name / f"{name}Config.cmake"
+    top = sysroot / f"{name.lower()}-config.cmake"
+    if config.exists() and not top.exists():
+        top.write_text(f'include("{config.as_posix()}")\n')
+        files.append(str(top))
+    return str(sysroot), files
+
+
+def _modules_directory(sysroot: Path) -> Path:
+    """Where modules a stubbed package would ship are written, on CMAKE_MODULE_PATH."""
+    return sysroot / "lib" / "cmake" / "will-it-riscv-modules"
+
+
+def _module_file(module: str, sysroot: Path) -> Optional[Path]:
+    if "/" not in module:
+        name = module if module.endswith(".cmake") else f"{module}.cmake"
+        return _modules_directory(sysroot) / name
+    path = Path(module)
+    return path if str(path).startswith(str(sysroot) + "/") else None
+
+
+def _includes_directory(sysroot: Path) -> Path:
+    return sysroot / "lib" / "cmake" / "will-it-riscv-commands"
+
+
+def _top_level_includes(sysroot: Path) -> list[str]:
+    """Every stub file that goes in at the first project()."""
+    return sorted(str(p) for p in _includes_directory(sysroot).glob("*.cmake"))
+
+
+def _targets_file(sysroot: Path) -> Path:
+    return _includes_directory(sysroot) / "zz-deferred-targets.cmake"
+
+
+def _defer_target(target: str, sysroot: Path) -> bool:
+    """Add a target to those made at the end of the top directory; False if it was."""
+    path = _targets_file(sysroot)
+    found = re.search(r"IN ITEMS (.*)\)\n", path.read_text()) if path.exists() else None
+    targets = found.group(1).split() if found else []
+    if target in targets:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_DEFERRED_TARGETS.format(targets=" ".join([*targets, target])))
+    return True
 
 
 def _stub_commands(commands: list[str], sysroot: Path) -> tuple[list[str], list]:
@@ -1260,7 +1772,7 @@ def _stub_commands(commands: list[str], sysroot: Path) -> tuple[list[str], list]
     no-op. Each is its own file, included at the first project() before
     anything calls it; a real definition loaded later wins.
     """
-    directory = sysroot / "lib" / "cmake" / "will-it-riscv-commands"
+    directory = _includes_directory(sysroot)
     directory.mkdir(parents=True, exist_ok=True)
     created = []
     for command in commands:
@@ -1268,13 +1780,16 @@ def _stub_commands(commands: list[str], sysroot: Path) -> tuple[list[str], list]
         if path.exists():
             continue
         if _MAKES_TARGET.search(command):
-            path.write_text(_COMMAND_STUB.format(command=command))
+            # A Python extension is a module; anything called a library may be
+            # linked into another target, which a module may not (musescore).
+            kind = "MODULE" if re.search(r"(module|extension)$", command) else "STATIC"
+            path.write_text(_COMMAND_STUB.format(command=command, kind=kind))
         else:
             path.write_text(
                 f"function({command})\n  # stub emitted by will-it-riscv\nendfunction()\n"
             )
         created.append(str(path))
-    return sorted(str(p) for p in directory.glob("*.cmake")), created
+    return _top_level_includes(sysroot), created
 
 
 def _stub_mpi(sysroot: Path, suffix: str) -> tuple[dict, list]:
@@ -1336,6 +1851,11 @@ set(CMAKE_CXX_FLAGS_INIT "-isystem {sysroot}/include")
 # The compiler is the host's, so what it builds runs here. CMake 4.1 and later
 # (CMP0190) will not look for an interpreter in a cross build without this.
 set(CMAKE_CROSSCOMPILING_EMULATOR "{emulator}")
+# FortranCInterface_VERIFY links a program of C and Fortran to prove the two
+# compilers agree, and nothing links here; on the target, gcc and gfortran do.
+# A plain variable, since detecting the mangling clears the cached answer.
+set(FortranCInterface_VERIFIED_C 1)
+set(FortranCInterface_VERIFIED_CXX 1)
 """
 
 
@@ -1400,7 +1920,10 @@ def _configure(
         return PseudoBuild(error=f"could not run cmake: {exc}")
 
     lookups: dict = {}
-    probes, traced = _parse_trace(trace, root, lookups)
+    reads: list = []
+    exists: list = []
+    searches: list = []
+    probes, traced = _parse_trace(trace, root, lookups, reads, exists, searches)
     narration = (process.stdout or "") + "\n" + (process.stderr or "")
     found, soft, blockers = _read_outcomes(narration)
     result = PseudoBuild(
@@ -1412,6 +1935,9 @@ def _configure(
         blocking=blockers[0] if blockers else None,
         blockers=blockers,
         lookups=lookups,
+        reads=reads,
+        exists=exists,
+        searches=searches,
     )
     result.narration = narration
     result.found_at = dict(_STATUS_FOUND_AT.findall(narration))
@@ -1425,6 +1951,35 @@ def _configure(
 #: A version no project will consider too old.
 FAKE_VERSION = ("99", "9", "9")
 FAKE_VERSION_STRING = "99.9.9"
+
+#: Debian 13's LLVM. Projects pin LLVM to ranges -- pocl takes 18.1, 19.1 or
+#: 20.1 and nothing else -- so its stub claims a real release.
+LLVM_VERSION = ("19", "1", "7")
+_LLVM_FAMILY = {"llvm", "clang", "mlir", "lld", "polly", "llvm-config"}
+
+#: Versions a configure turned the stub's down for and said what it wanted
+#: instead, this run: package (lower case) to version. Per thread, since the
+#: dataset tool configures several projects at once.
+_NEGOTIATED: contextvars.ContextVar[dict] = contextvars.ContextVar("negotiated")
+
+
+def _negotiated(name: str) -> Optional[str]:
+    return _NEGOTIATED.get({}).get(name.lower())
+
+
+def _fake_version(name: str) -> tuple[str, str, str]:
+    """The version a stub of ``name`` claims: 99.9.9, except that a name
+    ending in its major version -- Qt6, Qt5, Eigen3, SDL2, Gtk3 -- keeps it.
+    ``find_package(QT NAMES Qt6 Qt5)`` takes QT_VERSION_MAJOR from the
+    version found, and goes on to find_package(Qt${QT_VERSION_MAJOR})."""
+    wanted = _negotiated(name)
+    if wanted:
+        parts = (wanted.split(".") + ["0", "0"])[:3]
+        return parts[0], parts[1], parts[2]
+    if name.lower() in _LLVM_FAMILY:
+        return LLVM_VERSION
+    found = re.match(r"^[A-Za-z]+([0-9])$", name)
+    return (found.group(1), "99", "9") if found else FAKE_VERSION
 
 _LIBRARY_VAR = re.compile(r"_(LIBRARY|LIBRARIES|LIB|LIBS)(_[A-Z]+)?$", re.IGNORECASE)
 _INCLUDE_VAR = re.compile(r"_(INCLUDE_DIR|INCLUDE_DIRS|INCLUDEDIR|INCLUDE)$", re.IGNORECASE)
@@ -1451,7 +2006,7 @@ def _fake_header(name: str) -> str:
     below 6.3, so an empty file gets past find_path and then fails.
     """
     stem = re.sub(r"[^A-Za-z0-9]", "_", name).upper().strip("_")
-    major, minor, patch = FAKE_VERSION
+    major, minor, patch = _fake_version(name)
     lines = [f"/* stub emitted by will-it-riscv for {name} */"]
     if stem == "BOOST" or name.endswith("boost/version.hpp"):
         # FindBoost reads one packed number: major * 100000 + minor * 100 + patch.
@@ -1468,10 +2023,118 @@ def _fake_header(name: str) -> str:
             f"#define {prefix}_VERSION_PATCH {patch}",
             f"#define {prefix}_VERSION_MICRO {patch}",
             f"#define {prefix}_VERSION_NUM {major}{minor}{patch}",
-            f'#define {prefix}_VERSION "{FAKE_VERSION_STRING}"',
-            f'#define {prefix}_VERSION_STRING "{FAKE_VERSION_STRING}"',
+            f'#define {prefix}_VERSION "{major}.{minor}.{patch}"',
+            f'#define {prefix}_VERSION_STRING "{major}.{minor}.{patch}"',
         ]
     return "\n".join(lines) + "\n"
+
+
+#: How a few programs say their version, where a Find module reads it with
+#: the words around it. Anything else says the bare number, which is what
+#: FindDoxygen insists on (``^[0-9]+\.[0-9]+\.[0-9]+``).
+_VERSION_LINES = {
+    "git": "git version {}",
+    "cython": "Cython version {}",
+    "swig": "SWIG Version {}",
+    "bison": "bison (GNU Bison) {}",
+    "flex": "flex {}",
+}
+
+_PROGRAM_STUB = """\
+#!/bin/sh
+# stub emitted by will-it-riscv for {name}
+if [ $# -eq 1 ]; then
+  case "$1" in
+    --version|-version|-v|-V|version|-dumpversion) echo {version}; exit 0 ;;
+  esac
+fi
+{query}# Asked to write a file -- doxygen -s -g CMakeDoxyfile.tpl, FindDoxygen's
+# first act -- it writes an empty one, inside the scratch directory only.
+take=
+for arg do
+  if [ -n "$take" ]; then
+    case "$arg" in {scratch}/*) : > "$arg" ;; esac
+    take=
+  fi
+  case "$arg" in -g|-o|--output) take=1 ;; esac
+done
+exit 0
+"""
+
+
+#: qmake -query, which a Qt project asks where Qt is installed: everything in the sysroot.
+_QMAKE_QUERY = """\
+if [ "$1" = "-query" ]; then
+  if [ -n "$2" ]; then
+    case "$2" in QT_VERSION) echo {version} ;; *) echo {sysroot} ;; esac
+    exit 0
+  fi
+  for var in QT_INSTALL_PREFIX QT_INSTALL_ARCHDATA QT_INSTALL_DATA QT_INSTALL_DOCS \\
+      QT_INSTALL_HEADERS QT_INSTALL_LIBS QT_INSTALL_LIBEXECS QT_INSTALL_BINS \\
+      QT_INSTALL_TESTS QT_INSTALL_PLUGINS QT_INSTALL_QML QT_INSTALL_TRANSLATIONS \\
+      QT_INSTALL_CONFIGURATION QT_INSTALL_EXAMPLES QT_HOST_PREFIX QT_HOST_DATA \\
+      QT_HOST_BINS QT_HOST_LIBS; do
+    echo "$var:"{sysroot}
+  done
+  echo QT_VERSION:{version}
+  exit 0
+fi
+"""
+
+
+#: llvm-config, which tvm asks ten questions of: all answered from the sysroot.
+_LLVM_CONFIG = """\
+sysroot={sysroot}
+out=
+for arg do
+  case "$arg" in
+    --version) v={version} ;;
+    --prefix) v="$sysroot" ;;
+    --bindir) v="$sysroot/bin" ;;
+    --libdir) v="$sysroot/lib" ;;
+    --includedir) v="$sysroot/include" ;;
+    --cmakedir) v="$sysroot/lib/cmake/llvm" ;;
+    --libfiles) v="$sysroot/lib/libLLVM.so" ;;
+    --libs) v="-lLLVM" ;;
+    --libnames) v="libLLVM.so" ;;
+    --system-libs) v="" ;;
+    --cflags|--cppflags|--cxxflags) v="-I$sysroot/include" ;;
+    --ldflags) v="-L$sysroot/lib" ;;
+    --targets-built) v="RISCV" ;;
+    --host-target) v="riscv64-unknown-linux-gnu" ;;
+    --shared-mode) v="shared" ;;
+    --build-mode) v="Release" ;;
+    --has-rtti) v="YES" ;;
+    --assertion-mode) v="OFF" ;;
+    --components) v="all" ;;
+    --link-shared|--link-static|--ignore-libllvm) continue ;;
+    -*) v="" ;;
+    *) continue ;;
+  esac
+  out="${{out:+$out }}$v"
+done
+echo "$out"
+exit 0
+"""
+
+
+def _fake_program(name: str, scratch: Path, version: Optional[str] = None) -> str:
+    """A program that runs, says a version, and writes the file it is told to."""
+    if re.match(r"^llvm-config(-?[0-9.]+)?$", name):
+        sysroot = scratch / "sysroot"
+        (sysroot / "lib").mkdir(parents=True, exist_ok=True)
+        (sysroot / "lib" / "libLLVM.so").touch()
+        return "#!/bin/sh\n# stub emitted by will-it-riscv for llvm-config\n" + _LLVM_CONFIG.format(
+            sysroot=shlex.quote(str(sysroot)), version=".".join(LLVM_VERSION))
+    version = version or _negotiated(name) or FAKE_VERSION_STRING
+    said = _VERSION_LINES.get(name, "{}").format(version)
+    query = ""
+    if re.match(r"^qmake(6|-qt[56])?$", name):
+        query = _QMAKE_QUERY.format(version=shlex.quote(version),
+                                    sysroot=shlex.quote(str(scratch / "sysroot")))
+    return _PROGRAM_STUB.format(
+        name=name, version=shlex.quote(said), scratch=shlex.quote(str(scratch)), query=query,
+    )
 
 
 def _stub_variable(variable: str, sysroot: Path, suffix: str) -> Optional[str]:
@@ -1489,11 +2152,11 @@ def _stub_variable(variable: str, sysroot: Path, suffix: str) -> Optional[str]:
         return str(sysroot / "include")
     if _PROGRAM_VAR.search(variable):
         path = sysroot / "bin" / _PROGRAM_VAR.sub("", variable).lower()
-        path.write_text("#!/bin/sh\nexit 0\n")
+        path.write_text(_fake_program(path.name, sysroot.parent))
         path.chmod(0o755)
         return str(path)
     if _VERSION_VAR.search(variable):
-        return FAKE_VERSION_STRING
+        return _negotiated(_VERSION_VAR.split(variable)[0]) or FAKE_VERSION_STRING
     if variable.upper().endswith("_FLAGS"):
         # Anything put here lands on a compile line, where "1" is a file name.
         return None
@@ -1588,6 +2251,7 @@ def _synthesize(
             overrides.update(stubbed)
             created += [f for f in files if f not in already]
             continue
+        made_before, set_before = len(created), set(overrides)
         # 1. The cache variables FPHSA said were missing. A bare word among
         #    them is a component -- "(missing: ... SSL Crypto)" -- and the
         #    variable behind a component is <PKG>_<COMPONENT>_LIBRARY.
@@ -1623,11 +2287,57 @@ def _synthesize(
                     created.append(f"{config}#{package}::{component}")
             else:
                 variables += _component_variables(package, component)
-        # 1c. A config-mode package required and nowhere to be found.
-        for name in _NO_CONFIG.findall(re.sub(r"\s+", " ", stanza)):
+            # A linked target nothing defined -- lcc links BML::bml, which
+            # BML's library variables never make, and ginkgo hip::device from a
+            # config it never loads -- is made at the end, if still missing.
+            if _defer_target(f"{package}::{component}", sysroot):
+                created.append(f"{_targets_file(sysroot)}#{package}::{component}")
+                overrides["CMAKE_PROJECT_TOP_LEVEL_INCLUDES"] = ";".join(
+                    _top_level_includes(sysroot))
+        # 1b'. A module a stubbed package would have shipped: FairRoot
+        #      include()s FairFormattedOutput after find_package(FairCMakeModules).
+        for module in _MISSING_MODULE.findall(stanza):
+            path = _module_file(module, sysroot)
+            if path is not None and str(path) not in already and not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"# stub emitted by will-it-riscv: {module}, which a stubbed "
+                                "package would ship\n")
+                created.append(str(path))
+                overrides["CMAKE_MODULE_PATH"] = str(_modules_directory(sysroot))
+        # 1d. A variable the project's own error says to set: exacmech's
+        #     "RAJA_DIR was not provided", variorum's "needs explict HWLOC_DIR".
+        for variable in _named_variables(stanza):
+            value, files = _stub_named_variable(variable, sysroot, suffix)
+            if value is not None and overrides.get(variable) != value:
+                overrides[variable] = value
+                created += [f for f in files if f not in already]
+        # 1e. A Find module the project insists on, from a package that would
+        #     have shipped it: ufs-weather-model's FindESMF.cmake.
+        for name in _NO_FIND_MODULE.findall(re.sub(r"\s+", " ", stanza)):
+            module = _modules_directory(sysroot) / f"Find{name}.cmake"
+            if not module.exists():
+                created += _stub_config_package(name, sysroot, suffix)
+                module.parent.mkdir(parents=True, exist_ok=True)
+                config = sysroot / "lib" / "cmake" / name / f"{name}Config.cmake"
+                module.write_text(f"# stub emitted by will-it-riscv: {name}'s Find module\n"
+                                  f'include("{config.as_posix()}")\n')
+                created.append(str(module))
+                overrides["CMAKE_MODULE_PATH"] = str(_modules_directory(sysroot))
+        # 1c. A config-mode package required and nowhere to be found -- as
+        #     the first file it searched for: find_package(QT NAMES Qt6 Qt5)
+        #     looks for Qt6Config.cmake, never QTConfig.cmake.
+        flat = re.sub(r"\s+", " ", stanza)
+        for asked in _NO_CONFIG.findall(flat) + _NEITHER_CONFIG.findall(flat):
+            listed = _CONFIG_NAMES.findall(stanza.split("following names", 1)[-1])
+            name = listed[0] if listed and "following names" in stanza else asked
             config = sysroot / "lib" / "cmake" / name / f"{name}Config.cmake"
             if not config.is_file():
                 created += _stub_config_package(name, sysroot, suffix)
+            # Found wherever it is looked for -- atlas asks for ecbuild before
+            # project(), when the toolchain's find roots are not set yet.
+            for variable in dict.fromkeys([f"{asked}_DIR", f"{name}_DIR"]):
+                if overrides.get(variable) != str(config.parent):
+                    overrides[variable] = str(config.parent)
         # 2. NOTFOUND variables the generate step refused.
         if _NOTFOUND_HEADER in stanza:
             for line in stanza.splitlines()[1:]:
@@ -1663,6 +2373,15 @@ def _synthesize(
                 continue
             created.append(str(path))
 
+        # 4b. Blamed, and nothing of its own to put in place: prusaslicer's
+        #     Findcereal says "Cereal library not found" after a quiet
+        #     find_package(cereal CONFIG). A config package is what it looked for.
+        if len(created) == made_before and set(overrides) == set_before:
+            for name in _stanza_blockers(stanza)[:1]:
+                config = sysroot / "lib" / "cmake" / name / f"{name}Config.cmake"
+                if re.match(r"^[A-Za-z][A-Za-z0-9_+-]*$", name) and not config.is_file():
+                    created += _stub_config_package(name, sysroot, suffix)
+                    overrides[f"{name}_DIR"] = str(config.parent)
         # 5. Headers a check said it could not find. The toolchain file puts
         #    the sysroot's include directory on every compile line, so a stub
         #    there is enough to satisfy check_include_file.
@@ -1678,6 +2397,343 @@ def _synthesize(
             created.append(str(path))
 
     return overrides, created
+
+
+#: A grep for a feature switch (H5_HAVE_PARALLEL, ARMA_USE_WRAPPER), as
+#: against a version or a setting a configure cannot do without (METIS's
+#: IDXTYPEWIDTH): a stub claims the second kind, not the first.
+_FEATURE_GREP = re.compile(r"(?:^|[^A-Za-z])(?:HAVE|USE|ENABLE|WITH|HAS)_|_ENABLED\b")
+_GREP_WORD = re.compile(r"[A-Za-z][A-Za-z0-9]{4,}")
+_PLAIN_WORDS = {"define", "include", "undef", "ifdef", "ifndef"}
+
+
+def _feature_named(regex: str, message: str) -> bool:
+    """Whether the error is about what this feature grep looks for: "needs to
+    enable parallel support" and ``H5_HAVE_PARALLEL``."""
+    words = {w.lower() for w in _GREP_WORD.findall(regex.replace("_", " "))} - _PLAIN_WORDS
+    lowered = message.lower()
+    # dolfinx: "Found serial HDF5, MPI HDF5 build required."
+    words |= {other for w in words for other in _FEATURE_SYNONYMS.get(w, ())}
+    return any(re.search(rf"(?<![a-z]){re.escape(w)}(?![a-z])", lowered) for w in words)
+
+
+_FEATURE_SYNONYMS = {"parallel": ("mpi",), "deflate": ("zlib",), "szip": ("szlib",)}
+
+
+def _answer_reads(reads: list, sysroot: Path, answered: set, message: str = "") -> list[str]:
+    """Give each stub file a line for every grep of it that found nothing.
+
+    FindArmadillo greps ``armadillo_bits/arma_version.hpp`` for
+    ``#define ARMA_VERSION_MAJOR``, FindPython greps ``patchlevel.h`` for
+    ``PY_VERSION``, FindCURL ``curlver.h`` for ``LIBCURL_VERSION``. No guess
+    at macro names covers them all, but the trace says exactly what each
+    module looked for: write a line it matches. Only files inside the
+    sysroot, and each grep once. Returns the files changed.
+    """
+    changed: list[str] = []
+    for file, regex in reads:
+        if (file, regex) in answered or not file.startswith(str(sysroot) + "/"):
+            continue
+        if _FEATURE_GREP.search(regex) and not _feature_named(regex, message):
+            # A stub claims its version, not every feature its real one might
+            # have been built with: parallel HDF5 would bring MPI along.
+            continue
+        answered.add((file, regex))
+        path = Path(file)
+        try:
+            text = path.read_text(errors="replace") if path.exists() else ""
+        except OSError:
+            continue
+        if text and STUB_MARK not in text and path.suffix.lower() not in _HEADER_SUFFIXES:
+            continue   # a stub config or .pc file: a line of C would not belong
+        pattern = _python_regex(regex)
+        if pattern is not None and any(pattern.search(line) for line in text.splitlines()):
+            continue
+        python = "PY_" in regex or path.name == "patchlevel.h"
+        owner = re.search(rf"{STUB_MARK} for ([A-Za-z0-9_.+-]+)", text)
+        version = _python_version() if python else (
+            _fake_version(owner.group(1)) if owner else FAKE_VERSION)
+        # One line for each branch it allows: TBB_VERSION_(MAJOR|MINOR) wants both.
+        lines = list(dict.fromkeys(
+            _as_c(line, regex) for line in (_example(regex, version, pick) for pick in range(4))
+            if line is not None and "\n" not in line
+        ))
+        if not lines:
+            continue
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not text:
+                text = f"/* {STUB_MARK} for {path.stem} */\n"
+            path.write_text(
+                text + ("" if text.endswith("\n") else "\n") + "\n".join(lines) + "\n"
+            )
+        except OSError:
+            continue
+        if file not in changed:
+            changed.append(file)
+    return changed
+
+
+#: FPHSA, when the version its module worked out is the wrong one, or none.
+_UNSUITABLE = re.compile(
+    r"Could NOT find ([A-Za-z0-9_.+-]+): "
+    r"(?:Found unsuitable version|\(Required is (?:at least|exact) version)"
+)
+
+
+def _version_headers(
+    outcome: PseudoBuild, sysroot: Path, blockers: Optional[list] = None,
+) -> list[str]:
+    """The headers a package's own module looked for before reading its version.
+
+    FindArmadillo reads ``armadillo_bits/arma_version.hpp`` only ``if(EXISTS)``,
+    so a stub include directory gives it no version at all, and FPHSA calls
+    that unsuitable. When it does, write the headers that module asked
+    after; the next round greps them, and ``_answer_reads`` gives it the
+    lines it greps for. Only for the package refused, or one already stubbed
+    -- FindHDF5 reads H5pubconf.h if it is there, and with none the version
+    is empty and the project's own check refuses it -- inside the sysroot.
+    """
+    refused = {name.lower() for name in _UNSUITABLE.findall(outcome.narration or "")}
+    refused |= {name.lower() for name in blockers or []}
+    created: list[str] = []
+    for path, module in outcome.exists:
+        stem = Path(module).name.lower()
+        owner = re.sub(r"^find|-?config\.cmake$|\.cmake$", "", stem)
+        if not path.startswith(str(sysroot) + "/"):
+            continue
+        inside = path[len(str(sysroot)):].lower()
+        # Its own Find module asking, or a project macro asking after a
+        # header of its: mlpack's find_armadillo and armadillo_bits/arma_version.hpp.
+        named = [r for r in refused if len(r) >= 3 and r in inside]
+        if owner not in refused and not named:
+            continue
+        owner = owner if owner in refused else named[0]
+        target = Path(path)
+        if target.exists() or target.suffix.lower() not in _HEADER_SUFFIXES:
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f"/* {STUB_MARK} for {owner} */\n")
+        except OSError:
+            continue
+        created.append(path)
+    return created
+
+
+def _as_c(line: str, regex: str) -> str:
+    """The line as a #define where the regex allows it, so the header still compiles."""
+    if line.startswith("#"):
+        return line
+    candidate = "#define " + line
+    pattern = _python_regex(regex)
+    return candidate if pattern is not None and pattern.search(candidate) else line
+
+
+#: FPHSA saying which version it wanted instead of the one it found.
+_WANTED = re.compile(
+    r'Could NOT find ([A-Za-z0-9_.+-]+): Found unsuitable version "[^"]*", '
+    r'(?:but required is at least|but required is exact version|required range is) '
+    r'"([0-9][0-9.]*)'
+)
+
+
+def _negotiate(narration: str, sysroot: Path, answered: set, written: set) -> list[str]:
+    """Redo a package's stubs at the version the configure said it wanted.
+
+    openvdb wants TBB "at least 2020.3", and TBB's header said 99.9; espresso
+    wants Cython in "3.0.4...<4.0.0". The stub files of that package -- its
+    headers, its config, its program -- go, and come back next round at the
+    wanted version, the way they came the first time. Once a package.
+    """
+    negotiated = _NEGOTIATED.get(None)
+    if negotiated is None:
+        return []
+    redone: list[str] = []
+    for name, wanted in _WANTED.findall(re.sub(r"\s+", " ", narration)):
+        key = name.lower()
+        if key in negotiated:
+            continue
+        negotiated[key] = wanted
+        mark = f"{STUB_MARK} for {name}".lower()
+        doomed = [sysroot / "bin" / key, sysroot / "lib" / "cmake" / name]
+        for path in (sysroot / "include").rglob("*"):
+            try:
+                if path.is_file() and mark in path.read_text(errors="replace")[:200].lower():
+                    doomed.append(path)
+            except OSError:
+                continue
+        for path in doomed:
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            elif path.exists():
+                path.unlink()
+            else:
+                continue
+            gone = str(path)
+            written.difference_update({w for w in written if w.startswith(gone)})
+            answered.difference_update({a for a in answered if a[0].startswith(gone)})
+            # Progress, but not a file made: the stub is to be written again.
+            redone.append(f"{gone}#redo-at-{wanted}")
+    return redone
+
+
+def _python_version() -> tuple[str, ...]:
+    return tuple(str(p) for p in sys.version_info[:3])
+
+
+def _python_regex(regex: str) -> Optional[re.Pattern]:
+    """CMake's regex in Python's dialect, near enough to ask whether a line matches."""
+    try:
+        return re.compile(regex.replace("\\t", "\t"))
+    except re.error:
+        return None
+
+
+#: Words that say which part of a version a number is.
+_PART = (
+    (re.compile(r"MAJOR", re.IGNORECASE), 0),
+    (re.compile(r"MINOR", re.IGNORECASE), 1),
+    (re.compile(r"PATCH|MICRO|SUBMINOR|RELEASE|REVISION", re.IGNORECASE), 2),
+)
+
+
+def _example(
+    regex: str, version: tuple[str, ...] = FAKE_VERSION, pick: int = 0,
+) -> Optional[str]:
+    """One line a CMake regular expression matches, with the version's numbers in it.
+
+    Enough of CMake's syntax for what Find modules grep version headers
+    with: literals and escapes, ``.``, bracket classes, groups, ``|`` (the
+    ``pick``-th branch, or the last there is), ``* + ?``, and the anchors.
+    A run of digits is a part of the version -- the one the words before
+    it name (MAJOR, MINOR, PATCH), else the next -- and a run that may hold
+    a dot (``[0-9.]+``, ``[^"]+``, a captured ``(.*)``) gets the whole
+    dotted version. None when it is beyond this, or when what it made does
+    not match after all.
+    """
+    dotted = ".".join(version)
+    parts = {"next": 0}
+
+    def number(before: str) -> str:
+        named = [index for word, index in _PART if word.search(before[-24:])]
+        if named:
+            index = named[0]
+        else:
+            index = parts["next"]
+            parts["next"] += 1
+        return version[index] if index < len(version) else "0"
+
+    def atom_at(at: int) -> tuple[str, str, int]:
+        char = regex[at]
+        if char == "[":
+            close = at + 1
+            if regex[close:close + 1] == "^":
+                close += 1
+            if regex[close:close + 1] == "]":
+                close += 1   # a literal ] first in the class
+            close = regex.index("]", close)
+            return regex[at + 1:close], "class", close + 1
+        if char == "\\" and at + 1 < len(regex):
+            return {"t": "\t", "n": "\n"}.get(regex[at + 1], regex[at + 1]), "literal", at + 2
+        if char == ".":
+            return ".", "any", at + 1
+        return char, "literal", at + 1
+
+    def alternatives(at: int, prefix: str, depth: int) -> tuple[str, int]:
+        """The chosen branch of a group (or of the whole); returns (text, index of ')' or end)."""
+        texts = []
+        while True:
+            text, at = branch(at, prefix, depth)
+            texts.append(text)
+            if at < len(regex) and regex[at] == "|":
+                at += 1
+                continue
+            return texts[min(pick, len(texts) - 1)], at
+
+    def branch(at: int, prefix: str, depth: int) -> tuple[str, int]:
+        """Render up to the end of this branch: the index of its '|', ')' or the end."""
+        text = ""
+        while at < len(regex):
+            char = regex[at]
+            if char == ")":
+                if not depth:
+                    raise ValueError("unbalanced")
+                return text, at
+            if char == "|":
+                return text, at
+            if char in "^$":
+                at += 1
+                continue
+            if char == "(":
+                inner, close = alternatives(at + 1, prefix + text, depth + 1)
+                if close >= len(regex):
+                    raise ValueError("unbalanced")
+                atom, kind, at = inner, "group", close + 1
+            else:
+                atom, kind, at = atom_at(at)
+            quantifier = regex[at] if at < len(regex) and regex[at] in "*+?" else ""
+            at += bool(quantifier)
+            edge = not (prefix + text) or not regex[at:].strip("$)")
+            text += render(atom, kind, quantifier, prefix + text, depth, edge)
+        if depth:
+            raise ValueError("unbalanced")
+        return text, at
+
+    def render(
+        atom: str, kind: str, quantifier: str, before: str, depth: int, edge: bool,
+    ) -> str:
+        if kind in ("literal", "group"):
+            return "" if quantifier == "*" else atom
+        if kind == "any":
+            if quantifier == "*":
+                # ".*#define X ([0-9]+).*" pads both ends; "(.*)" and
+                # LIBCURL_VERSION "\".*\"" hold the version.
+                return "" if edge and not depth else dotted
+            return dotted if quantifier == "+" else "9"
+        allowed = _allowed(atom)
+        many = quantifier in ("*", "+")
+        if allowed("9") and allowed("."):
+            return dotted if many else "9"
+        if allowed("9"):
+            return number(before) if many else number(before)[:1]
+        if quantifier == "*":
+            return ""
+        for candidate in " _xA\t":
+            if allowed(candidate):
+                return candidate
+        raise ValueError("no character the class allows")
+
+    try:
+        line, _ = alternatives(0, "", 0)
+    except (ValueError, IndexError):
+        return None
+    pattern = _python_regex(regex)
+    if pattern is None or not pattern.search(line):
+        return None
+    return line
+
+
+def _allowed(spec: str):
+    """A bracket class, as a test of one character."""
+    negated = spec.startswith("^")
+    body = spec[1:] if negated else spec
+    body = body.replace("\\t", "\t")
+    ranges: list[tuple[str, str]] = []
+    at = 0
+    while at < len(body):
+        if at + 2 < len(body) and body[at + 1] == "-":
+            ranges.append((body[at], body[at + 2]))
+            at += 3
+        else:
+            ranges.append((body[at], body[at]))
+            at += 1
+
+    def test(char: str) -> bool:
+        inside = any(low <= char <= high for low, high in ranges)
+        return inside != negated
+
+    return test
 
 
 def _component_variables(package: str, component: str) -> list[str]:
@@ -1745,7 +2801,21 @@ def _environment(scratch: Path, deny_pkg_config: bool, sysroot: Optional[Path] =
         env["PKG_CONFIG_LIBDIR"] = str(empty)
         env["PKG_CONFIG_PATH"] = str(empty)
     env["CMAKE_BUILD_PARALLEL_LEVEL"] = "1"
+    env["PATH"] = _without_shims(env.get("PATH", ""))
+    if sysroot is not None:
+        # Last, so a host program comes first: the stubs there are only what a
+        # build asked for, and tvm runs its llvm-config by bare name.
+        env["PATH"] += os.pathsep + str(sysroot / "bin")
     return env
+
+
+def _without_shims(path: str) -> str:
+    """PATH less pyenv's and asdf's shims: a shim is there for every program any
+    installed version has, and fails when the active one has none -- so a
+    configure finds a cython that says "pyenv: cython: command not found"
+    where it should have found nothing, and been given a stub."""
+    shim = re.compile(r"/\.(pyenv|asdf)/shims/?$")
+    return os.pathsep.join(d for d in path.split(os.pathsep) if d and not shim.search(d))
 
 
 def _first_error(stdout: str, stderr: str) -> str:

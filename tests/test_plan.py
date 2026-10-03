@@ -176,6 +176,22 @@ def test_system_packages_are_checked_against_the_archive(tmp_path, target):
     assert result.why("debian:libnope-dev") == ["step:apt", "debian:libnope-dev"]
 
 
+def test_a_name_debian_has_nowhere_is_the_plans_mistake_not_a_no(tmp_path, target):
+    """openmpi is no Debian package: it says nothing about riscv64."""
+    distro = FakeDistro({"gcc", "libopenmpi-dev"})
+    distro.named = lambda package: package in distro.names_ or package == "libnuma-dev"
+    distro.similar = lambda package: ["libopenmpi-dev"] if "mpi" in package else []
+    result = run_plan(tmp_path, target, plan({
+        "id": "apt", "kind": "system-packages", "packages": ["gcc", "openmpi", "libnuma-dev"],
+        "evidence": [],
+    }), distro=distro)
+    assert result.nodes["debian:openmpi"].tier == planrun.UNKNOWN
+    assert "it has libopenmpi-dev" in result.nodes["debian:openmpi"].detail
+    assert result.nodes["debian:libnuma-dev"].tier == planrun.NONE
+    assert result.unknown_names == [("apt", "openmpi", ["libopenmpi-dev"], "Debian 13 (trixie)")]
+    assert result.answer.blockers == ["debian:libnuma-dev"]
+
+
 def test_a_python_package_with_nothing_for_the_target_blocks_the_plan(tmp_path, target):
     """MFC's shape: pure-Python jax pulls in jaxlib, which has no riscv64 wheel."""
     (tmp_path / "toolchain").mkdir()
@@ -411,3 +427,34 @@ def test_cmake_names_are_as_loose_as_cmake_is():
         parse_plan({"repo": "r", "steps": [{
             "id": "c", "kind": "cmake-configure", "evidence": [], "defines": {"-bad": "1"},
         }]})
+
+
+def test_a_configure_that_refuses_the_target_by_name_is_a_no():
+    from types import SimpleNamespace
+
+    from will_it_riscv.planrun import _refuses_target
+
+    def stopped(error):
+        return SimpleNamespace(pseudobuild=SimpleNamespace(error=error))
+
+    refused = stopped("CMake Error at cmake/ActsEnsureUv.cmake:42 (message): "
+                      "Unsupported architecture: riscv64")
+    assert _refuses_target(refused, "riscv64") == "Unsupported architecture: riscv64"
+    assert _refuses_target(stopped("CMake Error at x.cmake:1 (message): RISC-V is not "
+                                   "supported by this release"), "riscv64")
+    # Naming the target is not refusing it, and refusing something else is not either.
+    assert _refuses_target(stopped("CMake Error at x.cmake:1 (message): could not find "
+                                   "riscv64-linux-gnu-gcc"), "riscv64") is None
+    assert _refuses_target(stopped("CMake Error at x.cmake:1 (message): Unsupported "
+                                   "compiler GNU"), "riscv64") is None
+
+
+def test_a_default_build_that_needs_cuda_has_nothing_for_riscv64():
+    from will_it_riscv import graph as depgraph
+    from will_it_riscv.planrun import NONE, _cmake_tier
+
+    cuda = depgraph.Node(key="cuda", name="CUDA", kind="library")
+    cuda.status = depgraph.REQUIRED
+    assert _cmake_tier(cuda, {})[0] == NONE
+    optional = depgraph.Node(key="cuda", name="CUDA", kind="library")
+    assert _cmake_tier(optional, {})[0] != NONE   # asked for, not demanded

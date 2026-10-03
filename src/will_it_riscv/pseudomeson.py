@@ -276,6 +276,9 @@ def _meson_command(
             [sys.executable, str(interpreter.scripts / "meson")],
             f"configured with meson {version}, the build requirement's version",
         )
+    beside = Path(sys.executable).parent / "meson"   # the pinned one, Debian 13's
+    if beside.is_file() and os.access(beside, os.X_OK):
+        return [str(beside)], None
     host = shutil.which("meson")
     if host:
         return [host], None

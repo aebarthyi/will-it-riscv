@@ -1,6 +1,7 @@
 """Pseudobuilds: configure the project, watch what it asks for, throw it away."""
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -319,10 +320,391 @@ def test_an_executable_variable_gets_a_runnable_stub(tmp_path):
     assert path.exists() and path.stat().st_mode & 0o111
 
 
-def test_a_config_mode_dir_hint_is_left_alone(tmp_path):
-    """Faking <Pkg>_DIR sends CMake after a config file that is not there."""
+def test_a_stub_program_says_a_version_and_writes_what_it_is_told_to(tmp_path):
+    sysroot = tmp_path / "sysroot"
+    (sysroot / "bin").mkdir(parents=True)
+    overrides, _ = synth(ERROR + "Could NOT find Doxygen (missing: DOXYGEN_EXECUTABLE)\n", sysroot)
+    doxygen = overrides["DOXYGEN_EXECUTABLE"]
+    said = subprocess.run([doxygen, "--version"], capture_output=True, text=True)
+    assert said.stdout.strip() == "99.9.9"
+    template = tmp_path / "build" / "CMakeDoxyfile.tpl"
+    template.parent.mkdir()
+    subprocess.run([doxygen, "-s", "-g", str(template)], check=True)
+    assert template.exists()
+    outside = tmp_path.parent / "not-scratch.tpl"
+    subprocess.run([doxygen, "-g", str(outside)], check=True)
+    assert not outside.exists()
+    git = pseudobuild._stub_variable("GIT_EXECUTABLE", sysroot, ".so")
+    assert subprocess.run([git, "--version"], capture_output=True, text=True).stdout.strip() \
+        == "git version 99.9.9"
+
+
+@needs_cmake
+def test_doxygen_is_stubbed_far_enough_for_find_doxygen(tmp_path):
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(demo NONE)\n"
+        "find_package(Doxygen 1.8 REQUIRED)\n"
+        "doxygen_add_docs(docs ${CMAKE_SOURCE_DIR})\n"
+    )
+    result = run(tmp_path, timeout=120)
+    assert result.completed, result.error
+    assert result.blockers == ["Doxygen"]
+
+
+@pytest.mark.parametrize("regex, line", [
+    ('^#define[ \t]+PY_VERSION[ \t]+"[^"]+"', '#define PY_VERSION "99.9.9"'),
+    ("#define ARMA_VERSION_MINOR[ \t]+([0-9]+)", "#define ARMA_VERSION_MINOR 9"),
+    ('#define[ \t]+ARES_VERSION_STR[ \t]+"([0-9.]+)"', '#define ARES_VERSION_STR "99.9.9"'),
+    ('PY_VERSION[ \t]+"(.*)"', 'PY_VERSION "99.9.9"'),
+    ("^Version: ([0-9]+\\.[0-9]+)$", "Version: 99.9"),
+    ("[", None),
+])
+def test_a_line_is_made_that_a_cmake_regex_matches(regex, line):
+    assert pseudobuild._example(regex) == line
+
+
+def test_each_branch_of_an_alternation_gets_its_own_line():
+    regex = "TBB_VERSION_(MAJOR|MINOR)[ \t]+[0-9]+"
+    assert [pseudobuild._example(regex, pick=k) for k in (0, 1)] == [
+        "TBB_VERSION_MAJOR 99", "TBB_VERSION_MINOR 9"]
+
+
+VERSION_GREP = """\
+find_path(ARMA_INCLUDE_DIR NAMES armadillo)
+if(ARMA_INCLUDE_DIR)
+  file(STRINGS "${ARMA_INCLUDE_DIR}/armadillo_bits/arma_version.hpp" _major
+       REGEX "#define ARMA_VERSION_MAJOR[ \\t]+[0-9]+")
+  string(REGEX REPLACE ".*#define ARMA_VERSION_MAJOR[ \\t]+([0-9]+).*" "\\\\1" _major "${_major}")
+  file(READ "${ARMA_INCLUDE_DIR}/armadillo_bits/arma_version.hpp" _text)
+  string(REGEX REPLACE ".*#define ARMA_VERSION_MINOR[ \\t]+([0-9]+).*" "\\\\1" _minor "${_text}")
+  set(ARMADILLO_VERSION_STRING "${_major}.${_minor}")
+endif()
+include(FindPackageHandleStandardArgs)
+find_package_handle_standard_args(Armadillo
+  REQUIRED_VARS ARMA_INCLUDE_DIR VERSION_VAR ARMADILLO_VERSION_STRING)
+"""
+
+
+@needs_cmake
+def test_a_stub_header_gets_the_version_lines_its_module_greps_for(tmp_path):
+    (tmp_path / "cmake").mkdir()
+    (tmp_path / "cmake" / "FindArmadillo.cmake").write_text(VERSION_GREP)
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(demo NONE)\n"
+        "list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake)\n"
+        "find_package(Armadillo 4.0 REQUIRED)\n"
+        'if(NOT ARMADILLO_VERSION_STRING VERSION_EQUAL "99.9")\n'
+        '  message(FATAL_ERROR "version ${ARMADILLO_VERSION_STRING}")\n'
+        "endif()\n"
+    )
+    result = run(tmp_path, timeout=120)
+    assert result.completed, result.error
+    assert result.blockers == ["Armadillo"]
+
+
+@needs_cmake
+def test_a_version_header_checked_for_before_it_is_read_is_written(tmp_path):
+    """CMake's own FindArmadillo reads arma_version.hpp only if(EXISTS)."""
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(demo CXX)\n"
+        "find_package(Armadillo 4.0 REQUIRED)\n"
+    )
+    result = run(tmp_path, timeout=180)
+    assert result.completed, result.error
+    assert "Armadillo" in result.blockers
+
+
+@needs_cmake
+def test_a_lookup_the_error_names_in_its_own_words_is_tried(tmp_path):
+    """No package and no "Could NOT find": the project's own message names it."""
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(demo C)\n"
+        "find_program(EXE_FROBNICATE frobnicate-tool)\n"
+        "if(NOT EXE_FROBNICATE)\n"
+        '  message(FATAL_ERROR "frobnicate-tool binary not found!")\n'
+        "endif()\n"
+        "find_library(MGIS_DL_LIBRARY dl)\n"
+        "if(NOT MGIS_DL_LIBRARY)\n"
+        '  message(FATAL_ERROR "the libdl library not found. Set `MGIS_DL_LIBRARY` manually")\n'
+        "endif()\n"
+    )
+    result = run(tmp_path, timeout=180)
+    assert result.completed, result.error
+    assert result.blockers == ["frobnicate-tool", "dl"]
+    assert ("frobnicate-tool", True) in result.experiments
+
+
+@needs_cmake
+def test_a_linked_target_nothing_defines_is_made_at_the_end(tmp_path):
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.19)\n"
+        "project(demo C)\n"
+        "file(WRITE ${CMAKE_BINARY_DIR}/main.c \"int main(void){return 0;}\")\n"
+        "add_executable(main ${CMAKE_BINARY_DIR}/main.c)\n"
+        "target_link_libraries(main PRIVATE Widget::widget)\n"
+    )
+    result = run(tmp_path, timeout=180)
+    assert result.completed, result.error
+
+
+@needs_cmake
+def test_qt_is_found_by_the_name_it_was_searched_for_at_its_own_major(tmp_path):
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(demo NONE)\n"
+        "find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Core)\n"
+        "find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Core Widgets)\n"
+        'if(Qt6Core_VERSION VERSION_LESS "6.2.4")\n'
+        '  message(FATAL_ERROR "Qt version 6.2.4 or higher is required")\n'
+        "endif()\n"
+    )
+    result = run(tmp_path, timeout=180)
+    assert result.completed, result.error
+    assert result.blockers[0] in ("QT", "Qt6")
+
+
+def test_cmakes_own_lookups_and_the_interpreter_are_never_suspects():
+    narration = (
+        "CMake Error at CMakeLists.txt:9 (message):\n"
+        "  failed: Run Build Command(s): /usr/bin/gmake -f Makefile; python3 not found;"
+        " frob not found\n"
+    )
+    searches = [
+        ("find_program", "CMAKE_MAKE_PROGRAM", ("gmake", "make")),
+        ("find_program", "PYTHON_EXECUTABLE", ("python3",)),
+        ("find_program", "FROB_EXE", ("frob",)),
+    ]
+    assert [n for n, _ in pseudobuild._named_searches(narration, searches)] == ["frob"]
+
+
+CMAKES_OWN_MODULES = {
+    # FindCURL greps curlver.h for LIBCURL_VERSION "\".*\"".
+    "curl-version": ("C", "find_package(CURL 7.32 REQUIRED)\n", ["CURL"]),
+    # FairRoot: the modules a package of CMake modules would have put on the path.
+    "shipped-modules": ("NONE", "find_package(FairCMakeModules 0.2 REQUIRED)\n"
+                        "include(FairFormattedOutput)\n"
+                        "find_package(ECM REQUIRED NO_MODULE)\n"
+                        "set(CMAKE_MODULE_PATH ${ECM_MODULE_PATH})\n"
+                        "include(KDEInstallDirs)\n", ["FairCMakeModules", "ECM"]),
+    # MuseScore asks Qt::qmake where Qt is installed; colmap's AUTORCC wants Qt5::rcc.
+    "qt6-qmake": ("CXX", "find_package(Qt6 REQUIRED COMPONENTS Core)\n"
+                  "if(NOT TARGET Qt::qmake)\n"
+                  '  message(FATAL_ERROR "No supported Qt version found.")\n'
+                  "endif()\n"
+                  "get_target_property(QMAKE Qt${QT_VERSION_MAJOR}::qmake LOCATION)\n"
+                  "execute_process(COMMAND ${QMAKE} -query OUTPUT_VARIABLE ALL RESULT_VARIABLE rc)\n"
+                  'string(REPLACE "\\n" ";" VARS ${ALL})\n'
+                  "if(NOT rc EQUAL 0 OR NOT ALL MATCHES QT_INSTALL_LIBS)\n"
+                  '  message(FATAL_ERROR "qmake -query: ${ALL}")\n'
+                  "endif()\n", ["Qt6"]),
+    "qt5-autorcc": ("CXX", "find_package(Qt5 REQUIRED COMPONENTS Core Widgets)\n"
+                    "set(CMAKE_AUTOMOC ON)\nset(CMAKE_AUTORCC ON)\n"
+                    'file(WRITE ${CMAKE_BINARY_DIR}/r.qrc "<RCC><qresource/></RCC>")\n'
+                    'file(WRITE ${CMAKE_BINARY_DIR}/m.cpp "int main(){return 0;}")\n'
+                    "add_executable(m ${CMAKE_BINARY_DIR}/m.cpp ${CMAKE_BINARY_DIR}/r.qrc)\n"
+                    "target_link_libraries(m Qt5::Widgets Qt::Core)\n", ["Qt5"]),
+    # open3d: a Python3 it can do without, until its own error says "Python".
+    "python-named-bare": ("C", "find_package(Python3 3.6 COMPONENTS Interpreter Development)\n"
+                          "if(NOT Python3_FOUND)\n"
+                          '  message(FATAL_ERROR "BUILD_PYTHON_MODULE=ON requires Python >= 3.6.")\n'
+                          "endif()\n", ["Python3"]),
+    # atlas asks for ecbuild before project(); paraview's error only says "Qt".
+    "config-before-project": ("NONE", "", ["ecbuild"]),
+    "qt-auto": ("CXX", "find_package(Qt6 QUIET COMPONENTS Core)\n"
+                "if(NOT Qt6_FOUND)\n  find_package(Qt5 QUIET COMPONENTS Core)\n"
+                "  if(NOT Qt5_FOUND)\n"
+                '    message(FATAL_ERROR "Could not find a valid Qt installation.")\n'
+                "  endif()\nendif()\n", ["Qt6"]),
+    # vgm includes Geant4's use file; openscad compares CGAL_MAJOR_VERSION.
+    "use-file-and-spellings": ("NONE", "find_package(Geant4 REQUIRED)\ninclude(${Geant4_USE_FILE})\n"
+                               "find_package(CGAL REQUIRED COMPONENTS Core)\n"
+                               "if (${CGAL_MAJOR_VERSION} LESS 5)\n"
+                               '  message(FATAL_ERROR "CGAL too old")\nendif()\n',
+                               ["Geant4", "CGAL"]),
+    # tramonto: CMake's other wording of a config package it could not find.
+    "by-not-providing": ("NONE", "find_package(Trilinos REQUIRED)\n", ["Trilinos"]),
+    # exacmech: the error names the variable to set.
+    "named-variable": ("NONE", "if(NOT RAJA_DIR)\n"
+                       '  message(FATAL_ERROR "RAJA_DIR was not provided. It is needed to find RAJA.")\n'
+                       "endif()\nfind_package(RAJA REQUIRED PATHS ${RAJA_DIR})\n", ["RAJA"]),
+    # ufs-weather-model: a Find module only a package would have shipped.
+    "find-module": ("NONE", "find_package(ESMF MODULE REQUIRED)\n", ["ESMF"]),
+    # pocl takes LLVM 18.1, 19.1 or 20.1 only, else llvm-config; tvm asks llvm-config.
+    "llvm-range": ("NONE", "find_package(LLVM 20.1.0...<20.2 CONFIG)\n"
+                   "if(NOT LLVM_FOUND)\n  find_package(LLVM 19.1.0...<19.2 CONFIG)\nendif()\n"
+                   "if(NOT LLVM_FOUND)\n"
+                   "  find_program(LLVM_CONFIG_BIN NAMES llvmtce-config llvm-config)\nendif()\n"
+                   "if(NOT LLVM_CONFIG_BIN AND NOT LLVM_PACKAGE_VERSION)\n"
+                   '  message(FATAL_ERROR "Could not find either llvm-config or LLVMConfig.cmake !")\n'
+                   "endif()\n", ["LLVM"]),
+    "llvm-config": ("NONE", "find_package(LLVM REQUIRED CONFIG)\n"
+                    "set(LLVM_CONFIG ${LLVM_TOOLS_BINARY_DIR}/llvm-config)\n"
+                    "foreach(q --libfiles --system-libs --cxxflags --version --prefix --libdir "
+                    "--cmakedir --targets-built)\n"
+                    "  execute_process(COMMAND ${LLVM_CONFIG} ${q} RESULT_VARIABLE rc OUTPUT_VARIABLE o)\n"
+                    "  if(rc)\n"
+                    '    message(FATAL_ERROR "Fatal error executing: ${LLVM_CONFIG} ${q}")\n'
+                    "  endif()\nendforeach()\n", ["LLVM"]),
+    # rstudio: a QUIET Boost with components, and its own error after.
+    "boost-quiet": ("CXX", "find_package(Boost 1.91.0 QUIET COMPONENTS filesystem system)\n"
+                    "if(NOT Boost_FOUND)\n"
+                    '  message(FATAL_ERROR "Could not find Boost 1.91.0 or newer")\n'
+                    "endif()\n", ["Boost"]),
+    # gdl: FindZLIB passes its library names as one list argument.
+    "zlib-quiet": ("C", "find_package(ZLIB QUIET)\n"
+                   "if(NOT ZLIB_FOUND)\n"
+                   '  message(FATAL_ERROR "ZLib library is required but was not found.")\n'
+                   "endif()\n", ["ZLIB"]),
+    # musescore links what its framework's add-library command made.
+    "linked-command-target": ("CXX", "find_package(Muse REQUIRED)\n"
+                              'file(WRITE ${CMAKE_BINARY_DIR}/a.cpp "int a(){return 0;}")\n'
+                              "muse_add_library(core ${CMAKE_BINARY_DIR}/a.cpp)\n"
+                              "add_library(app STATIC ${CMAKE_BINARY_DIR}/a.cpp)\n"
+                              "target_link_libraries(app core)\n", ["Muse", "muse"]),
+    # tvm runs llvm-config by bare name.
+    "stub-on-path": ("NONE", "find_package(LLVM REQUIRED CONFIG)\n"
+                     "execute_process(COMMAND llvm-config --version RESULT_VARIABLE rc "
+                     "OUTPUT_VARIABLE v)\n"
+                     "if(rc)\n"
+                     '  message(FATAL_ERROR "Fatal error executing: llvm-config --version")\n'
+                     "endif()\n", ["LLVM"]),
+    # FPHSA's HANDLE_COMPONENTS: "Failed to find all ICU components (missing: i18n)".
+    "icu-components": ("CXX", "find_package(ICU REQUIRED COMPONENTS uc i18n)\n", ["ICU"]),
+    # Xft counts only with Freetype and Fontconfig, which FindX11 asks for QUIET.
+    "x11-xft": ("C", "find_package(X11 REQUIRED COMPONENTS Xft)\n",
+                ["X11", "Freetype", "Fontconfig"]),
+    # FindHDF5 reads H5pubconf.h only if it is there, and its version by if(MATCHES).
+    "hdf5-version": ("C", "find_package(HDF5 REQUIRED COMPONENTS C)\n"
+                     "if(HDF5_VERSION VERSION_LESS 1.14)\n"
+                     '  message(FATAL_ERROR "required HDF5 version is at least 1.14")\n'
+                     "endif()\n"
+                     "if(HDF5_IS_PARALLEL)\n"
+                     '  message(FATAL_ERROR "a stub claimed a feature nobody asked for")\n'
+                     "endif()\n", ["HDF5"]),
+    "hdf5-parallel": ("C", "find_package(HDF5 REQUIRED COMPONENTS C)\n"
+                      "if(NOT HDF5_IS_PARALLEL)\n"
+                      '  message(FATAL_ERROR "HDF5 library needs to enable parallel support.")\n'
+                      "endif()\n", ["HDF5"]),
+}
+
+
+@needs_cmake
+@pytest.mark.parametrize("case", sorted(CMAKES_OWN_MODULES))
+def test_cmakes_own_find_modules_are_satisfied(case, tmp_path):
+    language, body, blockers = CMAKES_OWN_MODULES[case]
+    before = "find_package(ecbuild 3.4 REQUIRED)\n" if case == "config-before-project" else ""
+    (tmp_path / "CMakeLists.txt").write_text(
+        f"cmake_minimum_required(VERSION 3.16)\n{before}project(demo {language})\n{body}"
+    )
+    result = run(tmp_path, timeout=240)
+    assert result.completed, result.error
+    assert result.blockers == blockers
+
+
+FIND_TBB = """\
+find_path(TBB_INCLUDE_DIR tbb/version.h)
+find_library(TBB_LIBRARY tbb)
+if(TBB_INCLUDE_DIR)
+  file(STRINGS "${TBB_INCLUDE_DIR}/tbb/version.h" _v REGEX "#define TBB_VERSION_(MAJOR|MINOR) ")
+  string(REGEX REPLACE ".*#define TBB_VERSION_MAJOR ([0-9]+).*" "\\\\1" _major "${_v}")
+  string(REGEX REPLACE ".*#define TBB_VERSION_MINOR ([0-9]+).*" "\\\\1" _minor "${_v}")
+  set(TBB_VERSION "${_major}.${_minor}")
+endif()
+include(FindPackageHandleStandardArgs)
+find_package_handle_standard_args(TBB REQUIRED_VARS TBB_INCLUDE_DIR TBB_LIBRARY VERSION_VAR TBB_VERSION)
+"""
+
+FIND_CYTHON = """\
+find_program(CYTHON_EXECUTABLE NAMES cython)
+if(CYTHON_EXECUTABLE)
+  execute_process(COMMAND ${CYTHON_EXECUTABLE} --version OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
+  string(REGEX REPLACE ".*Cython version ([0-9.]+).*" "\\\\1" CYTHON_VERSION "${_out}")
+endif()
+include(FindPackageHandleStandardArgs)
+find_package_handle_standard_args(Cython REQUIRED_VARS CYTHON_EXECUTABLE VERSION_VAR CYTHON_VERSION
+                                  HANDLE_VERSION_RANGE)
+"""
+
+
+@needs_cmake
+@pytest.mark.parametrize("module, wants", [
+    (FIND_TBB, "find_package(TBB 2020.3 REQUIRED)"),          # openvdb: years, not 99
+    (FIND_CYTHON, "find_package(Cython 3.0.4...<4.0.0 REQUIRED)"),   # espresso: a range
+])
+def test_a_stub_is_redone_at_the_version_the_configure_asked_for(module, wants, tmp_path):
+    (tmp_path / "cmake").mkdir()
+    name = "TBB" if module is FIND_TBB else "Cython"
+    (tmp_path / "cmake" / f"Find{name}.cmake").write_text(module)
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.19)\nproject(demo NONE)\n"
+        "list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake)\n" + wants + "\n"
+    )
+    result = run(tmp_path, timeout=240)
+    assert result.completed, result.error
+    assert name in result.blockers
+
+
+def test_a_setting_is_answered_and_a_feature_switch_only_when_asked_for(tmp_path):
+    sysroot = tmp_path / "sysroot"
+    header = sysroot / "include" / "metis.h"
+    header.parent.mkdir(parents=True)
+    header.write_text("/* stub emitted by will-it-riscv for METIS */\n")
+    width = "^#define[\t ]+IDXTYPEWIDTH[\t ]+([0-9\\.]+[0-9\\.]+)$"
+    parallel = "HAVE_PARALLEL 1"
+    answered: set = set()
+    pseudobuild._answer_reads([(str(header), width), (str(header), parallel)], sysroot, answered)
+    assert "IDXTYPEWIDTH" in header.read_text() and "HAVE_PARALLEL" not in header.read_text()
+    pseudobuild._answer_reads([(str(header), parallel)], sysroot, answered,
+                              "HDF5 library needs to enable parallel support.")
+    assert "HAVE_PARALLEL 1" in header.read_text()
+
+
+def test_only_stub_files_in_the_sysroot_are_answered(tmp_path):
+    sysroot = tmp_path / "sysroot"
+    (sysroot / "include").mkdir(parents=True)
+    ours = sysroot / "include" / "foo.h"
+    ours.write_text("/* stub emitted by will-it-riscv for foo */\n")
+    config = sysroot / "lib" / "cmake" / "Foo" / "FooConfig.cmake"
+    config.parent.mkdir(parents=True)
+    config.write_text("set(Foo_FOUND 1)\n")
+    outside = tmp_path / "real.h"
+    outside.write_text("/* stub emitted by will-it-riscv */\n")
+    reads = [(str(p), "#define FOO_VERSION_MAJOR[ \t]+[0-9]+") for p in (ours, config, outside)]
+    answered: set = set()
+    assert pseudobuild._answer_reads(reads, sysroot, answered) == [str(ours)]
+    assert "#define FOO_VERSION_MAJOR 99" in ours.read_text()
+    assert pseudobuild._answer_reads(reads, sysroot, answered) == []   # each grep once
+
+
+@needs_cmake
+@pytest.mark.skipif(not shutil.which("gfortran"), reason="gfortran is not installed")
+def test_fortran_and_c_are_taken_to_agree_without_linking(tmp_path):
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(demo C CXX Fortran)\n"
+        "include(FortranCInterface)\n"
+        "FortranCInterface_VERIFY()\n"
+        "FortranCInterface_VERIFY(CXX)\n"
+    )
+    result = run(tmp_path, timeout=120)
+    assert result.completed, result.error
+
+
+def test_shims_that_only_fail_are_not_on_the_configures_path():
+    path = "/home/u/.pyenv/shims:/usr/bin:/home/u/.asdf/shims/:/opt/bin"
+    assert pseudobuild._without_shims(path) == "/usr/bin:/opt/bin"
+
+
+def test_a_config_mode_dir_hint_leads_to_a_config_that_is_there(tmp_path):
+    """Faking <Pkg>_DIR alone sends CMake after a config file that is not
+    there; it only ever points at the config stub written for it."""
     overrides, _ = synth(ERROR + "Could NOT find PROJ (missing: PROJ_DIR)\n", tmp_path)
-    assert "PROJ_DIR" not in overrides
+    if "PROJ_DIR" in overrides:
+        assert (Path(overrides["PROJ_DIR"]) / "PROJConfig.cmake").is_file()
 
 
 def test_an_unrecognised_variable_is_merely_made_truthy(tmp_path):

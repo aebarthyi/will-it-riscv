@@ -270,7 +270,13 @@ class Environment:
     timeout: int = 600
 
 
-def environment(python: str = "3.12", arch: str = "riscv64", timeout: int = 600) -> Environment:
+#: What labels were made and checked against; ``--distro`` elsewhere.
+LABEL_DISTRO = "debian:trixie"
+
+
+def environment(
+    python: str = "3.12", arch: str = "riscv64", timeout: int = 600, distro: str = LABEL_DISTRO,
+) -> Environment:
     import httpx
 
     from .cache import Cache
@@ -282,8 +288,9 @@ def environment(python: str = "3.12", arch: str = "riscv64", timeout: int = 600)
     client = httpx.Client(timeout=60, follow_redirects=True)
     major, minor = (int(p) for p in python.split(".")[:2])
     target = Target.parse(arch, (major, minor))
-    distro = DistroIndex(client, cache, resolve_spec("debian:trixie"), target.arch)
-    distro.names()
+    distro = DistroIndex(client, cache, resolve_spec(distro), target.arch)
+    if distro.names() is None:
+        raise RuntimeError(f"{distro.spec.label}: {distro.error}")
     return Environment(PackageIndex(client, cache), distro, target, cache.root / "pip", timeout)
 
 
@@ -316,7 +323,25 @@ def plan_faults(result) -> list[str]:
         for line in getattr(outcome, "plan_check", None) or []:
             if "which no plan step does" in line or "which the driver never configured" in line:
                 problems.append(f"step {outcome.step.id!r}: {line}")
+        if outcome.status in ("failed", "stopped") and "COMPILER" in detail:
+            for name, value in outcome.step.defines.items():
+                if name.endswith("_COMPILER") and _PLACEHOLDER.search(value):
+                    problems.append(
+                        f"step {outcome.step.id!r} sets {name} to {value!r}, "
+                        "which is filled in by whoever runs the build, and the configure "
+                        f"stopped on it: {detail}; leave the compiler to CMake"
+                    )
+    for step_id, name, near, distro in getattr(result, "unknown_names", []):
+        problems.append(
+            f"step {step_id!r}: {distro} has no package named {name!r} on any architecture"
+            + (f" (it has {', '.join(near)})" if near else "")
+            + "; name the Debian package the build needs, or leave it out"
+        )
     return problems
+
+
+#: A value someone fills in: ${FC}, $CC, <C compiler>, @CXX@.
+_PLACEHOLDER = re.compile(r"\$\{?\w+\}?|<[^<>]+>|@\w+@")
 
 
 def summary(result) -> dict:
@@ -387,6 +412,63 @@ def label(
     }
     (directory / "meta.json").write_text(json.dumps(meta, indent=2))
     return meta
+
+
+def revise(
+    directory: Path, planner: modelplan.Backend, env: Environment,
+    rounds: int = modelplan.ROUNDS,
+) -> Optional[dict]:
+    """Send a verified label back to the teacher with what running it now shows.
+
+    For labels made before the executor could tell a plan's mistake from an
+    answer: a package name Debian has nowhere read as "nothing for riscv64".
+    The teacher sees its plan and the problems, as it would have in a later
+    round, and its answer is run and checked like any other. What was there
+    before goes to ``revised-from/``; nothing changes when the plan holds.
+    Returns the revision record, or None when there was nothing to revise.
+    """
+    meta = json.loads((directory / "meta.json").read_text())
+    found = tree(meta)
+    if found.root is None:
+        raise RuntimeError(f"{directory.name}: its tree is {found.error}")
+    root = found.root
+    pack = evidence.EvidencePack.from_dict(json.loads((directory / "pack.json").read_text()))
+    before = load_plan(directory / "plan.json")
+    problems = plan_faults(run_plan(before, root, env))
+    if not problems:
+        return None
+    executed: dict = {}
+
+    def verify(plan: Plan) -> list[str]:
+        result = run_plan(plan, root, env)
+        executed["result"] = result
+        return plan_faults(result)
+
+    history = [
+        {"role": "assistant", "content": json.dumps(modelplan.to_wire(before))},
+        {"role": "user", "content": modelplan.feedback(problems)},
+    ]
+    outcome = modelplan.plan_repository(
+        root, planner, pack=pack, rounds=rounds, verify=verify, history=history)
+    record = {
+        "problems": problems, "backend": outcome.backend, "error": outcome.error,
+        "ok": outcome.ok, "cost_usd": outcome.cost_usd,
+        "attempts": [{"text": a.text, "problems": a.problems} for a in outcome.attempts],
+    }
+    if outcome.ok and "result" in executed:
+        kept = directory / "revised-from"
+        kept.mkdir(exist_ok=True)
+        for name in ("plan.json", "run.json", "plan.relabelled.json", "relabel.json"):
+            if (directory / name).is_file():
+                (directory / name).replace(kept / name)
+        (directory / "plan.json").write_text(
+            json.dumps(plan_to_dict(outcome.plan), indent=2) + "\n")
+        (directory / "run.json").write_text(json.dumps(summary(executed["result"]), indent=2))
+        meta["revised"] = True
+        meta["cost_usd"] = (meta.get("cost_usd") or 0) + (outcome.cost_usd or 0)
+        (directory / "meta.json").write_text(json.dumps(meta, indent=2))
+    (directory / "revision.json").write_text(json.dumps(record, indent=2))
+    return record
 
 
 def _say(message: str) -> None:
@@ -470,11 +552,19 @@ def label_corpus(
 
 def examples(
     out: Path, tiers: tuple[str, ...] = (VERIFIED,), relabelled: bool = False,
+    corrections: bool = False, transcripts: tuple[Path, ...] = (),
 ) -> list[dict]:
     """Every labelled example of these tiers: the pack in, the plan out.
 
     ``relabelled``: the plan as the executor re-marked it, where there is one
     (``will-it-riscv-dataset relabel``), rather than as the teacher wrote it.
+
+    ``corrections``: also, for every answer that was sent back, an example
+    that continues from it -- the pack, that answer, what was wrong with it
+    -- to the verified plan, so a model learns to act on what it is told.
+    The answers are the teacher's own earlier rounds, the plan a revision
+    replaced (``revise``), and a model's, from the ``--transcripts`` of an
+    eval run with ``--run-feedback``, a directory of one file a key.
     """
     found = []
     for directory in sorted(p for p in out.iterdir() if (p / "meta.json").is_file()):
@@ -484,29 +574,62 @@ def examples(
         chosen = directory / "plan.relabelled.json"
         plan = load_plan(chosen if relabelled and chosen.is_file() else directory / "plan.json")
         pack = (directory / "pack.txt").read_text()
-        found.append({
-            "messages": [
-                {"role": "system", "content": modelplan.SYSTEM_PROMPT},
-                {"role": "user", "content": pack},
-                {"role": "assistant", "content": json.dumps(modelplan.to_wire(plan))},
-            ],
-            "meta": {
-                "name": meta["entry"]["name"], "key": directory.name, "split": meta["split"],
-                "tier": meta["tier"], "origin": meta.get("origin"),
-                "pack_digest": meta.get("pack_digest"),
-            },
-        })
+        answer = {"role": "assistant", "content": json.dumps(modelplan.to_wire(plan))}
+        start = [
+            {"role": "system", "content": modelplan.SYSTEM_PROMPT},
+            {"role": "user", "content": pack},
+        ]
+        base = {
+            "name": meta["entry"]["name"], "key": directory.name, "split": meta["split"],
+            "tier": meta["tier"], "origin": meta.get("origin"),
+            "pack_digest": meta.get("pack_digest"),
+        }
+        found.append({"messages": [*start, answer], "meta": base})
+        if not corrections or meta["split"] != "train":
+            continue    # the eval asks for a first answer; a test key's corrections go nowhere
+        for source, (text, problems) in _sent_back(directory, transcripts):
+            found.append({
+                "messages": [
+                    *start, {"role": "assistant", "content": text},
+                    {"role": "user", "content": modelplan.feedback(problems)}, answer,
+                ],
+                "meta": {**base, "key": f"{directory.name}#{source}", "of": directory.name},
+            })
     return found
+
+
+def _sent_back(directory: Path, transcripts: tuple[Path, ...]):
+    """``(source, (answer, problems))`` for every answer about this key that went back."""
+    tried = directory / "transcript.json"
+    if tried.is_file():
+        for i, attempt in enumerate(json.loads(tried.read_text())):
+            if attempt.get("problems"):
+                yield f"teacher-{i}", (attempt["text"], attempt["problems"])
+    revision = directory / "revision.json"
+    before = directory / "revised-from" / "plan.json"
+    if revision.is_file() and before.is_file():
+        record = json.loads(revision.read_text())
+        if record.get("ok"):
+            text = json.dumps(modelplan.to_wire(load_plan(before)))
+            yield "revised", (text, record["problems"])
+    for n, where in enumerate(transcripts):
+        mined = where / f"{directory.name}.json"
+        if not mined.is_file():
+            continue
+        for i, attempt in enumerate(json.loads(mined.read_text()).get("attempts", [])):
+            if attempt.get("problems"):
+                yield f"model{n}-{i}", (attempt["text"], attempt["problems"])
 
 
 def export(
     out: Path, destination: Path, tiers: tuple[str, ...] = (VERIFIED,), relabelled: bool = False,
+    corrections: bool = False, transcripts: tuple[Path, ...] = (),
 ) -> dict:
     destination.mkdir(parents=True, exist_ok=True)
     counts: dict[str, int] = {}
     handles = {}
     try:
-        for example in examples(out, tiers, relabelled):
+        for example in examples(out, tiers, relabelled, corrections, transcripts):
             split = example["meta"]["split"]
             if split not in handles:
                 handles[split] = (destination / f"{split}.jsonl").open("w")
@@ -655,12 +778,38 @@ def main(argv: Optional[list[str]] = None) -> int:
     exporting.add_argument("--include-partial", action="store_true")
     exporting.add_argument("--relabelled", action="store_true",
                            help="use the executor's marks where relabel wrote them")
+    exporting.add_argument("--corrections", action="store_true",
+                           help="also write, for every answer sent back, an example going "
+                                "from it and its problems to the verified plan")
+    exporting.add_argument("--transcripts", type=Path, action="append", default=[],
+                           help="with --corrections: a model's answers too, from an eval "
+                                "run's --transcripts directory")
 
     relabelling = sub.add_parser(
         "relabel", help="let the default configures mark each stated package required or not")
     relabelling.add_argument("--out", required=True, type=Path)
     relabelling.add_argument("--only", action="append", default=[], metavar="KEY")
     relabelling.add_argument("--jobs", type=int, default=1)
+
+    revising = sub.add_parser(
+        "revise", help="send verified labels back to the teacher with what running them shows")
+    revising.add_argument("--out", required=True, type=Path)
+    revising.add_argument("--only", action="append", default=[], metavar="KEY")
+    revising.add_argument("--planner", default="claude-cli",
+                          choices=("claude-cli", "anthropic", "openai"))
+    revising.add_argument("--planner-model")
+    revising.add_argument("--planner-url")
+    revising.add_argument("--jobs", type=int, default=1)
+
+    rerunning = sub.add_parser(
+        "rerun", help="run verified plans again on today's executor and record the runs")
+    rerunning.add_argument("--out", required=True, type=Path)
+    rerunning.add_argument("--split", help="only this split (default: every example)")
+    rerunning.add_argument("--only", action="append", default=[], metavar="KEY")
+    rerunning.add_argument("--jobs", type=int, default=1)
+    rerunning.add_argument("--distro", default=LABEL_DISTRO,
+                           help="run against this archive instead (default: %(default)s); "
+                                "the run goes to its own file, beside run.json")
 
     checking = sub.add_parser(
         "check", help="find every verified example's tree and rebuild its pack")
@@ -694,12 +843,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
     if args.command == "export":
         tiers = (VERIFIED, PARTIAL) if args.include_partial else (VERIFIED,)
-        counts = export(args.out, args.to, tiers, relabelled=args.relabelled)
+        counts = export(args.out, args.to, tiers, relabelled=args.relabelled,
+                        corrections=args.corrections, transcripts=tuple(args.transcripts))
         written = ", ".join(f"{split}: {n}" for split, n in sorted(counts.items()))
         print(written or "nothing to export")
         return 0
     if args.command == "relabel":
         return _relabel_all(args.out, args.only, args.jobs)
+    if args.command == "rerun":
+        return _rerun_all(args)
+    if args.command == "revise":
+        return _revise_all(args)
     if args.command == "check":
         index = environment().index if args.fetch else None
         outcomes = check(args.out, fetch_missing=args.fetch, index=index)
@@ -720,6 +874,94 @@ def main(argv: Optional[list[str]] = None) -> int:
         for entry in entries:
             handle.write(json.dumps({k: v for k, v in asdict(entry).items() if v}) + "\n")
     print(f"{len(entries)} packages written to {args.to}")
+    return 0
+
+
+def run_file(directory: Path, distro: str = LABEL_DISTRO) -> Path:
+    """Where the verified plan's run against this distro is kept: ``run.json``
+    for the one labels were made against, ``run.ubuntu-resolute.json`` and so on."""
+    if distro == LABEL_DISTRO:
+        return directory / "run.json"
+    return directory / f"run.{distro.replace(':', '-')}.json"
+
+
+def rerun(directory: Path, env: Environment) -> tuple[Optional[str], Optional[str]]:
+    """Run a verified plan again on today's executor, and record what it shows.
+
+    The eval compares a planner's run with the reference's; recorded by an
+    older executor, that compares the planner against the executor's past.
+    Against another distro, it is that distro's reference (``run_file``).
+    The run it replaces is kept as ``run.before.json`` (and so on). Returns
+    the verdicts, before and after.
+    """
+    meta = json.loads((directory / "meta.json").read_text())
+    found = tree(meta)
+    if found.root is None:
+        raise RuntimeError(f"{directory.name}: its tree is {found.error}")
+    ran = summary(run_plan(load_plan(directory / "plan.json"), found.root, env))
+    recorded = run_file(directory, env.distro.spec.id)
+    before = json.loads(recorded.read_text())["verdict"] if recorded.is_file() else None
+    if recorded.is_file():
+        recorded.replace(recorded.with_name(recorded.name.replace("run.", "run.before.", 1)))
+    recorded.write_text(json.dumps(ran, indent=2))
+    return before, ran["verdict"]
+
+
+def _rerun_all(args) -> int:
+    env = environment(distro=args.distro)
+    keys = args.only or sorted(
+        p.name for p in args.out.iterdir()
+        if (p / "meta.json").is_file()
+        and (meta := json.loads((p / "meta.json").read_text())).get("tier") == VERIFIED
+        and (args.split is None or meta.get("split") == args.split)
+    )
+
+    def one(key: str):
+        try:
+            return key, rerun(args.out / key, env)
+        except Exception as exc:  # noqa: BLE001 - one bad example does not stop the rest
+            return key, exc
+
+    changed = 0
+    with ThreadPoolExecutor(args.jobs) as pool:
+        for key, got in pool.map(one, keys):
+            if isinstance(got, Exception):
+                print(f"{key}: {got}", flush=True)
+                continue
+            before, after = got
+            changed += before is not None and before != after
+            print(f"{key}: {before} -> {after}" if before != after else f"{key}: {after}",
+                  flush=True)
+    print(f"{changed} of {len(keys)} verdicts changed")
+    return 0
+
+
+def _revise_all(args) -> int:
+    planner = modelplan.backend(args.planner, args.planner_model, args.planner_url)
+    env = environment()
+    keys = args.only or sorted(
+        p.name for p in args.out.iterdir()
+        if (p / "meta.json").is_file()
+        and json.loads((p / "meta.json").read_text()).get("tier") == VERIFIED
+    )
+    spent = 0.0
+
+    def one(key: str) -> tuple[str, Optional[dict]]:
+        try:
+            return key, revise(args.out / key, planner, env)
+        except Exception as exc:  # noqa: BLE001 - one bad example does not stop the rest
+            return key, {"ok": False, "error": str(exc), "problems": []}
+
+    with ThreadPoolExecutor(args.jobs) as pool:
+        for key, record in pool.map(one, keys):
+            if record is None:
+                print(f"{key}: holds", flush=True)
+                continue
+            spent += record.get("cost_usd") or 0.0
+            why = record.get("error") or "still wrong"
+            state = "revised" if record["ok"] else f"not revised ({why})"
+            print(f"{key}: {len(record['problems'])} problems, {state}; ${spent:.2f} so far",
+                  flush=True)
     return 0
 
 

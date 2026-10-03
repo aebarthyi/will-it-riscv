@@ -117,3 +117,39 @@ def test_a_clone_gets_its_submodules(tmp_path, monkeypatch):
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", "always")
     assert init_submodules(clone) is None
     assert (clone / "third_party" / "inner" / "CMakeLists.txt").is_file()
+
+
+def _ran(*steps, unknown=()):
+    from will_it_riscv import planrun
+    from will_it_riscv.plan import parse_plan
+
+    plan = parse_plan({"version": 1, "repo": "demo", "steps": [raw for raw, _, _ in steps]})
+    result = planrun.PlanResult(plan, None)
+    for step, (_, status, detail) in zip(plan.steps, steps):
+        result.steps.append(planrun.StepResult(step, status, detail))
+    result.unknown_names = list(unknown)
+    return result
+
+
+def test_a_name_debian_does_not_have_goes_back_with_the_near_names():
+    result = _ran(({"id": "apt", "kind": "system-packages", "packages": ["openmpi"],
+                    "evidence": []}, "done", "1 package"),
+                  unknown=[("apt", "openmpi", ["libopenmpi-dev", "openmpi-bin"],
+                            "Ubuntu 26.04 LTS (resolute)")])
+    (problem,) = dataset.plan_faults(result)
+    assert "Ubuntu 26.04 LTS (resolute) has no package named 'openmpi'" in problem
+    assert "libopenmpi-dev, openmpi-bin" in problem
+
+
+def test_a_placeholder_compiler_that_stops_the_configure_goes_back():
+    """pflogger's CI passes -DCMAKE_Fortran_COMPILER=${FC}; bolt's README <C compiler>."""
+    result = _ran(
+        ({"id": "configure", "kind": "cmake-configure", "evidence": [],
+          "defines": {"CMAKE_Fortran_COMPILER": "${FC}", "CMAKE_INSTALL_PREFIX": "${HOME}/x"}},
+         "failed", "CMake Error at CMakeLists.txt:22 (project): No CMAKE_Fortran_COMPILER "
+                   "could be found."),
+        ({"id": "fine", "kind": "cmake-configure", "evidence": [], "source": "sub",
+          "defines": {"CMAKE_C_COMPILER": "<C compiler>"}}, "completed", "1 round"),
+    )
+    (problem,) = dataset.plan_faults(result)
+    assert "'configure' sets CMAKE_Fortran_COMPILER to '${FC}'" in problem

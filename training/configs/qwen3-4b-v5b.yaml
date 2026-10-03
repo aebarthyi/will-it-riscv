@@ -1,0 +1,16 @@
+# Control for v5a: qwen3-4b-h200's recipe and data (v3) with v4's 28 revised labels,
+# and no corrections. Close to a rerun of h200, so it also shows run-to-run noise.
+# 1266 train (214 repo, 260 pypi, 792 quiz), 33 valid, 5.49M tokens an epoch:
+# 159 steps an epoch, 795 in all. Score the epoch 2 and 3 checkpoints.
+model: Qwen/Qwen3-4B-Instruct-2507
+data: data/prepared-v5b
+dtype: bfloat16
+attention: sdpa
+fsdp: false
+offload: false
+lora_r: 64
+lora_alpha: 128
+lr: 2.0e-4
+epochs: 5
+accumulation: 8
+save_every: 10

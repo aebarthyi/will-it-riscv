@@ -1,0 +1,17 @@
+# qwen3-4b-v5a for a few steps, longest sequences first: peak memory at 32k
+# and tokens per second, before the long run. Its own out, so last/ is not shared.
+model: Qwen/Qwen3-4B-Instruct-2507
+data: data/prepared-v5a
+dtype: bfloat16
+attention: sdpa
+fsdp: false
+offload: false
+lora_r: 64
+lora_alpha: 128
+lr: 2.0e-4
+epochs: 3
+accumulation: 8
+longest_first: true
+max_steps: 3
+save_every: 3
+eval_every: 1000

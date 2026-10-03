@@ -43,6 +43,7 @@ DEFAULTS = {
     "model": "Qwen/Qwen3-4B-Instruct-2507",
     "data": "data/prepared/12288",
     "out": None,                  # default: /scratch/runs/<config name>
+    "init_adapter": None,         # a checkpoint directory to start the LoRA from (same rank)
     "lora_r": 16, "lora_alpha": 32,
     "lr": 1e-4, "warmup": 0.03, "epochs": 3, "accumulation": 8, "clip": 1.0,
     "attention_block": 512, "offload": True,
@@ -219,6 +220,16 @@ def main(argv=None) -> int:
     model = get_peft_model(model, LoraConfig(
         r=config["lora_r"], lora_alpha=config["lora_alpha"], lora_dropout=0.0,
         target_modules="all-linear", task_type="CAUSAL_LM"))
+    if config["init_adapter"]:
+        # Training on from a finished run's adapter (rejection-sampling SFT); a resume
+        # below replaces these weights with its own.
+        from safetensors.torch import load_file
+
+        weights = load_file(str(Path(config["init_adapter"]) / "adapter_model.safetensors"))
+        loaded = set_peft_model_state_dict(model, weights)
+        # Keys that match nothing would leave the LoRA at its initialisation, silently.
+        assert not loaded.unexpected_keys, loaded.unexpected_keys[:5]
+        log(f"adapter from {config['init_adapter']}: {len(weights)} tensors")
     params = [p for p in model.parameters() if p.requires_grad]
     for p in params:              # LoRA weights train in fp32 under fp16 autocast
         p.data = p.data.float()

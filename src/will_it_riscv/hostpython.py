@@ -63,6 +63,11 @@ class _StubLoader(importlib.abc.Loader):
     def exec_module(self, module):
         module.__getattr__ = lambda name: _Anything()
         module.__path__ = []
+        # Asked where it is, or which it is -- neuron's FindPythonModule
+        # prints numpy.__file__ -- a stub says something a string can hold.
+        module.__file__ = os.path.join(STUBSITE, module.__name__.replace(".", os.sep),
+                                       "__init__.py")
+        module.__version__ = "99.9.9"
 
 
 class _Stubs(importlib.abc.MetaPathFinder):
@@ -134,6 +139,9 @@ class _Anything:
         return ""
     def __mro_entries__(self, bases):
         return (object,)
+
+
+__version__ = "99.9.9"
 
 
 def __getattr__(name):

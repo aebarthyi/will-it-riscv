@@ -1,0 +1,18 @@
+# qwen3-4b-rft1 for a few steps, longest sequences first: that the adapter loads and
+# peak memory at 32k, before the real runs. Its own out, so last/ is not shared.
+model: Qwen/Qwen3-4B-Instruct-2507
+data: data/prepared-rft1
+init_adapter: /scratch/runs/qwen3-4b-h200/checkpoint-318
+dtype: bfloat16
+attention: sdpa
+fsdp: false
+offload: false
+lora_r: 64
+lora_alpha: 128
+lr: 5.0e-5
+epochs: 2
+accumulation: 8
+longest_first: true
+max_steps: 3
+save_every: 3
+eval_every: 1000

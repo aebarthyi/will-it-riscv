@@ -131,3 +131,79 @@ def test_missing_port_is_reported_not_raised(tmp_path):
     assert not index.available
     assert "no sparc64 port" in index.error
     assert index.has("libssl-dev") is False
+
+
+class _ByArch(httpx.BaseTransport):
+    """A Packages.gz for each (arch, component) given; 404 for the rest."""
+
+    def __init__(self, lists: dict):
+        self.lists = lists
+
+    def handle_request(self, request):
+        for (arch, component), names in self.lists.items():
+            if f"/{component}/binary-{arch}/" in str(request.url):
+                body = "".join(f"Package: {n}\n\n" for n in names).encode()
+                return httpx.Response(200, content=gzip.compress(body))
+        return httpx.Response(404)
+
+
+def _debian(tmp_path, lists):
+    client = httpx.Client(transport=_ByArch(lists))
+    return DistroIndex(client, Cache(root=tmp_path / "cache"), KNOWN_DISTROS["debian:trixie"],
+                       "riscv64")
+
+
+def test_a_name_no_arch_has_is_not_named_and_one_amd64_has_is(tmp_path):
+    """openmpi is nobody's package; CUDA is amd64's, and in non-free."""
+    index = _debian(tmp_path, {
+        ("riscv64", "main"): ["libopenmpi-dev", "openmpi-bin"],
+        ("amd64", "main"): ["libopenmpi-dev", "openmpi-bin", "libnuma-dev"],
+        ("amd64", "non-free"): ["nvidia-cuda-toolkit"],
+    })
+    assert index.named("libopenmpi-dev") is True
+    assert index.named("libnuma-dev") is True           # just not for riscv64
+    assert index.named("nvidia-cuda-toolkit") is True
+    assert index.named("openmpi") is False
+
+
+def test_named_is_unsure_when_the_reference_list_cannot_be_had(tmp_path):
+    index = _debian(tmp_path, {("riscv64", "main"): ["gcc"]})
+    assert index.named("gcc") is True
+    assert index.named("openmpi") is None
+
+
+def test_similar_puts_the_dev_package_first_and_leaves_out_docs_and_bindings(tmp_path):
+    index = _debian(tmp_path, {("riscv64", "main"): [
+        "openmpi-doc", "openmpi-bin", "libopenmpi-dev", "libopenmpi40", "zlib1g-dev",
+        "lua-zlib-dev", "libpcre2-dev", "libghc-zlib-dev",
+    ]})
+    assert index.similar("openmpi") == ["libopenmpi-dev", "openmpi-bin", "libopenmpi40"]
+    assert index.similar("zlib-dev") == ["zlib1g-dev"]
+    assert index.similar("libpcre3-dev") == ["libpcre2-dev"]
+    assert index.similar("build-base") == []
+
+
+def test_ubuntu_looks_for_a_name_in_the_main_archive_since_ports_has_no_amd64(tmp_path):
+    seen = []
+
+    class Archive(httpx.BaseTransport):
+        def handle_request(self, request):
+            url = str(request.url)
+            seen.append(url)
+            names = {
+                ("ports.ubuntu.com", "main"): ["libopenmpi-dev"],
+                ("archive.ubuntu.com", "main"): ["libopenmpi-dev"],
+                ("archive.ubuntu.com", "multiverse"): ["nvidia-cuda-toolkit"],
+            }
+            for (host, component), listed in names.items():
+                if request.url.host == host and f"/{component}/" in url:
+                    body = "".join(f"Package: {n}\n\n" for n in listed).encode()
+                    return httpx.Response(200, content=gzip.compress(body))
+            return httpx.Response(404)
+
+    index = DistroIndex(httpx.Client(transport=Archive()), Cache(root=tmp_path / "cache"),
+                        KNOWN_DISTROS["ubuntu:resolute"], "riscv64")
+    assert index.named("nvidia-cuda-toolkit") is True
+    assert index.named("openmpi") is False
+    assert any("archive.ubuntu.com/ubuntu/dists/resolute/multiverse/binary-amd64" in u
+               for u in seen)

@@ -5,7 +5,9 @@ writes down what the default build runs, citing the lines that say so; the
 executor judges. So a wrong plan costs a round, never a wrong verdict: what
 it gets wrong -- JSON that does not parse, a step the format refuses, a
 citation that does not hold, a line the pack never showed it -- goes back
-to it, and it writes the plan again.
+to it, and it writes the plan again. A citation whose quote the pack shows
+on other lines is moved there instead (``relocate``): the quote grounds the
+step, and the line number is only where to find it.
 
 The wire format is the plan format made strict enough for schema-constrained
 decoding: every object closed, evidence always ``{at, quote}``, a
@@ -28,9 +30,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Optional, Protocol
 
@@ -43,6 +46,7 @@ from .plan import (
     SECTIONS,
     STEP_KINDS,
     SYSTEM_PACKAGES,
+    Evidence,
     Plan,
     PlanError,
     check_evidence,
@@ -148,6 +152,42 @@ def in_written_order(schema: Any) -> Any:
                 break
             leading.append(name)
         out["required"] = leading
+    return out
+
+
+#: Longest list the grammar lets a small model write, per property: about twice the
+#: longest in the labelled plans (packages 66, defines 37, unsure 9, ...). Past it, a
+#: model that has started repeating itself is made to close the list.
+MAX_ITEMS = {"packages": 100, "defines": 60, "extras": 40, "steps": 30, "evidence": 20,
+             "unsure": 12, "args": 20, "after": 20, "provides": 20}
+#: Longest string: the labelled plans' longest is an ``unsure`` of 477 characters.
+MAX_LENGTH = 600
+
+
+def bounded(schema: Any, name: str = "") -> Any:
+    """The schema with MAX_ITEMS and MAX_LENGTH, for a grammar to enforce.
+
+    A fine-tuned model decoding greedily can repeat one item or phrase until it
+    runs out of tokens, and a cut-off answer is not JSON: the whole plan is lost.
+    With the limits in the grammar the answer ends shorter but whole.
+    """
+    if isinstance(schema, list):
+        return [bounded(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    out = dict(schema)
+    if "items" in schema:
+        out["items"] = bounded(schema["items"])
+    if "properties" in schema:
+        out["properties"] = {
+            key: bounded(value, key) for key, value in schema["properties"].items()
+        }
+    if "$defs" in schema:
+        out["$defs"] = {key: bounded(value, key) for key, value in schema["$defs"].items()}
+    if schema.get("type") == "array" and name in MAX_ITEMS:
+        out["maxItems"] = MAX_ITEMS[name]
+    if schema.get("type") == "string":
+        out["maxLength"] = MAX_LENGTH
     return out
 
 
@@ -278,14 +318,16 @@ class OpenAICompatible:
 
     def __init__(
         self, url: str, model: str, api_key: Optional[str] = None, max_tokens: int = 8192,
-        timeout: float = 600.0, client: Any = None,
+        timeout: float = 600.0, client: Any = None, temperature: float = 0.0,
     ):
+        """``temperature`` above 0 samples, for drawing several answers to one pack."""
         import httpx
 
         self.name = f"openai:{model}"
         self.url = url.rstrip("/")
         self.model = model
         self.max_tokens = max_tokens
+        self.temperature = temperature
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         self.client = client or httpx.Client(timeout=timeout, headers=headers)
 
@@ -294,11 +336,11 @@ class OpenAICompatible:
             "model": self.model,
             "messages": [{"role": "system", "content": system}, *messages],
             "max_tokens": self.max_tokens,
-            "temperature": 0,
+            "temperature": self.temperature,
             # What vLLM, llama.cpp and Ollama constrain decoding with.
             "response_format": {
                 "type": "json_schema",
-                "json_schema": {"name": "plan", "schema": in_written_order(schema)},
+                "json_schema": {"name": "plan", "schema": bounded(in_written_order(schema))},
             },
         })
         response.raise_for_status()
@@ -309,6 +351,37 @@ class OpenAICompatible:
             input_tokens=usage.get("prompt_tokens", 0),
             output_tokens=usage.get("completion_tokens", 0),
         )
+
+
+class Shared:
+    """Several servers of one model, each answering ``slots`` requests at once.
+
+    Workers forked after this is made share its semaphores: a request waits
+    here until some server has a free slot, and goes to that one. So a busy
+    card never queues work an idle one could take, and a backend's timeout
+    covers answering, not waiting.
+    """
+
+    def __init__(self, backends: list[Backend], slots: int = 1):
+        import multiprocessing
+
+        context = multiprocessing.get_context("fork")
+        self.name = backends[0].name
+        self.backends = backends
+        self.free = context.BoundedSemaphore(len(backends) * slots)
+        self.each = [context.BoundedSemaphore(slots) for _ in backends]
+
+    def complete(self, system: str, messages: list[dict], schema: dict) -> Completion:
+        # Whoever holds ``free`` finds a server slot: a slot is only taken
+        # while ``free`` is held, and there are as many of one as the other.
+        with self.free:
+            for backend, gate in zip(self.backends, self.each):
+                if gate.acquire(block=False):
+                    try:
+                        return backend.complete(system, messages, schema)
+                    finally:
+                        gate.release()
+        raise RuntimeError("no server slot was free")  # pragma: no cover - see above
 
 
 class Anthropic:
@@ -412,12 +485,23 @@ def _as_one_prompt(messages: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
-def backend(kind: str, model: Optional[str] = None, url: Optional[str] = None) -> Backend:
-    """A backend by name, as the command line names it."""
+def backend(
+    kind: str, model: Optional[str] = None, url: Optional[str] = None, slots: int = 1,
+) -> Backend:
+    """A backend by name, as the command line names it.
+
+    For ``openai``, ``url`` may name several servers of the same model,
+    comma-separated; requests then go to whichever has one of its ``slots``
+    free (see Shared).
+    """
     if kind == "openai":
         if not url or not model:
             raise ValueError("the openai backend needs --planner-url and --planner-model")
-        return OpenAICompatible(url, model, api_key=os.environ.get("PLANNER_API_KEY"))
+        key = os.environ.get("PLANNER_API_KEY")
+        urls = [u.strip() for u in url.split(",") if u.strip()]
+        if len(urls) == 1 and slots == 1:
+            return OpenAICompatible(urls[0], model, api_key=key)
+        return Shared([OpenAICompatible(u, model, api_key=key) for u in urls], slots)
     if kind == "anthropic":
         return Anthropic(model or DEFAULT_TEACHER)
     if kind == "claude-cli":
@@ -433,6 +517,8 @@ class Attempt:
     text: str
     problems: list[str]
     completion: Optional[Completion] = None
+    moved: list[str] = field(default_factory=list)
+    """Citations ``relocate`` moved to the lines that say their quote."""
 
 
 @dataclass
@@ -455,9 +541,14 @@ class ModelPlan:
 
 
 def check(
-    text: str, root: Path, pack: evidence_pack.EvidencePack
+    text: str, root: Path, pack: evidence_pack.EvidencePack,
+    moved: Optional[list[str]] = None,
 ) -> tuple[Optional[Plan], Optional[dict], list[str]]:
-    """Everything wrong with one answer, as sentences the model can act on."""
+    """Everything wrong with one answer, as sentences the model can act on.
+
+    The plan comes back with its citations relocated; ``moved`` collects a
+    note for each.
+    """
     try:
         wire = json.loads(text)
     except ValueError as exc:
@@ -468,6 +559,9 @@ def check(
         plan = parse_plan(to_plan(wire))
     except PlanError as exc:
         return None, wire, list(exc.problems)
+    plan, notes = relocate(plan, pack)
+    if moved is not None:
+        moved += notes
     problems = check_evidence(plan, root)
     cited = [("entry", e) for e in plan.entry_evidence] + [
         (f"step {s.id!r}", e) for s in plan.steps for e in s.evidence
@@ -483,6 +577,75 @@ def check(
     return plan, wire, problems
 
 
+def relocate(plan: Plan, pack: evidence_pack.EvidencePack) -> tuple[Plan, list[str]]:
+    """Each citation whose quote is not on its lines, moved to lines the pack shows that say it.
+
+    A model often quotes the right text from the wrong place: gdal's apt
+    line, cited at a comment in another part of the workflow; a setup.py
+    error message, a line off. Sent back, the same citation tends to come
+    back unchanged, and a plan that never holds is never run. The quote is
+    what ties a step to the pack, so the citation moves to the nearest
+    lines the pack shows that say it -- in the cited file first, then
+    anywhere -- and only a quote the pack never shows goes back. Returns the
+    plan and a note for each move.
+    """
+    notes: list[str] = []
+
+    def fixed(owner: str, item: Evidence) -> Evidence:
+        if not item.quote or _says(pack, item):
+            return item
+        found = _find(pack, item)
+        if found is None:
+            return item
+        notes.append(f"{owner}: {item} -> {found}")
+        return found
+
+    entry = [fixed("entry", e) for e in plan.entry_evidence]
+    steps = [
+        replace(s, evidence=[fixed(f"step {s.id!r}", e) for e in s.evidence]) for s in plan.steps
+    ]
+    if not notes:
+        return plan, []
+    return replace(plan, entry_evidence=entry, steps=steps), notes
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _says(pack: evidence_pack.EvidencePack, item: Evidence) -> bool:
+    excerpt = pack.excerpt(item.path)
+    if excerpt is None or not excerpt.shows(item.start, item.end):
+        return False
+    text = " ".join(t for n, t in excerpt.lines if item.start <= n <= item.end)
+    return _squash(item.quote or "") in _squash(text)
+
+
+def _find(pack: evidence_pack.EvidencePack, item: Evidence) -> Optional[Evidence]:
+    """The nearest run of shown lines, up to the cited span or three, that says the quote."""
+    want = _squash(item.quote or "")
+    if not want:
+        return None
+    span = max(3, item.end - item.start + 1)
+    best: Optional[tuple[tuple, Evidence]] = None
+    for order, excerpt in enumerate(pack.excerpts):
+        same = excerpt.path == item.path
+        shown = excerpt.lines
+        for i, (number, _) in enumerate(shown):
+            for width in range(1, span + 1):
+                run = shown[i:i + width]
+                if len(run) < width or run[-1][0] - number != width - 1:
+                    break   # past the end, or across lines the pack leaves out
+                if want in _squash(" ".join(t for _, t in run)):
+                    if width > 1 and want in _squash(" ".join(t for _, t in run[1:])):
+                        break   # the lines after this one say it on their own
+                    rank = (not same, abs(number - item.start) if same else order, number)
+                    if best is None or rank < best[0]:
+                        best = (rank, Evidence(excerpt.path, number, run[-1][0], item.quote))
+                    break
+    return best[1] if best else None
+
+
 def plan_repository(
     root: Path,
     planner: Backend,
@@ -491,26 +654,30 @@ def plan_repository(
     pack: Optional[evidence_pack.EvidencePack] = None,
     rounds: int = ROUNDS,
     verify: Optional[Callable[[Plan], list[str]]] = None,
+    history: Optional[list[dict]] = None,
 ) -> ModelPlan:
     """Ask for a plan, check it, and send it back until it holds or rounds run out.
 
     ``verify`` is a further check on a plan that holds -- running it, for a
-    dataset -- whose problems go back the same way.
+    dataset -- whose problems go back the same way. ``history``: turns after
+    the pack that already happened -- an earlier answer and what was wrong
+    with it -- so the next answer is a revision.
     """
     root = Path(root)
     pack = pack or evidence_pack.build(root, name)
     outcome = ModelPlan(pack=pack, backend=planner.name)
-    messages: list[dict] = [{"role": "user", "content": pack.render()}]
+    messages: list[dict] = [{"role": "user", "content": pack.render()}, *(history or [])]
     for _ in range(max(1, rounds)):
         try:
             completion = planner.complete(SYSTEM_PROMPT, messages, WIRE_SCHEMA)
         except Exception as exc:  # noqa: BLE001 - a backend failing is an outcome
             outcome.error = f"{planner.name}: {exc}"
             break
-        plan, wire, problems = check(completion.text, root, pack)
+        moved: list[str] = []
+        plan, wire, problems = check(completion.text, root, pack, moved)
         if plan is not None and not problems and verify is not None:
             problems = verify(plan)
-        outcome.attempts.append(Attempt(completion.text, problems, completion))
+        outcome.attempts.append(Attempt(completion.text, problems, completion, moved))
         if plan is not None:
             outcome.plan, outcome.wire = plan, wire
         if not problems:
@@ -520,6 +687,11 @@ def plan_repository(
             {"role": "user", "content": _feedback(problems)},
         ]
     return outcome
+
+
+def feedback(problems: list[str]) -> str:
+    """What goes back to the planner about an answer, as the next user turn."""
+    return _feedback(problems)
 
 
 def _feedback(problems: list[str]) -> str:

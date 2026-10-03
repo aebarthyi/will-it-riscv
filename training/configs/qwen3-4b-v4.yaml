@@ -1,0 +1,18 @@
+# qwen3-4b-h200's recipe on the v4 data: 28 labels revised (package names Debian
+# has nowhere), relabelled, and 364 corrections -- an answer that went back, the
+# problems sent with it, then the verified plan (295 from h200-318's own rounds on
+# train, 23 from the teacher's, 21 revisions). 3 epochs: h200's best was epoch 2 of 5.
+# 1605 train (443 repo, 370 pypi, 792 quiz), 58 valid, 9.31M tokens an epoch, none
+# dropped: 201 steps an epoch, 603 in all; ~1.5 h on an H100 at h200's rate.
+model: Qwen/Qwen3-4B-Instruct-2507
+data: data/prepared-v4/32768
+dtype: bfloat16
+attention: sdpa
+fsdp: false
+offload: false
+lora_r: 64
+lora_alpha: 128
+lr: 2.0e-4
+epochs: 3
+accumulation: 8
+save_every: 10

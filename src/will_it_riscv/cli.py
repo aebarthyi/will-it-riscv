@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -121,17 +122,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--plan-from-model", action="store_true",
         help="have a model write the plan from the repository's evidence pack -- its "
         "install docs, scripts, manifests, build files and CI, line by line -- check "
-        "every citation, send back what does not hold, and then run the plan as --plan "
+        "every citation and run every plan that holds, send back what does not hold "
+        "and what the run shows the plan got wrong, and report the last run as --plan "
         "would. RUNS THE CONFIGURE STEPS THE MODEL LISTS.",
     )
     scope.add_argument(
-        "--planner", choices=("claude-cli", "anthropic", "openai"), default=None,
+        "--planner", choices=("claude-cli", "anthropic", "openai", "llama-server"),
+        default=None,
         help="what writes the plan: claude-cli (Claude Code's `claude -p`; the default "
         "when it is installed), anthropic (the Claude API; needs ANTHROPIC_API_KEY and "
-        "the teacher extra), or openai (any OpenAI-compatible server -- vLLM, llama.cpp, "
-        "Ollama -- serving a small model)",
+        "the teacher extra), openai (any OpenAI-compatible server -- vLLM, llama.cpp, "
+        "Ollama -- serving a small model), or llama-server (start llama.cpp's server on "
+        "the --planner-model GGUF for this run; the default when that ends in .gguf)",
     )
-    scope.add_argument("--planner-model", metavar="NAME", help="the model the planner runs")
+    scope.add_argument(
+        "--planner-model", metavar="NAME",
+        help="the model the planner runs; for llama-server, the .gguf file",
+    )
     scope.add_argument(
         "--planner-url", metavar="URL",
         help="an OpenAI-compatible endpoint, e.g. http://localhost:8000/v1",
@@ -380,10 +387,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.recurse and not (args.plan or args.plan_from_model):
         raise SystemExit("--recurse needs --plan: it recurses from a plan's answer")
     if args.plan_from_model:
-        plan = _model_plan(args, stderr)
-        if plan is None:
-            return 2
-        return _run_plan(args, target, cache, stderr, plan=plan)
+        return _run_plan(args, target, cache, stderr, from_model=True)
     if args.plan:
         return _run_plan(args, target, cache, stderr)
 
@@ -478,27 +482,73 @@ def main(argv: Optional[list[str]] = None) -> int:
     return 0 if args.exit_zero else analysis.exit_code()
 
 
-def _model_plan(args: argparse.Namespace, stderr: Console):
-    """--plan-from-model: a plan written by a model, checked, or None."""
+def _planner(args: argparse.Namespace, stderr: Console, stack: contextlib.ExitStack):
+    """The backend --planner names; a llama-server is started on ``stack``."""
     import shutil
 
     from . import modelplan
+
+    kind = args.planner
+    if kind is None and (args.planner_model or "").endswith(".gguf"):
+        kind = "llama-server"
+    if kind is None:
+        kind = "claude-cli" if shutil.which("claude") else "anthropic"
+    if kind == "llama-server":
+        from . import serve
+
+        if not args.planner_model:
+            raise SystemExit("--planner llama-server needs --planner-model MODEL.gguf")
+        model = Path(args.planner_model)
+        try:
+            with stderr.status(f"loading {model.name}…"):
+                url = stack.enter_context(serve.llama_server(model))
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+        return modelplan.OpenAICompatible(url, model.stem)
+    try:
+        return modelplan.backend(kind, args.planner_model, args.planner_url)
+    except (ValueError, RuntimeError) as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def _model_plan(args: argparse.Namespace, stderr: Console, run):
+    """--plan-from-model: the plan a model wrote and its last run, or (None, None).
+
+    Every plan whose citations hold is ``run`` before it is taken, as the
+    evaluation and the labelling do. What the run shows was the plan's own
+    fault -- a directory or manifest that is not there, a package name the
+    distro has never had, a compiler left as a placeholder -- goes back to
+    the model with anything else that did not hold. The last run comes back
+    with the plan, so it is not run twice.
+    """
+    from . import dataset, modelplan
     from .plan import plan_to_dict
 
     root = Path(args.path)
-    if not root.is_dir():
-        raise SystemExit(f"{root}: --plan-from-model needs the repository directory")
-    kind = args.planner or ("claude-cli" if shutil.which("claude") else "anthropic")
-    try:
-        planner = modelplan.backend(kind, args.planner_model, args.planner_url)
-    except (ValueError, RuntimeError) as exc:
-        raise SystemExit(str(exc)) from exc
-    with stderr.status(f"{planner.name} is writing the plan…"):
-        outcome = modelplan.plan_repository(root, planner)
+    last: dict = {}
+    with contextlib.ExitStack() as stack:
+        planner = _planner(args, stderr, stack)
+        with stderr.status(f"{planner.name} is writing the plan…") as status:
+
+            def verify(plan) -> list[str]:
+                last["run"] = run(plan, lambda what: status.update(f"{plan.repo}: {what}"))
+                faults = dataset.plan_faults(last["run"])
+                if faults:
+                    status.update(f"{planner.name} is revising the plan…")
+                return faults
+
+            outcome = modelplan.plan_repository(root, planner, verify=verify)
     for number, attempt in enumerate(outcome.attempts, 1):
-        if attempt.problems:
+        if attempt.moved:
             stderr.print(
-                f"[yellow]plan {number}: {len(attempt.problems)} problem(s), sent back[/yellow]"
+                f"[dim]plan {number}: {len(attempt.moved)} citation(s) moved to the lines "
+                "that say their quote[/dim]"
+            )
+        if attempt.problems:
+            left = number == len(outcome.attempts) and not outcome.error
+            stderr.print(
+                f"[yellow]plan {number}: {len(attempt.problems)} problem(s), "
+                f"{'left' if left else 'sent back'}[/yellow]"
             )
             for problem in attempt.problems[:8]:
                 stderr.print(f"  • {problem}", highlight=False)
@@ -506,25 +556,33 @@ def _model_plan(args: argparse.Namespace, stderr: Console):
         stderr.print(f"[red]{outcome.error}[/red]")
     if outcome.plan is None:
         stderr.print("[red]the model wrote no plan this can run[/red]")
-        return None
+        return None, None
     if not outcome.ok:
-        stderr.print("[yellow]running the last plan it wrote, problems and all[/yellow]")
+        stderr.print("[yellow]reporting the last plan it wrote, problems and all[/yellow]")
     if args.save_plan:
         Path(args.save_plan).write_text(json.dumps(plan_to_dict(outcome.plan), indent=2) + "\n")
-    return outcome.plan
+    ran = last.get("run")
+    return outcome.plan, ran if ran is not None and ran.plan is outcome.plan else None
 
 
 def _run_plan(
-    args: argparse.Namespace, target: Target, cache: Cache, stderr: Console, plan=None,
+    args: argparse.Namespace, target: Target, cache: Cache, stderr: Console,
+    from_model: bool = False,
 ) -> int:
-    """--plan: run each step in the pretend environment, report one graph."""
+    """--plan: run each step in the pretend environment, report one graph.
+
+    ``from_model``: --plan-from-model, where the plan is the model's, and
+    the run it was taken on is the one reported.
+    """
     from . import planrun
     from .plan import PlanError, load_plan
 
     root = Path(args.path)
+    flag = "--plan-from-model" if from_model else "--plan"
     if not root.is_dir():
-        raise SystemExit(f"{root}: --plan needs the repository directory")
-    if plan is None:
+        raise SystemExit(f"{root}: {flag} needs the repository directory")
+    plan = None
+    if not from_model:
         try:
             plan = load_plan(Path(args.plan))
         except PlanError as exc:
@@ -533,7 +591,7 @@ def _run_plan(
                 stderr.print(f"  • {problem}", highlight=False)
             return 2
     if args.format not in ("text", "json", "dot"):
-        raise SystemExit("--plan reports as text, json or dot")
+        raise SystemExit(f"{flag} reports as text, json or dot")
     from . import recurse as recursion
 
     walk = None
@@ -552,19 +610,26 @@ def _run_plan(
             except KeyError as exc:
                 raise SystemExit(str(exc)) from exc
             distro.names()
+
+        def run(plan, progress=None):
+            return planrun.execute(
+                plan, root, index=index, target=target, distro=distro,
+                timeout=args.pseudobuild_timeout, pip_cache=cache.root / "pip",
+                progress=progress,
+            )
+
         try:
-            if args.quiet:
-                result = planrun.execute(
-                    plan, root, index=index, target=target, distro=distro,
-                    timeout=args.pseudobuild_timeout, pip_cache=cache.root / "pip",
-                )
-            else:
+            result = None
+            if from_model:
+                plan, result = _model_plan(args, stderr, run)
+                if plan is None:
+                    return 2
+            # A model's plan may come with the run it was taken on.
+            if result is None and args.quiet:
+                result = run(plan)
+            elif result is None:
                 with stderr.status(f"running {plan.repo}'s plan…") as status:
-                    result = planrun.execute(
-                        plan, root, index=index, target=target, distro=distro,
-                        timeout=args.pseudobuild_timeout, pip_cache=cache.root / "pip",
-                        progress=lambda what: status.update(f"{plan.repo}: {what}"),
-                    )
+                    result = run(plan, lambda what: status.update(f"{plan.repo}: {what}"))
             if args.recurse:
                 recurse_options: dict = {
                     "index": index, "target": target, "distro": distro,

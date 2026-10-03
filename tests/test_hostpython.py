@@ -45,6 +45,18 @@ def test_a_module_nothing_installs_is_stubbed(tmp_path):
     assert python.provide() == []   # dealt with once
 
 
+def test_a_stubbed_module_says_where_it_is_and_which_it_is(tmp_path):
+    """neuron's FindPythonModule prints numpy.__file__, then numpy.__version__."""
+    python = HostPython.create(tmp_path, dists={})
+    _run(python, "-c", "import wir_stubbed")
+    python.provide()
+    where = _run(python, "-c", "import re, wir_stubbed; "
+                 "print(re.compile('/__init__.py.*').sub('', wir_stubbed.__file__))")
+    assert where.returncode == 0 and where.stdout.strip().endswith("wir_stubbed")
+    which = _run(python, "-c", "import wir_stubbed; print(wir_stubbed.__version__)")
+    assert which.stdout.strip() == "99.9.9"
+
+
 def test_a_script_and_a_module_run_with_their_own_directory_first(tmp_path):
     python = HostPython.create(tmp_path / "python")
     (tmp_path / "tools").mkdir()

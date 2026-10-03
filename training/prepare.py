@@ -41,9 +41,13 @@ def kind(example: dict) -> str:
 
 
 def to_prompt_completion(example: dict) -> dict:
+    """The last answer is the completion; a correction's earlier answer and the
+    problems sent back about it are prompt, so no loss falls on the wrong answer."""
     messages = example["messages"]
-    assert [m["role"] for m in messages] == ["system", "user", "assistant"], example["meta"]
-    return {"prompt": messages[:2], "completion": messages[2:], "meta": example["meta"]}
+    roles = [m["role"] for m in messages]
+    assert roles[:2] == ["system", "user"] and roles[-1] == "assistant", example["meta"]
+    assert roles[2:] == ["assistant", "user"] * ((len(roles) - 3) // 2) + ["assistant"], roles
+    return {"prompt": messages[:-1], "completion": messages[-1:], "meta": example["meta"]}
 
 
 def measure(tokenizer, row: dict) -> tuple[int, int]:
@@ -57,13 +61,21 @@ def measure(tokenizer, row: dict) -> tuple[int, int]:
 
 
 def validation_keys(rows: list[dict]) -> set[str]:
-    """Every 16th of each kind, in the order of a hash of its key."""
+    """Every 16th of each kind, in the order of a hash of its key.
+
+    A correction goes where the example it corrects goes (``of``): the plan
+    is the same, so one in train would teach what valid is meant to test.
+    """
     held: set[str] = set()
     for k in ("repo", "pypi"):
-        keys = sorted((r["meta"]["key"] for r in rows if r["meta"]["kind"] == k),
+        keys = sorted({owner(r) for r in rows if r["meta"]["kind"] == k},
                       key=lambda key: hashlib.sha256(key.encode()).hexdigest())
         held.update(keys[::VALID_EVERY])
     return held
+
+
+def owner(row: dict) -> str:
+    return row["meta"].get("of") or row["meta"]["key"]
 
 
 def main(argv=None) -> int:
@@ -96,7 +108,7 @@ def main(argv=None) -> int:
         if row["meta"]["tokens"] > args.max_tokens:
             stats["dropped"].append({"key": row["meta"]["key"], "tokens": row["meta"]["tokens"]})
         else:
-            splits["valid" if row["meta"]["key"] in held else "train"].append(row)
+            splits["valid" if owner(row) in held else "train"].append(row)
     for row in exported["test"]:
         if row["meta"]["tokens"] > args.max_tokens:
             stats["test_over"].append(row["meta"]["key"])
@@ -106,7 +118,8 @@ def main(argv=None) -> int:
         with (out / f"{split}.jsonl").open("w") as handle:
             for row in rows:
                 handle.write(json.dumps(row) + "\n")
-        counts = {k: sum(r["meta"]["kind"] == k for r in rows) for k in ("repo", "pypi")}
+        counts = {k: sum(r["meta"]["kind"] == k for r in rows) for k in ("repo", "pypi", "quiz")}
+        counts["fix"] = sum("of" in r["meta"] for r in rows)
         tokens = sorted(r["meta"]["tokens"] for r in rows)
         stats[split] = {
             "examples": len(rows), **counts,
@@ -117,7 +130,8 @@ def main(argv=None) -> int:
     (out / "stats.json").write_text(json.dumps(stats, indent=2) + "\n")
     for split in splits:
         s = stats[split]
-        print(f"{split:5s} {s['examples']:4d} examples ({s['repo']} repo, {s['pypi']} pypi)"
+        print(f"{split:5s} {s['examples']:4d} examples ({s['repo']} repo, {s['pypi']} pypi, "
+              f"{s['quiz']} quiz; {s['fix']} corrections)"
               f"  {s['tokens']:>9,} tokens, median {s['median']:,}, max {s['max']:,}"
               f"  plan share {s['completion_tokens'] / max(s['tokens'], 1):.0%}")
     print(f"dropped from train: {len(stats['dropped'])}; "

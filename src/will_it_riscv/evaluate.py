@@ -14,6 +14,9 @@ verified one.
   verdict     with --execute: run it, and does it reach the same answer
   required    with --execute: overlap of what its run and the reference's require
 
+Each score also keeps how long its planner and run took (``seconds``), which
+is what orders a later --jobs run slowest first.
+
 Steps match softly. Two system-packages steps match as far as their package
 lists overlap; two configures of the same directory match more the more of
 their -D flags agree; a python-install matches on its manifest and section.
@@ -34,7 +37,7 @@ import json
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Collection, Optional
 
 from . import modelplan
 from .evidence import EvidencePack
@@ -69,6 +72,7 @@ class Score:
     order: Optional[float] = None
     verdict: Optional[bool] = None
     required: Optional[float] = None
+    seconds: Optional[float] = None
 
     @property
     def f1(self) -> float:
@@ -229,18 +233,35 @@ def teacher_first(directory: Path) -> Planner:
 
 def model_planner(
     backend: modelplan.Backend, rounds: int = 1, transcripts: Optional[Path] = None,
+    env=None,
 ) -> Planner:
-    """``transcripts``: keep each answer and what was sent back, one file a key."""
+    """``transcripts``: keep each answer and what was sent back, one file a key.
+
+    ``env``: run each plan that holds, and send back what running it showed
+    was the plan's fault, as labelling does and as the tool itself would. The
+    last run is left in ``meta["run"]``, as ``(plan, result)``, so it is not
+    run twice.
+    """
 
     def planner(root: Path, pack: EvidencePack, meta: dict) -> Optional[Plan]:
-        outcome = modelplan.plan_repository(root, backend, pack=pack, rounds=rounds)
+        verify = None
+        if env is not None:
+            from . import dataset
+
+            def verify(plan: Plan) -> list[str]:
+                result = dataset.run_plan(plan, root, env)
+                meta["run"] = (plan, result)
+                return dataset.plan_faults(result)
+
+        outcome = modelplan.plan_repository(
+            root, backend, pack=pack, rounds=rounds, verify=verify)
         if transcripts is not None:
             transcripts.mkdir(parents=True, exist_ok=True)
             (transcripts / f"{meta['key']}.json").write_text(json.dumps({
                 "backend": outcome.backend,
                 "error": outcome.error,
                 "attempts": [
-                    {"text": a.text, "problems": a.problems,
+                    {"text": a.text, "problems": a.problems, "moved": a.moved,
                      "output_tokens": a.completion.output_tokens if a.completion else None}
                     for a in outcome.attempts
                 ],
@@ -255,42 +276,135 @@ def model_planner(
 
 def evaluate(
     out: Path, planners: dict[str, Planner], split: str = "test", execute: bool = False,
-    python: str = "3.12", progress=print, keys: Optional[set[str]] = None,
+    python: str = "3.12", progress=print, keys: Optional[Collection[str]] = None,
+    env=None, baselines: bool = True, jobs: int = 1,
 ) -> list[Score]:
+    """``keys``: only these examples; with ``jobs`` above 1 they start in this
+    order, so put the slow ones first and the last few don't run alone.
+
+    ``jobs``: examples at once, each in its own forked process: a run is
+    mostly CMake and parsing its trace, and one slow repository then holds
+    one worker, not the whole evaluation.
+    """
     from . import dataset
 
-    env = dataset.environment(python) if execute else None
-    scores: list[Score] = []
+    if execute and env is None:
+        env = dataset.environment(python)
+    if not execute:
+        env = None
+    wanted = set(keys) if keys is not None else None
+    directories = []
     for directory in sorted(p for p in out.iterdir() if (p / "meta.json").is_file()):
         meta = json.loads((directory / "meta.json").read_text())
         if meta.get("tier") != dataset.VERIFIED or meta.get("split") != split:
             continue
-        if keys is not None and directory.name not in keys:
+        if wanted is not None and directory.name not in wanted:
             continue
-        found = dataset.tree(meta)
-        if found.root is None:
-            progress(f"{directory.name}: its tree is {found.error}; skipped "
-                     f"(will-it-riscv-dataset check --fetch brings it back)")
-            continue
-        root = found.root
-        reference = load_plan(directory / "plan.json")
-        pack = EvidencePack.from_dict(json.loads((directory / "pack.json").read_text()))
-        reference_run = None
-        if (directory / "run.json").is_file():
-            reference_run = json.loads((directory / "run.json").read_text())
-        for name, planner in {**planners, "teacher-first": teacher_first(directory)}.items():
+        directories.append(directory)
+    if jobs <= 1:
+        return [s for d in directories for s in _example(d, planners, env, baselines, progress)]
+
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    global _WORK
+    if keys is not None:
+        start = {key: i for i, key in enumerate(keys)}
+        directories.sort(key=lambda d: start[d.name])
+    if env is not None:
+        _warm(env)
+    _WORK = (planners, env, baselines, progress)
+    results: dict[str, list[Score]] = {}
+    with ProcessPoolExecutor(jobs, mp_context=multiprocessing.get_context("fork"),
+                             initializer=_fresh_clients) as pool:
+        running = {pool.submit(_work, d): d.name for d in directories}
+        for done, future in enumerate(as_completed(running), 1):
+            key = running[future]
             try:
-                candidate = planner(root, pack, {**meta, "key": directory.name})
-            except Exception as exc:  # noqa: BLE001 - a planner failing scores zero
-                progress(f"{directory.name}: {name} failed: {exc}")
-                candidate = None
-            result = score(candidate, reference, root, pack, directory.name, name)
-            result.kind = kind(meta)
-            if env is not None and candidate is not None and reference_run is not None:
+                results[key] = future.result()
+            except Exception as exc:  # noqa: BLE001 - a worker dying loses one example
+                progress(f"{key}: failed: {exc}")
+                results[key] = []
+            progress(f"{done}/{len(directories)} done: {key}")
+    return [s for d in sorted(directories) for s in results[d.name]]
+
+
+_WORK: tuple = ()
+
+
+def _work(directory: Path) -> list[Score]:
+    return _example(directory, *_WORK)
+
+
+def _fresh_clients() -> None:
+    """A worker's own HTTP connections: forked ones are the parent's sockets."""
+    import httpx
+
+    env = _WORK[1]
+    if env is None:
+        return
+    client = httpx.Client(timeout=60, follow_redirects=True)
+    env.index.client = env.distro.client = client
+    reference = getattr(env.distro, "_reference_index", None)
+    if reference is not None:
+        reference.client = client
+
+
+def _warm(env) -> None:
+    """Load the archive's lists before forking, so the workers share one copy."""
+    distro = env.distro
+    distro.names()
+    distro.version("")
+    distro.contents()
+    distro.named("")
+
+
+def _example(directory: Path, planners: dict[str, Planner], env, baselines: bool,
+             progress) -> list[Score]:
+    import time
+
+    from . import dataset
+
+    meta = json.loads((directory / "meta.json").read_text())
+    found = dataset.tree(meta)
+    if found.root is None:
+        progress(f"{directory.name}: its tree is {found.error}; skipped "
+                 f"(will-it-riscv-dataset check --fetch brings it back)")
+        return []
+    root = found.root
+    reference = load_plan(directory / "plan.json")
+    pack = EvidencePack.from_dict(json.loads((directory / "pack.json").read_text()))
+    reference_run = None
+    recorded = dataset.run_file(directory, env.distro.spec.id if env else dataset.LABEL_DISTRO)
+    if recorded.is_file():
+        reference_run = json.loads(recorded.read_text())
+    elif env is not None:
+        progress(f"{directory.name}: no reference run in {recorded.name}; "
+                 "verdict and required are not scored")
+    everyone = dict(planners)
+    if baselines:
+        everyone["teacher-first"] = teacher_first(directory)
+    scores = []
+    for name, planner in everyone.items():
+        began = time.monotonic()
+        context = {**meta, "key": directory.name}
+        try:
+            candidate = planner(root, pack, context)
+        except Exception as exc:  # noqa: BLE001 - a planner failing scores zero
+            progress(f"{directory.name}: {name} failed: {exc}")
+            candidate = None
+        result = score(candidate, reference, root, pack, directory.name, name)
+        result.kind = kind(meta)
+        if env is not None and candidate is not None and reference_run is not None:
+            done = context.get("run")
+            if done is not None and done[0] is candidate:
+                ran = dataset.summary(done[1])
+            else:
                 ran = dataset.summary(dataset.run_plan(candidate, root, env))
-                result.verdict = ran["verdict"] == reference_run["verdict"]
-                result.required = _overlap(set(ran["required"]), set(reference_run["required"]))
-            scores.append(result)
+            result.verdict = ran["verdict"] == reference_run["verdict"]
+            result.required = _overlap(set(ran["required"]), set(reference_run["required"]))
+        result.seconds = round(time.monotonic() - began, 1)
+        scores.append(result)
     return scores
 
 
@@ -343,27 +457,54 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--planner", choices=("claude-cli", "anthropic", "openai"),
                         help="a model to score beside the baselines")
     parser.add_argument("--planner-model")
-    parser.add_argument("--planner-url")
+    parser.add_argument("--planner-url",
+                        help="for openai: the server, or several of the same model, comma-separated")
+    parser.add_argument("--planner-slots", type=int, default=1,
+                        help="requests each server takes at once (llama-server's -np)")
     parser.add_argument("--rounds", type=int, default=1,
                         help="let the model revise this many times (default: 1, none)")
     parser.add_argument("--execute", action="store_true",
                         help="also run every plan, and compare what the runs require")
+    parser.add_argument("--run-feedback", action="store_true",
+                        help="with --execute: run each plan the model writes, and send back "
+                             "what the run shows is wrong with it, as labelling does")
+    parser.add_argument("--no-baselines", action="store_true",
+                        help="score only --planner, not autoplan and teacher-first")
     parser.add_argument("--json", type=Path, help="write every score here")
     parser.add_argument("--transcripts", type=Path,
                         help="keep what the model wrote, one file per repository, here")
     parser.add_argument("--python", default="3.12")
+    parser.add_argument("--distro", default="debian:trixie",
+                        help="with --execute: the archive plans run against; the references "
+                             "must have been run against it too (will-it-riscv-dataset rerun "
+                             "--distro)")
     parser.add_argument("--keys", type=Path,
-                        help="score only these examples of the split: a file, one key a line")
+                        help="score only these examples of the split: a file, one key a line; "
+                             "with --jobs they start in its order, so list the slow ones first")
+    parser.add_argument("--jobs", type=int, default=1,
+                        help="examples to score at once, each in its own process")
     args = parser.parse_args(argv)
 
-    planners: dict[str, Planner] = {"autoplan": autoplan_planner}
+    if args.run_feedback and not args.execute:
+        parser.error("--run-feedback needs --execute")
+    if args.no_baselines and not args.planner:
+        parser.error("--no-baselines needs --planner")
+    env = None
+    if args.execute:
+        from . import dataset
+
+        env = dataset.environment(args.python, distro=args.distro)
+    planners: dict[str, Planner] = {} if args.no_baselines else {"autoplan": autoplan_planner}
     if args.planner:
-        backend = modelplan.backend(args.planner, args.planner_model, args.planner_url)
-        planners[backend.name] = model_planner(backend, args.rounds, args.transcripts)
-    keys = set(args.keys.read_text().split()) if args.keys else None
+        backend = modelplan.backend(
+            args.planner, args.planner_model, args.planner_url, args.planner_slots)
+        planners[backend.name] = model_planner(
+            backend, args.rounds, args.transcripts, env if args.run_feedback else None)
+    keys = list(dict.fromkeys(args.keys.read_text().split())) if args.keys else None
     scores = evaluate(
         args.out, planners, args.split, args.execute, args.python,
-        progress=lambda m: print(m, file=sys.stderr), keys=keys,
+        progress=lambda m: print(m, file=sys.stderr), keys=keys, env=env,
+        baselines=not args.no_baselines, jobs=args.jobs,
     )
     rows = table(scores)
     columns = ["planner", "kind", "repos", "parsed", "cited", "grounded", "precision", "recall", "f1",

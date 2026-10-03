@@ -1,0 +1,18 @@
+# v2-153's recipe on one H200 (141 GB, bf16): the v3 data (relabelled plans, the
+# spack-2 repos, quiz questions) at 32k, so the long repos are kept, not dropped.
+# One card: accumulation 8 keeps v2's 8 sequences a step. No offload, no FSDP.
+# The epoch checkpoints are what get scored; v2's best was epoch 3 of 6.
+# 1266 train (214 repo, 260 pypi, 792 quiz), 33 valid, 5.49M tokens an epoch, none dropped:
+# 159 steps an epoch, 795 in all; ~4.5k tokens/s on an H100 (smoke), ~1.7 h in all.
+model: Qwen/Qwen3-4B-Instruct-2507
+data: data/prepared-v3/32768
+dtype: bfloat16
+attention: sdpa
+fsdp: false
+offload: false
+lora_r: 64
+lora_alpha: 128
+lr: 2.0e-4
+epochs: 5
+accumulation: 8
+save_every: 10

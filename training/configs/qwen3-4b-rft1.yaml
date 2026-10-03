@@ -1,0 +1,21 @@
+# Rejection-sampling SFT from h200-318: its own best first answer on each train key
+# (greedy + 4 at T=0.8, ranked by verdict, required overlap, F1; /scratch/runs/rft),
+# trained on from its adapter at a fraction of its learning rate (h200's cosine was at
+# ~1.4e-4 by step 318). 481 of 507 train keys kept (252 a sample beat greedy; 26 with
+# no right verdict dropped): 450 train (197 repo, 253 pypi), 31 valid, 3.22M tokens an
+# epoch, 57 steps an epoch, 114 in all. Score both epoch checkpoints (57, 114)
+# against h200-318 (par-eval.sh); qwen3-4b-rft1s1 is the same with another data order.
+model: Qwen/Qwen3-4B-Instruct-2507
+data: data/prepared-rft1
+init_adapter: /scratch/runs/qwen3-4b-h200/checkpoint-318
+dtype: bfloat16
+attention: sdpa
+fsdp: false
+offload: false
+lora_r: 64
+lora_alpha: 128
+lr: 5.0e-5
+epochs: 2
+accumulation: 8
+save_every: 10
+seed: 0

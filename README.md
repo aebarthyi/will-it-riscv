@@ -140,6 +140,10 @@ Everything is driven by what the configure itself said:
 | `file failed to open for reading: …/proj.h` | that header, carrying every common spelling of a version macro |
 | `… are set to NOTFOUND … FOO_LIBRARY linked by target` | the variable a target links |
 | `linux/fs.h header not found` | the header — reported as a **host gap**, not a dependency: every riscv64 Linux system has it; the Mac SDK does not |
+| `(missing: DOXYGEN_EXECUTABLE)`, then `doxygen -s -g CMakeDoxyfile.tpl` | a program that answers `--version` (`99.9.9`; `git version 99.9.9` for git) and writes the file it is told to write, inside the scratch directory only |
+| `Found unsuitable version "0.0.0"`, after the module grepped a stub header with `REGEX "#define ARMA_VERSION_MAJOR …"` | a line that the regex matches, added to the stub: `#define ARMA_VERSION_MAJOR 99` (`patchlevel.h` gets the interpreter's own version). If the module read the header only `if(EXISTS)`, it is written first |
+| `links to: BML::bml but the target was not found`, with no config to grow it | an empty imported target, made after the top directory is done, so a real one always comes first |
+| `… provided by "QT" with any of the following names: Qt6Config.cmake …` | `Qt6Config.cmake`, the first name searched. A stub whose name ends in its major version (Qt6, Eigen3, SDL2) claims that major, `6.99.9`, and each component gets its own `Qt6Core_VERSION` |
 
 **Blame by experiment.** Some configures die without naming anything.
 GROMACS narrates `-- Could NOT find OpenMP` and then fails in its own words;
@@ -147,7 +151,11 @@ its FindFFTW never says "Could NOT find" at all. So the loop suspects the
 misses nearest the error — first any the error message mentions by name, then
 the find_packages the trace saw it name — and stubs the likeliest the way its
 own Find module looked for it: the trace records every `find_library`,
-`find_path` and `pkg_check_modules` each module ran. If the error moves, the
+`find_path` and `pkg_check_modules` each module ran. A lookup the error names
+in the project's own words is a suspect too, after the named packages:
+`find_program(EXE_SQLITE3 sqlite3)`, then `sqlite3 binary not found!`. CMake's
+own lookups (`CMAKE_MAKE_PROGRAM`, which every quoted try_compile log names)
+and the pinned interpreter are never suspects. If the error moves, the
 suspect is a hard requirement, shown by experiment. If it does not, every
 trace of the stub is taken back out, so a later round cannot find it, and the
 next suspect is tried — at most three per stuck point.
@@ -354,6 +362,16 @@ showed. Each problem goes back as a sentence, and the model writes the
 plan again. The model only plans; the executor judges, so a bad plan costs
 a round, not a wrong verdict.
 
+**Every plan that holds is run, and what the run shows goes back too**, as
+it does in labelling and evaluation. A run can show three kinds of mistake:
+a manifest or directory that isn't there, a package name the distro has
+never had on any architecture (with the nearest names it does have), or a
+compiler left as a placeholder (`${FC}`) that stopped the configure. Each
+goes back the same way. A configure that stops for any other reason is the
+build's answer, so it is reported, not sent back. The report is the run the
+last plan was accepted on. On the held-out repositories this feedback takes
+the fine-tuned 4B planner's repository verdicts from 0.79 to 0.94.
+
 It writes a wire format: the plan format with every object closed,
 evidence always `{at, quote}`, and `-D` flags as name/value pairs. That is
 strict enough for schema-constrained decoding, and the same schema
@@ -364,6 +382,20 @@ constrains every backend:
 | `claude-cli` | Claude Code's `claude -p`, tools off, with `--json-schema` (the default, and no API key needed) |
 | `anthropic` | the Claude API with structured outputs (`pip install 'will-it-riscv[teacher]'`, `ANTHROPIC_API_KEY`) |
 | `openai` | any OpenAI-compatible server, such as vLLM, llama.cpp or Ollama, with the schema as `response_format`: what a fine-tuned small model is served by (`--planner-url`, `--planner-model`) |
+| `llama-server` | a GGUF file (`--planner-model planner.gguf`; the default when the name ends in `.gguf`): llama.cpp's server is started on it for the run and stopped afterwards |
+
+The fine-tuned planner is one GGUF file, which `training/export.py` writes
+from a trained adapter:
+
+```console
+$ will-it-riscv ~/src/MFC --plan-from-model --planner-model qwen3-4b-h200-checkpoint-318-q8_0.gguf
+```
+
+The tool looks for the server in `$LLAMA_SERVER`, then for `llama-server`
+on the PATH. It starts it with the settings the planner was evaluated
+with: a 40k context, every layer on the GPU, flash attention, one slot and
+the model's chat template. `$LLAMA_SERVER_ARGS` is added at the end, so
+`LLAMA_SERVER_ARGS='-ngl 0'` runs on the CPU only.
 
 **A dataset of verified plans.** `will-it-riscv-dataset` labels a corpus
 with a teacher and verifies each label by running the plan. Anything that
@@ -520,6 +552,14 @@ isolation would have given them:
   in the host's CMake, not a dependency, so the configure is rerun with
   `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` (CMake's own suggested fix) and a
   note says so.
+- **What the host only pretends to have is not there.** pyenv's shims
+  are dropped from the configure's PATH: a shim exists for every program
+  any installed Python has, and fails when the active one has none, so a
+  configure would find a `cython` that only says "command not found".
+- **What needs a linker is answered for the target.** FortranCInterface
+  links a program of C and Fortran to prove the two compilers agree, and
+  nothing links here. On the target gcc and gfortran do agree, so the
+  toolchain file says so.
 - **What they build is on the target's side.** Confinement re-roots every
   search into the empty sysroot. A path that already points into the
   build tree or the source tree is searched as written, though. SUNDIALS
@@ -538,7 +578,10 @@ A plan's `meson-setup` step, and `--pseudobuild` on a tree with a
 `meson.build` and no `CMakeLists.txt`, runs `meson setup` the way a CMake
 configure is run. It is a cross build for linux/riscv64, confined to an
 empty sysroot, set up in a copy-on-write clone of the tree because Meson
-writes into it, and unblocked round by round.
+writes into it, and unblocked round by round. The Meson is the one the
+project ships, if it names one, else the build requirement's version, else
+Debian 13's (1.7, a dependency of this tool): qemu wants 1.6, libvips 1.4,
+and an older host Meson stops both before they ask for anything.
 
 ```console
 $ will-it-riscv ~/src/numpy --pseudobuild

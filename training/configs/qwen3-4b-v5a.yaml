@@ -1,0 +1,18 @@
+# Ablation of v4: qwen3-4b-h200's recipe (5-epoch cosine) on the v4 data with at most
+# one correction a repository -- h200-318's own first answer where there is one -- so
+# no train plan appears more than twice an epoch (v4 had 181 plans 2-4 times, 41% of
+# its tokens). Against v5b, this says whether corrections help once they are thinned.
+# 1447 train (331 repo, 324 pypi, 792 quiz; 181 corrections), 48 valid, 7.44M tokens
+# an epoch: 181 steps an epoch, 905 in all. Score the epoch 2 and 3 checkpoints.
+model: Qwen/Qwen3-4B-Instruct-2507
+data: data/prepared-v5a
+dtype: bfloat16
+attention: sdpa
+fsdp: false
+offload: false
+lora_r: 64
+lora_alpha: 128
+lr: 2.0e-4
+epochs: 5
+accumulation: 8
+save_every: 10

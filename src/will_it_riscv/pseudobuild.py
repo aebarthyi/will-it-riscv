@@ -156,6 +156,10 @@ class PseudoBuild:
     """What taking each found package away did, once the configure had
     completed: name to ``(True, detail)`` when the configure then failed --
     required -- or ``(False, detail)`` when it completed without it."""
+    unblocker: list = field(default_factory=list)
+    """What an unblocker agent (:mod:`unblock`) made of each point the rules
+    could not get past, as its records; ``confirmed`` is the executor's
+    verdict on its stubs."""
 
     @property
     def ok(self) -> bool:
@@ -728,6 +732,7 @@ def run(
     python_dists: Optional[dict] = None,
     pip_cache: Optional[Path] = None,
     prune: bool = False,
+    unblocker=None,
 ) -> Optional[PseudoBuild]:
     """Configure the project in a scratch directory, unblocking as it goes.
 
@@ -741,8 +746,11 @@ def run(
     flags the build itself passes -- MFC's -DMFC_MPI=ON -- and are never
     stubbed over. ``python_dists`` is what the plan installs, name to
     version: a configure that imports one of them from the interpreter it is
-    given gets it, for the host (see :mod:`hostpython`). Returns None when
-    there is nothing to do (no CMakeLists.txt at the root).
+    given gets it, for the host (see :mod:`hostpython`). ``unblocker`` is
+    handed each point the rules cannot get past (see :mod:`unblock`); by
+    default, what ``$WILL_IT_RISCV_UNBLOCK`` names, else none. Time in its
+    sessions is not counted against ``timeout``. Returns None when there is
+    nothing to do (no CMakeLists.txt at the root).
     """
     root = Path(root)
     if not (root / "CMakeLists.txt").exists():
@@ -750,7 +758,12 @@ def run(
     if not available():
         return PseudoBuild(error="cmake is not installed")
 
+    if unblocker is None:
+        from .unblock import from_environment
+
+        unblocker = from_environment()
     started = time.monotonic()
+    paused = 0.0   # in unblocker sessions
     aggregate = PseudoBuild(rounds=0)
     negotiation = _NEGOTIATED.set({})
     overrides: dict[str, str] = {}
@@ -773,6 +786,10 @@ def run(
         given = {
             "FETCHCONTENT_BASE_DIR": str(scratch_path / "_deps"),
             "FETCHCONTENT_UPDATES_DISCONNECTED": "ON",
+            # Somewhere writable: hdf5-vol-cache file(COPY)s its scripts into
+            # ${CMAKE_INSTALL_PREFIX}/bin while it configures, and the default
+            # is /usr/local. A real build would install there; this one cannot.
+            "CMAKE_INSTALL_PREFIX": str(scratch_path / "install"),
         }
         # The build host's Python, pinned from the start the way
         # scikit-build-core pins it, so every import a configure makes of it
@@ -782,7 +799,7 @@ def run(
             given[f"{prefix}_EXECUTABLE"] = str(interpreter.executable)
 
         for attempt in range(1, max_rounds + 1):
-            left = timeout - (time.monotonic() - started)
+            left = timeout - (time.monotonic() - started - paused)
             if left <= 0:
                 aggregate.error = f"ran out of time after {attempt - 1} rounds"
                 break
@@ -828,11 +845,18 @@ def run(
                 # the previous round died of. If not, it was innocent: take
                 # every trace of it back out, or later rounds would find it.
                 if outcome.completed or _signature(outcome.error) != trial.signature:
-                    for name in (trial.name, *trial.also):
-                        if name not in aggregate.blockers:
-                            aggregate.blockers.append(name)
-                        aggregate.experiments.append((name, True))
+                    if trial.kind == "host":
+                        # Something every riscv64 system has: a gap in the
+                        # sandbox, not a dependency.
+                        if trial.name not in aggregate.host_gaps:
+                            aggregate.host_gaps.append(trial.name)
+                    else:
+                        for name in (trial.name, *trial.also):
+                            if name not in aggregate.blockers:
+                                aggregate.blockers.append(name)
+                            aggregate.experiments.append((name, True))
                     aggregate.round_blockers[-1] = trial.name
+                    _judged(unblocker, trial, True)
                     tried = set()
                     trial = None
                 else:
@@ -863,8 +887,11 @@ def run(
                     for path in trial.files:
                         Path(path).unlink(missing_ok=True)
                         written.discard(path)
+                    for path, text in trial.restore.items():
+                        Path(path).write_text(text)
                     for name in (trial.name, *trial.also):
                         aggregate.experiments.append((name, False))
+                    _judged(unblocker, trial, False)
                     outcome.narration = trial.narration
                     aggregate.unblocked = sorted(overrides)
                     trial = None
@@ -925,6 +952,16 @@ def run(
                     outcome, tried, aggregate.blockers, overrides, sysroot, suffix,
                     str(interpreter.executable),
                 )
+                if trial is None and unblocker is not None \
+                        and len(aggregate.unblocker) < getattr(unblocker, "sessions", 1):
+                    # The rules are out of suspects. Hand the stuck point over.
+                    began = time.monotonic()
+                    trial = _agent_trial(
+                        unblocker, aggregate, outcome, root, scratch_path, sysroot, toolchain,
+                        env, given, overrides, fixed, attempt,
+                        max(60, int(timeout - (began - started - paused))),
+                    )
+                    paused += time.monotonic() - began
                 if trial is None:
                     break   # nothing left to try; the configure is stuck here
                 tried.add(trial.name)
@@ -1015,6 +1052,14 @@ class _Trial:
     """Stubbed with it and blamed with it: the other dependencies a refused
     package's own module asked for (FindX11's Xft wants Freetype and
     Fontconfig both)."""
+    restore: dict = field(default_factory=dict)
+    """Stubs it rewrote, path to what they said before: an unblocker agent
+    may correct the executor's own."""
+    kind: str = "dependency"
+    """``host`` when an agent said what stopped the round is something every
+    riscv64 system has, not a dependency."""
+    session: Optional[object] = None
+    """The unblocker session it came from, if one did, with its record."""
 
 
 def _signature(error: Optional[str]) -> str:
@@ -1252,6 +1297,57 @@ def _nested_trial(
         name=nested[0], also=nested[1:], signature=_signature(outcome.error),
         overrides=stubbed, files=files, narration=outcome.narration,
     )
+
+
+def _agent_trial(
+    unblocker, aggregate: PseudoBuild, outcome: PseudoBuild, root: Path, scratch: Path,
+    sysroot: Path, toolchain: Optional[Path], env: dict, given: dict, overrides: dict,
+    fixed: dict, attempt: int, timeout: int,
+) -> Optional[_Trial]:
+    """An unblocker session at a stuck point, as a trial -- or as a note,
+    when it says the plan or the sandbox is at fault."""
+    from .unblock import Stuck
+
+    # Round one falls back to a host configure when a cross one will not start.
+    build = f"build-{attempt}" if toolchain or attempt > 1 else "build-host"
+    stuck = Stuck(
+        root=root, scratch=scratch, sysroot=sysroot, toolchain=toolchain, env=env,
+        settings={**given, **overrides, **fixed}, fixed=dict(fixed), outcome=outcome,
+        round=attempt, trace=scratch / f"{build}.trace.json", build=scratch / build,
+        overrides=dict(overrides),
+        blockers=list(aggregate.blockers), timeout=timeout,
+        earlier=[dict(r) for r in aggregate.unblocker],
+    )
+    result = unblocker(stuck)
+    record = result.record()
+    aggregate.unblocker.append(record)
+    if result.outcome == "cannot_stub" and result.name and result.kind != "host":
+        # What no stub can be, and the default build demands: CUDA, for one.
+        # It stopped the configure, and that is the answer.
+        if result.name not in aggregate.blockers:
+            aggregate.blockers.append(result.name)
+        aggregate.round_blockers[-1] = result.name
+    if not result.proposes:
+        flags = " ".join(f"-D{k}={v}" for k, v in result.flags.items())
+        aggregate.notes.append(
+            f"stuck at {_signature(outcome.error)[:120]}; an unblocker agent: {result.outcome}"
+            + (f" ({flags})" if flags else "") + (f": {result.reason}" if result.reason else "")
+        )
+        return None
+    return _Trial(
+        name=result.name, signature=_signature(outcome.error), overrides=dict(result.overrides),
+        files=list(result.files), narration=outcome.narration, restore=dict(result.restore),
+        kind=result.kind, session=(result, record), also=list(result.also),
+    )
+
+
+def _judged(unblocker, trial: _Trial, confirmed: bool) -> None:
+    if trial.session is None:
+        return
+    result, record = trial.session
+    record["confirmed"] = confirmed
+    if hasattr(unblocker, "judged"):
+        unblocker.judged(result, confirmed)
 
 
 def _stub_package(

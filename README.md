@@ -164,6 +164,21 @@ Status misses are never stubbed on sight — faking an optional dependency
 would erase the very evidence that it is one — and nothing is ever written
 outside the scratch directory.
 
+**An agent for the long tail (opt-in, experimental).** When the rules run out
+of suspects, `WILL_IT_RISCV_UNBLOCK=claude` (or `claude:<model>`) hands the
+stuck point to Claude through `claude -p`, with a workbench served over MCP.
+It reads: the error, the trace around the line that raised it, what each
+Find module searched for, the source tree and CMake's modules. It writes stub
+files inside the sysroot and sets lookup-result cache variables. It is never
+allowed the source tree, a build option, the plan's `-D` flags or `CMAKE_*`.
+It can rerun the configure a few times. Its stubs come back as a trial like
+any other: if the executor's next round shows the error moved, they stay,
+and if not, they are taken back out. An agent that finds the plan at fault
+(the configure insists on a flag the plan does not give) or something no
+stub can be leaves a note instead. Each session's prompt, transcript and
+stubs are kept under `$WILL_IT_RISCV_UNBLOCK_LOG`. `$WILL_IT_RISCV_UNBLOCK_BUDGET`
+caps the dollars per session.
+
 ### The dependency graph, and the answer
 
 Every probe in the trace carries who asked: the project line that decided to

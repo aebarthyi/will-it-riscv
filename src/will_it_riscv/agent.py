@@ -399,7 +399,8 @@ At a stuck point:
 tree, a build option, the plan's -D flags or CMAKE_*.
 - Stub exactly what this error needs. Claim no feature nobody asked for.
 - Never impersonate a compiler or toolchain (no fake nvcc, hipcc, gfortran). A default build \
-that enables CUDA or HIP is itself the answer: resume with cannot_stub, blocker CUDA (or HIP).
+that enables CUDA or HIP needs the vendor's compiler, which no stub can be: resume with \
+cannot_stub, blocker CUDA (or HIP); whether {arch} can have it is the resolver's call.
 - A version check gets a version that passes: what {distro} ships if you know it and it \
 passes, else the oldest the check accepts. Put what it demanded in resume's version.
 - As soon as the error moves, resume: do not chase the next error yourself.

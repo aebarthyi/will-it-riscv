@@ -439,6 +439,12 @@ def test_a_claude_session_end_to_end(tmp_path):
         "PKG_CONFIG_LIBDIR", "PKG_CONFIG_PATH", "CMAKE_BUILD_PARALLEL_LEVEL", "PATH"}
 
 
+def test_the_prompt_is_for_the_target_asked_for():
+    prompt = unblock.system_prompt("aarch64")
+    assert "pretend aarch64 sandbox" in prompt and "Linux/aarch64" in prompt
+    assert "riscv64" not in prompt.replace("will-it-riscv", "")
+
+
 def test_it_is_off_unless_asked_for(monkeypatch):
     monkeypatch.delenv("WILL_IT_RISCV_UNBLOCK", raising=False)
     assert unblock.from_environment() is None

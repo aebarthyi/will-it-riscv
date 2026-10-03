@@ -105,6 +105,7 @@ class Stuck:
     """Seconds each configure may take."""
     earlier: list = field(default_factory=list)
     """What earlier sessions in this loop did, as records."""
+    arch: str = "riscv64"
 
 
 @dataclass
@@ -788,10 +789,10 @@ def serve_tools(tools: list, dispatch, log: Path, stdin=None, stdout=None,
 
 
 SYSTEM = """\
-You unblock CMake configures in a pretend riscv64 sandbox.
+You unblock CMake configures in a pretend {arch} sandbox.
 
-will-it-riscv answers "will this project build on riscv64?" by running the project's \
-configure step -- never its build -- as a cross build for Linux/riscv64, confined to an \
+will-it-riscv answers "will this project build on {arch}?" by running the project's \
+configure step -- never its build -- as a cross build for Linux/{arch}, confined to an \
 empty scratch sysroot. Nothing is installed and nothing is emulated. Whatever the configure \
 insists on is given a stub: files that exist only to be found (a header, an empty \
 lib<name>.so, a <Name>Config.cmake, a .pc file, a program script). Each package the \
@@ -800,7 +801,7 @@ the minimal spec.
 
 The executor's rules stub most blockers. This configure stopped somewhere they could not \
 get past. Your job: find out why it stopped, and stub what it was looking for so it gets \
-past THIS error -- the way the real package, installed on Debian 13 or Ubuntu 26.04 riscv64, \
+past THIS error -- the way the real package, installed on a current Debian or Ubuntu for {arch}, \
 would be found.
 
 Rules:
@@ -810,9 +811,10 @@ the source tree, never a build option, never the plan's -D flags, never CMAKE_*.
 Claim no feature nobody asked for (no parallel HDF5, no MPI-enabled anything, no optional \
 component) unless this configure demands it.
 - Never impersonate a compiler or toolchain: no fake nvcc, hipcc, gfortran or compiler \
-identification. A default build that enables CUDA or HIP is itself the answer (NVIDIA ships \
-no riscv64 CUDA): finish with cannot_stub, blocker CUDA (or HIP), kind dependency.
-- A version check gets a version that passes: what Debian 13 ships if you know it and it \
+identification. A default build that enables CUDA or HIP needs the vendor's compiler, which no \
+stub can be: finish with cannot_stub, blocker CUDA (or HIP), kind dependency. Whether {arch} can \
+have it is the resolver's call, not yours.
+- A version check gets a version that passes: what the target distro ships if you know it and it \
 passes, else the oldest the check accepts. Real version formats (ELPA's 2023.05.001, a \
 header's #define) as the check parses them. Put what the check demanded in finish's version.
 - Test with configure. As soon as the error MOVES -- a different error, or it completes -- \
@@ -825,7 +827,7 @@ setting the plan does not give (a build type it insists on), finish with plan_fa
 from the checkout), finish with cannot_stub. Either way, say why in one or two sentences.
 - Name the blocker in one word, as the project's own find_package / pkg-config / \
 find_library call names it (ELPA, HDF5, Armadillo, wxWidgets, netcdf). Others stubbed for the \
-same error go in also. If what stopped it is no dependency but something every riscv64 Linux \
+same error go in also. If what stopped it is no dependency but something every {arch} Linux \
 system has (dlfcn.h, a CMake quirk of the sandbox), kind is "host".
 
 How the sandbox works: CMAKE_FIND_ROOT_PATH is the sysroot (plus the scratch and source \
@@ -839,6 +841,10 @@ sysroot, traces, build directories) and CMake's own modules.
 
 Be brief: a few tool calls to understand, one or two configures to test, then finish.
 """
+
+
+def system_prompt(arch: str = "riscv64") -> str:
+    return SYSTEM.replace("{arch}", arch)
 
 
 def prompt(stuck: Stuck, bench: Workbench, configures: int) -> str:
@@ -968,7 +974,7 @@ class ClaudeUnblocker(Replays):
         dirs = [str(stuck.root)] + ([str(cmake_modules())] if cmake_modules() else [])
         command = [
             self.command, "-p", "--model", self.model,
-            "--system-prompt", SYSTEM,
+            "--system-prompt", system_prompt(stuck.arch),
             "--tools", "Read,Grep,Glob",
             "--allowedTools", "Read,Grep,Glob,mcp__unblock",
             "--permission-mode", "dontAsk",

@@ -625,7 +625,7 @@ def _configure(
             node.carried_on = True
         if step.id not in node.steps:
             node.steps.append(step.id)
-        tier, detail, by = _cmake_tier(gnode, provided)
+        tier, detail, by = _cmake_tier(gnode, provided, target.arch)
         _settle(node, tier, detail, by)
         if tier == PROVIDED and needed:
             for name in [gnode.key, gnode.name, *gnode.aliases]:
@@ -645,26 +645,35 @@ def _configure(
     return StepResult(step, status, detail, pseudobuild=outcome, graph=graph)
 
 
-#: What no riscv64 system can have: NVIDIA ships CUDA for x86-64, arm64 and
-#: ppc64le. A default build that will not configure without it is a "no".
-#: (ROCm is left out: its libraries are found, not demanded, and stubs make
-#: an auto-detected backend look present.)
-NO_RISCV64 = {
-    "cuda": "NVIDIA's CUDA has no riscv64 build",
-    "cudatoolkit": "NVIDIA's CUDA has no riscv64 build",
-    "nvcc": "NVIDIA's CUDA compiler has no riscv64 build",
+#: What a vendor ships for some architectures only: NVIDIA's CUDA for x86-64,
+#: arm64 and ppc64le. On any other target, a default build that will not
+#: configure without it is a "no". (ROCm is left out: its libraries are
+#: found, not demanded, and stubs make an auto-detected backend look present.)
+VENDOR_ONLY = {
+    "cuda": ("NVIDIA's CUDA", {"x86_64", "aarch64", "ppc64le"}),
+    "cudatoolkit": ("NVIDIA's CUDA", {"x86_64", "aarch64", "ppc64le"}),
+    "nvcc": ("NVIDIA's CUDA compiler", {"x86_64", "aarch64", "ppc64le"}),
 }
 
 
+def _vendor_shortfall(key: str, arch: str) -> Optional[str]:
+    """Why a vendor's package cannot be had for this arch, if it cannot."""
+    if key not in VENDOR_ONLY:
+        return None
+    what, arches = VENDOR_ONLY[key]
+    return None if arch in arches else f"{what} has no {arch} build"
+
+
 def _cmake_tier(
-    node: depgraph.Node, provided: dict[str, str]
+    node: depgraph.Node, provided: dict[str, str], arch: str = "riscv64"
 ) -> tuple[str, str, Optional[str]]:
     for name in [node.key, node.name, *node.aliases]:
         step_id = provided.get(_normal(name))
         if step_id:
             return PROVIDED, f"provided by step {step_id!r}", step_id
-    if node.key in NO_RISCV64 and (node.status == depgraph.REQUIRED or node.asked_required):
-        return NONE, NO_RISCV64[node.key], None
+    shortfall = _vendor_shortfall(node.key, arch)
+    if shortfall and (node.status == depgraph.REQUIRED or node.asked_required):
+        return NONE, shortfall, None
     if node.provided_by:
         return TOOLCHAIN, f"comes with {node.provided_by}", None
     if node.available:
@@ -747,7 +756,11 @@ def _answer(result: PlanResult) -> PlanAnswer:
 
 
 #: The names an error might call the target by.
-_ARCH_NAMES = {"riscv64": r"riscv64|riscv|risc-v", "aarch64": r"aarch64|arm64"}
+_ARCH_NAMES = {
+    "riscv64": r"riscv64|riscv|risc-v", "aarch64": r"aarch64|arm64",
+    "x86_64": r"x86_64|x86-64|amd64", "ppc64le": r"ppc64le|ppc64|powerpc64",
+    "loongarch64": r"loongarch64|loongarch", "s390x": r"s390x|s390",
+}
 _REFUSES = re.compile(
     r"unsupported|not supported|isn'?t supported|not a supported|does not support"
     r"|unknown|unrecogni[sz]ed|no support", re.IGNORECASE,

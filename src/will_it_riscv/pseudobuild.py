@@ -959,7 +959,7 @@ def run(
                     trial = _agent_trial(
                         unblocker, aggregate, outcome, root, scratch_path, sysroot, toolchain,
                         env, given, overrides, fixed, attempt,
-                        max(60, int(timeout - (began - started - paused))),
+                        max(60, int(timeout - (began - started - paused))), arch,
                     )
                     paused += time.monotonic() - began
                 if trial is None:
@@ -1302,7 +1302,7 @@ def _nested_trial(
 def _agent_trial(
     unblocker, aggregate: PseudoBuild, outcome: PseudoBuild, root: Path, scratch: Path,
     sysroot: Path, toolchain: Optional[Path], env: dict, given: dict, overrides: dict,
-    fixed: dict, attempt: int, timeout: int,
+    fixed: dict, attempt: int, timeout: int, arch: str = "riscv64",
 ) -> Optional[_Trial]:
     """An unblocker session at a stuck point, as a trial -- or as a note,
     when it says the plan or the sandbox is at fault."""
@@ -1316,7 +1316,7 @@ def _agent_trial(
         round=attempt, trace=scratch / f"{build}.trace.json", build=scratch / build,
         overrides=dict(overrides),
         blockers=list(aggregate.blockers), timeout=timeout,
-        earlier=[dict(r) for r in aggregate.unblocker],
+        earlier=[dict(r) for r in aggregate.unblocker], arch=arch,
     )
     result = unblocker(stuck)
     record = result.record()

@@ -458,3 +458,14 @@ def test_a_default_build_that_needs_cuda_has_nothing_for_riscv64():
     assert _cmake_tier(cuda, {})[0] == NONE
     optional = depgraph.Node(key="cuda", name="CUDA", kind="library")
     assert _cmake_tier(optional, {})[0] != NONE   # asked for, not demanded
+
+
+def test_cuda_is_a_no_only_where_nvidia_ships_none():
+    from will_it_riscv import graph as depgraph
+    from will_it_riscv.planrun import NONE, _cmake_tier
+
+    cuda = depgraph.Node(key="cuda", name="CUDA", kind="library")
+    cuda.status = depgraph.REQUIRED
+    assert _cmake_tier(cuda, {}, "loongarch64")[1] == "NVIDIA's CUDA has no loongarch64 build"
+    for arch in ("aarch64", "x86_64", "ppc64le"):
+        assert _cmake_tier(cuda, {}, arch)[0] != NONE, arch

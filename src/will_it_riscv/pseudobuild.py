@@ -922,6 +922,7 @@ def run(
                 created.append(changed)
             created += _version_headers(outcome, sysroot, aggregate.blockers)
             created += _negotiate(outcome.narration, sysroot, answered, written)
+            _numpy_importable(fresh, interpreter)
             imported = interpreter.provide()
             if imported and aggregate.round_blockers[-1] is None:
                 # Nothing CMake looked for stopped it: its own interpreter
@@ -965,6 +966,8 @@ def run(
                 if trial is None:
                     break   # nothing left to try; the configure is stuck here
                 tried.add(trial.name)
+                _numpy_importable(trial.overrides, interpreter)
+                interpreter.provide()
                 fresh, created = trial.overrides, trial.files
             overrides.update(fresh)
             written.update(created)
@@ -987,6 +990,18 @@ def run(
     aggregate.found -= set(aggregate.blockers)
     aggregate.duration = time.monotonic() - started
     return aggregate
+
+
+def _numpy_importable(overrides: dict, interpreter: HostPython) -> None:
+    """NumPy's headers are stubbed: let the interpreter import numpy too.
+
+    FindPython reads NumPy's version by importing it, in a try it catches, so
+    the failed import is never recorded -- and the version is left empty:
+    psi4 then compares nothing with 2. The plan's numpy if it resolves one,
+    else a stub, as for any import.
+    """
+    if any(key.endswith("_NumPy_INCLUDE_DIR") for key in overrides):
+        interpreter.missed("numpy")
 
 
 def _prune(aggregate: PseudoBuild, root: Path, scratch: Path, settings: dict, env: dict,

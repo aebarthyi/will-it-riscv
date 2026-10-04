@@ -97,5 +97,11 @@ def test_a_stubbed_setup_says_the_version_it_was_given(tmp_path):
     _run(python, "-c", "import wir_setuptools")
     python.provide()
     script = tmp_path / "setup.py"
-    script.write_text("from wir_setuptools import setup\nsetup(name='x', version='5.6.7')\n")
+    script.write_text(
+        "from wir_setuptools import setup, Extension\n"
+        "class CMakeExtension(Extension):\n"
+        "    def __init__(self, name):\n"
+        "        Extension.__init__(self, name, sources=[])\n"
+        "setup(name='x', version='5.6.7', ext_modules=[CMakeExtension('x')])\n"
+    )
     assert _run(python, str(script), "--version").stdout.strip() == "5.6.7"

@@ -1362,3 +1362,18 @@ def test_a_linker_flag_check_is_answered_as_the_link_would(tmp_path):
     )
     result = run(tmp_path, timeout=120)
     assert result.completed and result.platform == "linux/riscv64"
+
+
+def test_stubbed_numpy_headers_make_numpy_importable_too(tmp_path):
+    """FindPython reads NumPy's version by importing it, and catches the failure:
+    with headers and no module, psi4 compares an empty version with 2."""
+    from will_it_riscv.hostpython import HostPython
+
+    python = HostPython.create(tmp_path, dists={})
+    pseudobuild._numpy_importable({"Python_INCLUDE_DIR": "/x"}, python)
+    assert python.provide() == []
+    pseudobuild._numpy_importable({"Python_NumPy_INCLUDE_DIR": "/x"}, python)
+    assert python.provide() == ["numpy"]
+    version = subprocess.run([str(python.executable), "-c", "import numpy; print(numpy.__version__)"],
+                             capture_output=True, text=True)
+    assert version.stdout.strip() == "99.9.9"

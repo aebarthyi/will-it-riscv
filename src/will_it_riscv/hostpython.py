@@ -167,8 +167,13 @@ def _attribute(name):
 
 
 class _Anything:
-    def __init__(self, name=""):
-        self._name = name
+    def __init__(self, name="", *args, **kwargs):
+        # Also what a subclass's Extension.__init__(self, name, sources=...)
+        # reaches, on a stub: anything goes, and only a name is kept.
+        if isinstance(name, str):
+            self.__dict__["_name"] = name
+        else:
+            self.__dict__.setdefault("_name", "")
     def __getattr__(self, name):
         return _attribute(name)
     def __call__(self, *args, **kwargs):

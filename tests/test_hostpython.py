@@ -2,6 +2,7 @@
 
 import subprocess
 import sys
+from pathlib import Path
 
 from will_it_riscv.hostpython import HostPython
 
@@ -71,3 +72,30 @@ def test_a_module_run_with_dash_m_that_is_not_there_is_recorded(tmp_path):
     python = HostPython.create(tmp_path)
     assert _run(python, "-m", "wir_scm").returncode == 1
     assert python.missing() == ["wir_scm"]
+
+
+def test_a_stub_answers_what_a_configure_asks_it_by_name(tmp_path):
+    """exago reads mpi4py's version and include directory, two lines; ascent
+    asks distutils for the site directory; FindPython asks numpy its version."""
+    python = HostPython.create(tmp_path, dists={})
+    for module in ("wir_mpi", "wir_utils.sysconfig"):
+        _run(python, "-c", f"import {module}")
+    python.provide()
+    two = _run(python, "-c", "import wir_mpi as m; print(m.__version__); print(m.get_include())")
+    version, include = two.stdout.split()
+    assert version == "99.9.9" and Path(include).is_dir()
+    site = _run(python, "-c", "from wir_utils.sysconfig import get_python_lib, get_paths\n"
+                "print(get_python_lib()); print(get_paths()['include'])").stdout.split()
+    assert len(site) == 2 and all(Path(p).is_dir() for p in site)
+    nested = _run(python, "-c", "import wir_mpi; print(wir_mpi.version.version)")
+    assert nested.stdout.strip() == "99.9.9"
+
+
+def test_a_stubbed_setup_says_the_version_it_was_given(tmp_path):
+    """xrootd runs its setup.py --version for the version, setuptools stubbed."""
+    python = HostPython.create(tmp_path, dists={})
+    _run(python, "-c", "import wir_setuptools")
+    python.provide()
+    script = tmp_path / "setup.py"
+    script.write_text("from wir_setuptools import setup\nsetup(name='x', version='5.6.7')\n")
+    assert _run(python, str(script), "--version").stdout.strip() == "5.6.7"

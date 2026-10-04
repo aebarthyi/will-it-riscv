@@ -42,26 +42,15 @@ with open(os.path.join(HERE, "stubs.txt")) as handle:
     STUBS = set(handle.read().split())
 
 
-class _Anything:
-    def __getattr__(self, name):
-        return _Anything()
-    def __call__(self, *args, **kwargs):
-        return _Anything()
-    def __iter__(self):
-        return iter(())
-    def __bool__(self):
-        return False
-    def __str__(self):
-        return ""
-    def __mro_entries__(self, bases):
-        return (object,)
+@ANYTHING@
+_ANSWERS = os.path.join(STUBSITE, "_answers")
 
 
 class _StubLoader(importlib.abc.Loader):
     def create_module(self, spec):
         return None
     def exec_module(self, module):
-        module.__getattr__ = lambda name: _Anything()
+        module.__getattr__ = _attribute
         module.__path__ = []
         # Asked where it is, or which it is -- neuron's FindPythonModule
         # prints numpy.__file__ -- a stub says something a string can hold.
@@ -126,11 +115,66 @@ _WRAPPER = '#!/bin/sh\nexec "{python}" -S "{runner}" "$@"\n'
 #: A stubbed module, as a file, so that any interpreter a build runs sees it:
 #: Meson runs a ``.py`` script with its own Python, not the one it was given.
 _STUB_MODULE = '''# stub emitted by will-it-riscv: nothing said which version to install
-class _Anything:
+import os
+@ANYTHING@
+_ANSWERS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_answers")
+__version__ = "99.9.9"
+__getattr__ = _attribute
+'''
+
+#: What a stubbed module's every attribute is. Most are only imported, or
+#: called and ignored; but a configure asks some for real answers, by name --
+#: numpy.get_include(), distutils.sysconfig.get_python_lib(), mpi4py's
+#: __version__ and get_include() on two lines, ``setup.py --version`` with
+#: setuptools stubbed -- and an empty string stops it (ascent, exago, dolfinx,
+#: psi4, xrootd). So a version is one that passes, a path a directory that
+#: exists, and setup() says the version it was given.
+_ANYTHING = r'''
+import re as _re
+import sys as _sys
+
+_VERSION = _re.compile(r"_*(get_)?(short_|full_)?version_*")
+_PATHLIKE = {"include", "inc", "path", "dir", "directory", "lib", "libdir", "includedir",
+             "prefix", "location", "root", "home", "site", "purelib", "platlib", "stdlib",
+             "platstdlib", "scripts", "data"}
+_PLURAL = ("dirs", "libs", "includes", "libraries", "directories")
+
+
+class _Version(str):
     def __getattr__(self, name):
-        return _Anything()
+        return self if _VERSION.fullmatch(name.lower()) else _Anything(name)
+
+
+def _answer(name, args=(), kwargs=None):
+    lower = (name or "").lower()
+    if lower in ("get_config_var", "get_path") and args and isinstance(args[0], str):
+        lower = args[0].lower()   # sysconfig.get_config_var("LIBDIR")
+    if lower == "setup" and "--version" in _sys.argv:
+        print((kwargs or {}).get("version", "99.9.9"))
+        return _Anything(name)
+    if _VERSION.fullmatch(lower):
+        return _Version("99.9.9")
+    words = [w for w in _re.split(r"[^a-z0-9]+", lower) if w]
+    if "paths" in words or not any(w in _PATHLIKE or w.rstrip("s") in _PATHLIKE for w in words):
+        return _Anything(name)   # get_paths() is a mapping: asked by key, below
+    where = _os.path.join(_ANSWERS, "_".join(words))
+    _os.makedirs(where, exist_ok=True)
+    return [where] if lower.endswith(_PLURAL) else where
+
+
+def _attribute(name):
+    return _Version("99.9.9") if _VERSION.fullmatch(name.lower()) else _Anything(name)
+
+
+class _Anything:
+    def __init__(self, name=""):
+        self._name = name
+    def __getattr__(self, name):
+        return _attribute(name)
     def __call__(self, *args, **kwargs):
-        return _Anything()
+        return _answer(self._name, args, kwargs)
+    def __getitem__(self, key):
+        return _answer(key) if isinstance(key, str) else _Anything()
     def __iter__(self):
         return iter(())
     def __bool__(self):
@@ -139,14 +183,10 @@ class _Anything:
         return ""
     def __mro_entries__(self, bases):
         return (object,)
-
-
-__version__ = "99.9.9"
-
-
-def __getattr__(name):
-    return _Anything()
 '''
+_ANYTHING = "import os as _os\n" + _ANYTHING
+_RUNNER = _RUNNER.replace("@ANYTHING@", _ANYTHING)
+_STUB_MODULE = _STUB_MODULE.replace("@ANYTHING@", _ANYTHING)
 
 
 @dataclass

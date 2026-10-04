@@ -1954,18 +1954,40 @@ set(FortranCInterface_VERIFIED_C 1)
 set(FortranCInterface_VERIFIED_CXX 1)
 """
 
+#: A compile check of a STATIC_LIBRARY hands its link options to the archiver:
+#: check_linker_flag(CXX -DKOKKOS_DEPENDENCE) becomes "ar qc lib.a
+#: -DKOKKOS_DEPENDENCE ...", which ar refuses, and Kokkos stops the configure.
+#: On the target the link takes them. So the archive step drops every option
+#: after ar's own, and a linker flag check is answered as the link would.
+ARCHIVER = """\
+#!/bin/sh
+# Written by will-it-riscv: ar, less the link options a try_compile passes it.
+op="$1"; shift
+n=$#
+while [ "$n" -gt 0 ]; do
+  a="$1"; shift; n=$((n - 1))
+  case "$a" in -*) ;; *) set -- "$@" "$a" ;; esac
+done
+exec {ar} "$op" "$@"
+"""
+
 
 def _toolchain(scratch: Path, sysroot: Path, arch: str, source: Path) -> Path:
     emulator = scratch / "run-on-host"
     emulator.write_text('#!/bin/sh\nexec "$@"\n')
     emulator.chmod(0o755)
     path = scratch / "toolchain.cmake"
-    path.write_text(
-        TOOLCHAIN.format(
-            arch=arch, sysroot=sysroot.as_posix(), emulator=emulator.as_posix(),
-            scratch=scratch.as_posix(), source=Path(source).resolve().as_posix(),
-        )
+    text = TOOLCHAIN.format(
+        arch=arch, sysroot=sysroot.as_posix(), emulator=emulator.as_posix(),
+        scratch=scratch.as_posix(), source=Path(source).resolve().as_posix(),
     )
+    ar = shutil.which("ar")
+    if ar:
+        archiver = scratch / "archive"
+        archiver.write_text(ARCHIVER.format(ar=shlex.quote(ar)))
+        archiver.chmod(0o755)
+        text += f'set(CMAKE_AR "{archiver.as_posix()}" CACHE FILEPATH "ar, less link options")\n'
+    path.write_text(text)
     return path
 
 

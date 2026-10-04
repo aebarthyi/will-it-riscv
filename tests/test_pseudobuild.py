@@ -1344,3 +1344,21 @@ def test_a_command_a_stubbed_package_would_define_is_stubbed_too(tmp_path):
     result = run(tmp_path, timeout=120)
     assert result.completed, result.error
     assert result.blockers == ["wirnano"]
+
+
+@needs_cmake
+def test_a_linker_flag_check_is_answered_as_the_link_would(tmp_path):
+    """Kokkos checks -DKOKKOS_DEPENDENCE with check_linker_flag. A compile check
+    of a static library hands it to ar, which refuses it; the link would not."""
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.22)\n"
+        "project(t CXX)\n"
+        "find_package(ZLIB QUIET)\n"   # asked something: no fallback to a host configure
+        "include(CheckLinkerFlag)\n"
+        'check_linker_flag(CXX "-DKOKKOS_DEPENDENCE" OK)\n'
+        "if(NOT OK)\n"
+        '  message(FATAL_ERROR "The linker for CXX can not consume flags")\n'
+        "endif()\n"
+    )
+    result = run(tmp_path, timeout=120)
+    assert result.completed and result.platform == "linux/riscv64"

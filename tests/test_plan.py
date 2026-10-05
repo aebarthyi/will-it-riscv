@@ -565,10 +565,12 @@ def test_a_plan_that_never_configures_the_project_goes_back(tmp_path, target):
     apt = {"id": "apt", "kind": "system-packages", "packages": ["gcc"], "evidence": []}
     result = run_plan(tmp_path, target, plan(apt), distro=FakeDistro({"gcc"}))
     assert result.unconfigured == ["meson.build"]
+    assert result.answer.verdict == "probably"     # not yes: nothing was configured
     assert dataset.plan_faults(result) == [
         "the project has a meson.build at its root and no default step configures it: "
-        "package lists alone say nothing of whether it builds, so add the meson-setup "
-        "step its default build runs"]
+        "package lists alone say nothing of whether it builds, so add a default meson-setup "
+        "step, even where the documented build is make, autotools or Bazel: the tool runs "
+        "none of those, and the configure stands in for them"]
     assert planrun.to_dict(result)["unconfigured"] == ["meson.build"]
 
     def unconfigured(*steps):

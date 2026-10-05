@@ -858,6 +858,17 @@ def _answer(result: PlanResult) -> PlanAnswer:
         return PlanAnswer(
             "unknown", f"step {first.step.id!r} {first.status}: {first.detail}", **lists
         )
+    if result.unconfigured:
+        # Read, not configured, as recursion says of such a node: the
+        # packages exist, and nothing shows the project builds with them.
+        once = (f", and {len(from_source)} would be built from source" if from_source
+                else "")
+        return PlanAnswer(
+            "probably",
+            f"no default step configures the {' or '.join(result.unconfigured)} at the root: "
+            f"the packages listed exist for the target{once}, and that is all the run shows",
+            **lists,
+        )
     if from_source:
         return PlanAnswer(
             "yes-after-source-builds",

@@ -224,6 +224,11 @@ A package built with a plain "pip install ." is a python-install of its pyprojec
 section "build-system", then the configure its build backend runs: scikit-build-core runs \
 CMake, meson-python runs Meson.
 
+The tool runs no make, autotools or Bazel. When the default build is one of those and the \
+repository also has a CMakeLists.txt or meson.build at its root, write that configure as a \
+default step with its default options: it stands in for the build the tool cannot run, and \
+without it package lists are all the tool sees. Say so in its note.
+
 Every step has:
 - "id": a short name of letters, digits, dots and dashes, like "configure-simulation".
 - "after": the ids of the steps that must run before it.

@@ -340,8 +340,9 @@ def plan_faults(result) -> list[str]:
         kind = "meson-setup" if name == "meson.build" else "cmake-configure"
         problems.append(
             f"the project has a {name} at its root and no default step configures it: "
-            "package lists alone say nothing of whether it builds, so add the "
-            f"{kind} step its default build runs")
+            f"package lists alone say nothing of whether it builds, so add a default {kind} "
+            "step, even where the documented build is make, autotools or Bazel: the tool "
+            "runs none of those, and the configure stands in for them")
     for step_id, name, near, distro in getattr(result, "unknown_names", []):
         problems.append(
             f"step {step_id!r}: {distro} has no package named {name!r} on any architecture"

@@ -12,7 +12,12 @@ verified one.
   optional    of the steps both have, how many agree on default versus optional
   order       of the orderings the reference insists on, how many it keeps
   verdict     with --execute: run it, and does it reach the same answer
-  required    with --execute: overlap of what its run and the reference's require
+  required    with --execute: overlap of what its run and the reference's are
+              shown to need -- by a configure that ran to the end, or the
+              project's own manifest -- each dependency once; not scored where
+              the reference's run shows nothing (planrun.proven)
+  req_all     the same over everything required, the plan's own package lists
+              included: which apt lines were copied as much as what is needed
   tokens      what the example cost in model tokens, in and out: the planner's,
               and with --unblock the unblocker agent's (in thousands, per repo)
   usd         the same in dollars, where the backend says
@@ -38,7 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Collection, Optional
 
@@ -75,6 +80,10 @@ class Score:
     order: Optional[float] = None
     verdict: Optional[bool] = None
     required: Optional[float] = None
+    required_all: Optional[float] = None
+    plan_check: list = field(default_factory=list)
+    """With --execute: what checking its run against the plan found -- an
+    option moved off its default, a configure the driver never ran."""
     seconds: Optional[float] = None
     planner_tokens_in: int = 0
     planner_tokens_out: int = 0
@@ -294,6 +303,26 @@ def model_planner(
     return planner
 
 
+def saved_planner(directories: list[Path]) -> Planner:
+    """The last answer a model gave, kept by an earlier run's --transcripts:
+    scoring it again after the executor or the measures change costs no model
+    call. With several directories, a later one's answer for a key wins."""
+
+    def planner(root: Path, pack: EvidencePack, meta: dict) -> Optional[Plan]:
+        for directory in reversed(directories):
+            kept = directory / f"{meta['key']}.json"
+            if kept.is_file():
+                # As plan_repository kept it: the last answer that parsed.
+                for attempt in reversed(json.loads(kept.read_text()).get("attempts") or []):
+                    plan, _, _ = modelplan.check(attempt["text"], root, pack)
+                    if plan is not None:
+                        return plan
+                return None
+        return None
+
+    return planner
+
+
 def agent_planner(agent, env) -> Planner:
     """The agent (:mod:`agent`): it plans, runs, fixes and stops on its own;
     what it spent goes in ``meta["usage"]``. Its fixes at stuck points are
@@ -442,7 +471,11 @@ def _example(directory: Path, planners: dict[str, Planner], env, baselines: bool
             else:
                 ran = dataset.summary(dataset.run_plan(candidate, root, env))
             result.verdict = ran["verdict"] == reference_run["verdict"]
-            result.required = _overlap(set(ran["required"]), set(reference_run["required"]))
+            result.required, result.required_all = required_overlap(ran, reference_run)
+            result.plan_check = ran.get("plan_check", [])
+            if "proven" not in reference_run:
+                progress(f"{directory.name}: its reference run predates proven requirements; "
+                         "required is not scored (will-it-riscv-dataset rerun)")
         if "usage" in context:
             result.planner_tokens_in, result.planner_tokens_out, result.planner_usd = \
                 context["usage"]
@@ -454,6 +487,16 @@ def _example(directory: Path, planners: dict[str, Planner], env, baselines: bool
         result.seconds = round(time.monotonic() - began, 1)
         scores.append(result)
     return scores
+
+
+def required_overlap(ran: dict, reference: dict) -> tuple[Optional[float], float]:
+    """``(proven, all)``: how far two runs agree on what the default build is
+    shown to need -- None where the reference's run shows nothing, or was
+    recorded before runs said -- and on everything they require."""
+    everything = _overlap(set(ran["required"]), set(reference["required"]))
+    if not reference.get("proven"):
+        return None, everything
+    return _overlap(set(ran.get("proven", ())), set(reference["proven"])), everything
 
 
 def _overlap(a: set, b: set) -> float:
@@ -491,6 +534,7 @@ def table(scores: list[Score]) -> list[dict]:
             "order": mean([s.order for s in mine]),
             "verdict": mean([None if s.verdict is None else float(s.verdict) for s in mine]),
             "required": mean([s.required for s in mine]),
+            "req_all": mean([s.required_all for s in mine]),
             "ktokens": mean([s.tokens / 1000 for s in mine]),
             "usd": mean([s.usd for s in mine]),
             "sessions": mean([float(s.unblock_sessions) for s in mine]),
@@ -505,9 +549,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument("--out", required=True, type=Path, help="a labelled dataset directory")
     parser.add_argument("--split", default="test")
-    parser.add_argument("--planner", choices=("claude-cli", "anthropic", "openai", "agent"),
+    parser.add_argument("--planner",
+                        choices=("claude-cli", "anthropic", "openai", "agent", "saved"),
                         help="a model to score beside the baselines; agent: Claude (via claude "
-                             "-p, --planner-model) planning with tools, needs --execute")
+                             "-p, --planner-model) planning with tools, needs --execute; saved: "
+                             "the last answers kept in --saved")
+    parser.add_argument("--saved", metavar="DIR[,DIR...]",
+                        help="for --planner saved: --transcripts directories of earlier runs; "
+                             "a later one's answer for a key wins")
     parser.add_argument("--planner-model")
     parser.add_argument("--planner-url",
                         help="for openai: the server, or several of the same model, comma-separated")
@@ -545,6 +594,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.error("--run-feedback needs --execute")
     if args.no_baselines and not args.planner:
         parser.error("--no-baselines needs --planner")
+    if (args.planner == "saved") != bool(args.saved):
+        parser.error("--planner saved and --saved go together")
     if args.unblock:
         if not args.execute:
             parser.error("--unblock needs --execute")
@@ -565,6 +616,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         model = args.planner_model or "sonnet"
         planners[f"agent:{model}"] = agent_planner(ClaudeAgent(model=model), env)
+    elif args.planner == "saved":
+        saved = [Path(d) for d in args.saved.split(",")]
+        planners[f"saved:{saved[0].name}"] = saved_planner(saved)
     elif args.planner:
         backend = modelplan.backend(
             args.planner, args.planner_model, args.planner_url, args.planner_slots)
@@ -578,7 +632,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     rows = table(scores)
     columns = ["planner", "kind", "repos", "parsed", "cited", "grounded", "precision", "recall", "f1",
-               "optional", "order", "verdict", "required", "ktokens", "usd", "sessions"]
+               "optional", "order", "verdict", "required", "req_all", "ktokens", "usd", "sessions"]
     print("  ".join(f"{c:>9}" for c in columns))
     for row in rows:
         print("  ".join(f"{'-' if row[c] is None else row[c]!s:>9}" for c in columns))

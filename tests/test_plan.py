@@ -469,3 +469,87 @@ def test_cuda_is_a_no_only_where_nvidia_ships_none():
     assert _cmake_tier(cuda, {}, "loongarch64")[1] == "NVIDIA's CUDA has no loongarch64 build"
     for arch in ("aarch64", "x86_64", "ppc64le"):
         assert _cmake_tier(cuda, {}, arch)[0] != NONE, arch
+
+
+# -- how a requirement is known ---------------------------------------------
+
+THING = (
+    "include(FindPackageHandleStandardArgs)\n"
+    "find_package_handle_standard_args(Thing REQUIRED_VARS THING_LIBRARY)\n"
+)
+
+
+def thing_project(root, *after):
+    (root / "cmake").mkdir()
+    (root / "cmake" / "FindThing.cmake").write_text(THING)
+    (root / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\nproject(demo NONE)\n"
+        "list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake)\n"
+        "find_package(Thing REQUIRED)\n" + "".join(after)
+    )
+
+
+@needs_cmake
+def test_a_requirement_says_how_it_is_known(tmp_path, target):
+    """Shown by a configure that ran to the end, or only named by the plan's
+    apt list -- what a README or CI script hands over, runtime libraries and
+    tooling along with the build's needs. Proven, it counts once: as the
+    configure's node, not again as the apt line that installs it."""
+    thing_project(tmp_path)
+    result = run_plan(tmp_path, target, plan(
+        {"id": "apt", "kind": "system-packages", "packages": ["libthing-dev", "ccache"],
+         "evidence": []},
+        {"id": "configure", "kind": "cmake-configure", "after": ["apt"], "evidence": []},
+    ), distro=FakeDistro({"libthing-dev", "ccache"}))
+    (thing,) = [n for n in result.nodes.values() if n.name == "Thing"]
+    assert thing.required and thing.basis == planrun.BY_CONFIGURE
+    assert result.nodes["debian:ccache"].basis == planrun.BY_LIST
+    assert planrun.proven(result) == [thing.id]
+    assert planrun.to_dict(result)["nodes"][0]["basis"] is not None
+
+
+@needs_cmake
+def test_what_only_a_configure_that_stopped_asked_for_is_not_proven(tmp_path, target):
+    """Until a configure completes, an optional package a stub made present
+    can look required: octopus's PSolver, and the atlab its module asks for."""
+    thing_project(tmp_path, 'message(FATAL_ERROR "this build needs what nobody can give it")\n')
+    result = run_plan(tmp_path, target, plan(
+        {"id": "configure", "kind": "cmake-configure", "evidence": []},
+    ))
+    (thing,) = [n for n in result.nodes.values() if n.name == "Thing"]
+    assert thing.required and thing.basis == planrun.BY_STOPPED
+    assert planrun.proven(result) == []
+
+
+@needs_cmake
+def test_a_default_step_that_moves_an_option_off_its_default_is_sent_back(tmp_path, target):
+    """NEURON's MPI is ON by default: a default step that turns it OFF, citing
+    nothing that does, reports a build without what the default one needs --
+    a CMake file that only mentions the flag sets nothing. A flag a cited
+    script sets near the line cited (uamqp's setup.py), one left at its
+    default, and an optional step's are all fine."""
+    from will_it_riscv import dataset
+
+    (tmp_path / "build.sh").write_text(
+        "mkdir build && cd build\ncmake .. \\\n  -DDEMO_DOCS:BOOL=ON\n")
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\nproject(demo NONE)\n"
+        'option(DEMO_MPI "Use MPI" ON)\noption(DEMO_GPU "Use a GPU" OFF)\n'
+        'option(DEMO_DOCS "Build the docs")\n'
+        'if(DEMO_MUSIC AND NOT DEMO_MPI)\n  message(FATAL_ERROR "MUSIC needs -DDEMO_MPI=ON")\nendif()\n'
+    )
+    result = run_plan(tmp_path, target, plan(
+        {"id": "configure", "kind": "cmake-configure",
+         "defines": {"DEMO_MPI": "OFF", "DEMO_GPU": "OFF", "DEMO_DOCS": "ON"},
+         "evidence": [{"at": "build.sh:2", "quote": "cmake .."},
+                      {"at": "CMakeLists.txt:3", "quote": 'option(DEMO_MPI "Use MPI" ON)'}]},
+        {"id": "gpu", "kind": "cmake-configure", "defines": {"DEMO_GPU": "ON"},
+         "optional": True, "enabled_by": "--gpu", "evidence": []},
+    ))
+    configure, gpu = result.steps
+    (moved,) = configure.plan_check
+    assert moved.startswith("-DDEMO_MPI=OFF moves the project's option from its default ON "
+                            "(CMakeLists.txt:3)")
+    assert gpu.plan_check == []
+    assert [f for f in dataset.plan_faults(result) if "DEMO" in f] == [
+        f"step 'configure': {moved}"]

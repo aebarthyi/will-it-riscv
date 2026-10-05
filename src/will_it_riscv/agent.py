@@ -247,8 +247,11 @@ class Session:
         except (TypeError, ValueError, OSError):
             pass
         lines = [f"verdict: {summary['verdict']}: {summary['headline']}"]
-        lines += [f"required ({len(summary['required'])}): "
-                  + ", ".join(summary["required"][:80])]
+        for key, title in (("proven", "required, shown by the build"),
+                           ("unproven", "required by a configure that stopped, not proven"),
+                           ("listed", "only named by your package lists")):
+            if summary[key] or key == "proven":
+                lines.append(f"{title} ({len(summary[key])}): " + ", ".join(summary[key][:80]))
         lines += ["steps:"] + [f"- {s['id']} ({s['kind']}): {s['status']}: {s['detail'][:240]}"
                                for s in summary["steps"]]
         if self.replayed:

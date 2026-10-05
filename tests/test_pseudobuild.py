@@ -121,6 +121,29 @@ def test_missing_trace_file_is_not_an_error(tmp_path):
     assert probes == {} and traced == 0
 
 
+def test_the_projects_own_options_are_read_with_their_defaults(tmp_path):
+    """As expanded: NEURON's ${NRN_ENABLE_MPI_DEFAULT} arrives as ON. No
+    value is OFF; the first declaration wins; CMake's own modules' options,
+    CTest's BUILD_TESTING among them, are not the project's."""
+    root = tmp_path / "repo"
+    events = [
+        {"cmd": "option", "args": ["DEMO_MPI", "Use MPI", "ON"],
+         "file": f"{root}/CMakeLists.txt", "line": 4, "global_frame": 1},
+        {"cmd": "option", "args": ["DEMO_DOCS", "Build the docs"],
+         "file": f"{root}/cmake/options.cmake", "line": 2, "global_frame": 2},
+        {"cmd": "option", "args": ["DEMO_MPI", "Use MPI", "OFF"],
+         "file": f"{root}/CMakeLists.txt", "line": 9, "global_frame": 1},
+        {"cmd": "option", "args": ["BUILD_TESTING", "Build the testing tree.", "ON"],
+         "file": "/usr/share/cmake/Modules/CTest.cmake", "line": 50, "global_frame": 2},
+    ]
+    trace = tmp_path / "trace.json"
+    trace.write_text("\n".join(json.dumps(e) for e in events))
+    options: dict = {}
+    _parse_trace(trace, root, options=options)
+    assert options == {"DEMO_MPI": ("ON", "CMakeLists.txt:4"),
+                       "DEMO_DOCS": ("OFF", "cmake/options.cmake:2")}
+
+
 # -- the subprocess boundary ------------------------------------------------
 
 

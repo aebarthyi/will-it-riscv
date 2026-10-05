@@ -708,3 +708,40 @@ def test_a_run_stops_when_the_teacher_stops_answering_and_picks_up_again(tmp_pat
 
     again = dataset.label_corpus(entries, out, Answers(), execute=False, progress=said.append)
     assert [m["tier"] for m in again] == [dataset.VERIFIED] * 4
+
+
+def test_the_harness_rescores_what_a_model_wrote_without_asking_it_again(tmp_path):
+    repo = write(tmp_path / "repo", REPO)
+    out = tmp_path / "out"
+    dataset.label(dataset.Entry(name="demo", path=str(repo), split="test"), repo,
+                  Scripted(wire()), out)
+    kept = tmp_path / "transcripts"
+    evaluate.evaluate(out, {"model": evaluate.model_planner(Scripted(wire()), 1, kept)},
+                      baselines=False)
+    (saved,) = kept.iterdir()
+    # The plan kept is the last answer that parsed, as plan_repository keeps it.
+    record = json.loads(saved.read_text())
+    record["attempts"].append({"text": "not a plan"})
+    saved.write_text(json.dumps(record))
+    (score,) = evaluate.evaluate(out, {"saved": evaluate.saved_planner([kept])},
+                                 baselines=False)
+    assert score.parsed and score.precision == 1.0 and score.tokens == 0
+    # A later directory's answer for the key wins: here, none that parses.
+    later = tmp_path / "later"
+    later.mkdir()
+    (later / saved.name).write_text(json.dumps({"attempts": []}))
+    (score,) = evaluate.evaluate(out, {"saved": evaluate.saved_planner([kept, later])},
+                                 baselines=False)
+    assert not score.parsed
+
+
+def test_required_is_scored_on_what_the_runs_prove():
+    """An apt line the reference copied from CI is no longer the candidate's
+    loss; a reference that proves nothing scores nobody."""
+    reference = {"required": ["debian:ccache", "debian:libboost-dev", "library:boost"],
+                 "proven": ["library:boost"]}
+    ran = {"required": ["debian:cmake", "library:boost"], "proven": ["library:boost"]}
+    assert evaluate.required_overlap(ran, reference) == (1.0, 0.25)
+    assert evaluate.required_overlap({"required": [], "proven": []}, reference)[0] == 0.0
+    assert evaluate.required_overlap(ran, {"required": ["debian:gcc"], "proven": []})[0] is None
+    assert evaluate.required_overlap(ran, {"required": ["debian:gcc"]})[0] is None

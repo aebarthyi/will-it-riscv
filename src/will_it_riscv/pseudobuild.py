@@ -160,6 +160,10 @@ class PseudoBuild:
     """What an unblocker agent (:mod:`unblock`) made of each point the rules
     could not get past, as its records; ``confirmed`` is the executor's
     verdict on its stubs."""
+    options: dict = field(default_factory=dict)
+    """The project's own options: name to ``(default, "path:line")``,
+    the default as the trace expanded it -- NEURON's
+    ``${NRN_ENABLE_MPI_DEFAULT}`` arrives as ON. What a -D moves it from."""
 
     @property
     def ok(self) -> bool:
@@ -426,7 +430,7 @@ _SEARCH_COMMANDS = ("find_library", "find_path", "find_file", "find_program")
 def _parse_trace(
     path: Path, root: Optional[Path] = None, lookups: Optional[dict] = None,
     reads: Optional[list] = None, exists: Optional[list] = None,
-    searches: Optional[list] = None,
+    searches: Optional[list] = None, options: Optional[dict] = None,
 ) -> tuple[dict[str, Probe], int]:
     """Every dependency question in the trace, and who asked it.
 
@@ -473,6 +477,15 @@ def _parse_trace(
                 defined = event.get("args") or []
                 if defined and _inside(str(event.get("file", "")), prefixes):
                     wrappers.add(str(defined[0]).lower())
+                continue
+            if command == "option":
+                declared = [str(a) for a in event.get("args", [])]
+                if options is not None and declared and declared[0] not in options:
+                    site = _project_sites([event], prefixes)
+                    if site:
+                        # option(NAME "help" [value]): no value is OFF.
+                        options[declared[0]] = (
+                            declared[2] if len(declared) > 2 else "OFF", site[0])
                 continue
             if searches is not None and command in _SEARCH_COMMANDS:
                 found_args = [str(a) for a in event.get("args", []) if str(a).strip()]
@@ -836,6 +849,8 @@ def run(
             for name, where in outcome.found_at.items():
                 aggregate.found_at.setdefault(name, where)
             aggregate.soft_misses |= outcome.soft_misses
+            for name, declared in outcome.options.items():
+                aggregate.options.setdefault(name, declared)
             aggregate.commands_traced += outcome.commands_traced
             aggregate.completed = outcome.completed
             aggregate.error = outcome.error
@@ -2056,7 +2071,8 @@ def _configure(
     reads: list = []
     exists: list = []
     searches: list = []
-    probes, traced = _parse_trace(trace, root, lookups, reads, exists, searches)
+    options: dict = {}
+    probes, traced = _parse_trace(trace, root, lookups, reads, exists, searches, options)
     narration = (process.stdout or "") + "\n" + (process.stderr or "")
     found, soft, blockers = _read_outcomes(narration)
     result = PseudoBuild(
@@ -2071,6 +2087,7 @@ def _configure(
         reads=reads,
         exists=exists,
         searches=searches,
+        options=options,
     )
     result.narration = narration
     result.found_at = dict(_STATUS_FOUND_AT.findall(narration))

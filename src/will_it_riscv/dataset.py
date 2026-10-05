@@ -321,7 +321,8 @@ def plan_faults(result) -> list[str]:
         ):
             problems.append(f"step {outcome.step.id!r} could not run: {detail}")
         for line in getattr(outcome, "plan_check", None) or []:
-            if "which no plan step does" in line or "which the driver never configured" in line:
+            if ("which no plan step does" in line or "which the driver never configured" in line
+                    or "from its default" in line):
                 problems.append(f"step {outcome.step.id!r}: {line}")
         if outcome.status in ("failed", "stopped") and "COMPILER" in detail:
             for name, value in outcome.step.defines.items():
@@ -346,6 +347,8 @@ _PLACEHOLDER = re.compile(r"\$\{?\w+\}?|<[^<>]+>|@\w+@")
 
 def summary(result) -> dict:
     """What running a plan showed, for the record."""
+    from . import planrun
+
     answer = result.answer
     return {
         "steps": [
@@ -358,6 +361,13 @@ def summary(result) -> dict:
         "verdict": answer.verdict if answer else None,
         "headline": answer.headline if answer else None,
         "required": sorted(n.id for n in result.nodes.values() if n.required),
+        # How each is known (planrun.BY_*): what the build is shown to need is
+        # what gets scored; the rest is reported beside it.
+        "proven": planrun.proven(result),
+        "unproven": sorted(n.id for n in result.nodes.values()
+                           if n.required and n.basis == planrun.BY_STOPPED),
+        "listed": sorted(n.id for n in result.nodes.values()
+                         if n.required and n.basis == planrun.BY_LIST),
     }
 
 

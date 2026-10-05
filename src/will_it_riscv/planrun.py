@@ -90,6 +90,23 @@ UPSTREAM_BINARIES = {
 
 _RANK = {PROVIDED: -1, BINARY: 0, TOOLCHAIN: 0, SOURCE: 1, UNKNOWN: 2, NONE: 3}
 
+# How a requirement is known, strongest first.
+BY_CONFIGURE = "configure"
+"""A default configure that ran to the end demanded it."""
+BY_MANIFEST = "manifest"
+"""The project's own manifest -- a pyproject.toml, a requirements file --
+declares it, and a default step installs from that."""
+BY_STOPPED = "stopped"
+"""Only a default configure that stopped demanded it. Until a configure
+completes, an optional package a stub made present can look required:
+octopus's PSolver, and the atlab its Find module then asks for."""
+BY_LIST = "listed"
+"""Only a package list the plan wrote names it: apt lines out of a README or
+a CI script, which carry runtime libraries and tooling along with the build's
+needs."""
+PROVEN = (BY_CONFIGURE, BY_MANIFEST)
+_BASIS_RANK = {BY_CONFIGURE: 0, BY_MANIFEST: 1, BY_STOPPED: 2, BY_LIST: 3}
+
 
 @dataclass
 class DepNode:
@@ -124,6 +141,9 @@ class DepNode:
     wants: Optional[str] = None
     """For a distro package asked for at a version: the version the build
     wants -- 8.7.0, for jax's Bazel. What recursing into its source fetches."""
+    basis: Optional[str] = None
+    """When required: how that is known, the strongest of every default step
+    that needs it (``BY_CONFIGURE`` ... ``BY_LIST``)."""
 
 
 @dataclass
@@ -253,14 +273,24 @@ def _edge(result: PlanResult, source: str, target: str) -> None:
         result.edges.append((source, target))
 
 
-def _need(node: DepNode, step: Step) -> None:
-    """Record that this step needs the node: required, or optional behind a flag."""
+def _need(node: DepNode, step: Step, basis: str) -> None:
+    """Record that this step needs the node: required, or optional behind a
+    flag. ``basis``: how the step knows it (``BY_CONFIGURE`` ... ``BY_LIST``)."""
     if step.optional:
         flag = step.enabled_by or step.id
         if flag not in node.optional_via:
             node.optional_via.append(flag)
     else:
         node.required = True
+        if node.basis is None or _BASIS_RANK[basis] < _BASIS_RANK[node.basis]:
+            node.basis = basis
+
+
+def proven(result: PlanResult) -> list[str]:
+    """What the default build is shown to need: by a configure that ran to the
+    end, or by the project's own manifest. A dependency counts once -- as the
+    configure's node, whatever apt line also installs it."""
+    return sorted(n.id for n in result.nodes.values() if n.required and n.basis in PROVEN)
 
 
 def _settle(
@@ -317,7 +347,7 @@ def _python_install(
     for report in analysis.packages.values():
         node = _node(result, f"pypi:{report.name}", "pypi", report.name)
         node.version = node.version or report.version
-        _need(node, step)
+        _need(node, step, BY_MANIFEST if step.manifest is not None else BY_LIST)
         if step.id not in node.steps:
             node.steps.append(step.id)
         detail = report.reasons[0] if report.reasons else report.verdict.value
@@ -352,7 +382,7 @@ def _system_packages(
         node = _node(result, f"debian:{package}", "debian", package)
         if wanted and (node.wants is None or _newer(wanted, node.wants)):
             node.wants = wanted
-        _need(node, step)
+        _need(node, step, BY_LIST)
         node.steps.append(step.id)
         _edge(result, f"step:{step.id}", node.id)
         if not checked or distro is None:
@@ -620,7 +650,7 @@ def _configure(
         node = _node(result, ids[key], gnode.kind, gnode.name)
         needed = gnode.status == depgraph.REQUIRED or gnode.asked_required
         if needed:
-            _need(node, step)
+            _need(node, step, BY_CONFIGURE if outcome.completed else BY_STOPPED)
         elif gnode.status == depgraph.OPTIONAL and not step.optional:
             node.carried_on = True
         if step.id not in node.steps:
@@ -642,7 +672,77 @@ def _configure(
         detail += "; installed for the host: " + ", ".join(outcome.python_installed)
     if not outcome.completed and outcome.error:
         detail += f"; stopped at {outcome.error}"
-    return StepResult(step, status, detail, pseudobuild=outcome, graph=graph)
+    checks = [] if step.optional else _moved_defaults(step, outcome, root)
+    return StepResult(step, status, detail, pseudobuild=outcome, graph=graph, plan_check=checks)
+
+
+def _moved_defaults(step: Step, outcome: PseudoBuild, root: Path) -> list[str]:
+    """The -D flags of a default configure that move one of the project's
+    options off its default, where nothing the step cites sets it.
+
+    The default build is the minimal spec. NEURON's MPI is ON unless someone
+    says otherwise: a default step that turns it OFF reports a build without
+    what the default one needs. dd4hep's Geant4 is OFF, and only the
+    bootstrap script it cites turns it ON.
+    """
+    options = getattr(outcome, "options", None) or {}
+    cited = _cited(step, root)
+    moved = []
+    for name, value in step.defines.items():
+        if name not in options or _sets(name, cited):
+            continue
+        default, site = options[name]
+        if _truthy(value) != _truthy(default):
+            moved.append(
+                f"-D{name}={value} moves the project's option from its default {default} "
+                f"({site}), and nothing the step cites sets it: a default step keeps the "
+                "defaults, so drop it, cite the install instructions that set it, or move "
+                "it to an optional step")
+    return moved
+
+
+def _cited(step: Step, root: Path) -> str:
+    """What the step's evidence could set a -D with: its quotes, the lines it
+    cites, and the whole of a cited file that is not CMake's own -- a script,
+    a README, a preset -- whose command's flags may sit a few lines from the
+    line cited: uamqp's setup.py. A CMake file names its options to declare
+    and test them -- NEURON's "MUSIC requires -DNRN_ENABLE_MPI=ON" -- so only
+    the lines cited count there."""
+    said = []
+    inside = root.resolve()
+    for evidence in step.evidence:
+        said.append(evidence.quote or "")
+        path = (root / evidence.path).resolve()
+        if not path.is_relative_to(inside):
+            continue
+        try:
+            lines = path.read_text(errors="replace").splitlines()
+        except (OSError, ValueError):
+            continue
+        if path.name == "CMakeLists.txt" or path.suffix == ".cmake":
+            said += lines[max(0, evidence.start - 1):min(evidence.end, evidence.start + 200)]
+        else:
+            said += lines[:5000]
+    return "\n".join(said)
+
+
+def _sets(name: str, text: str) -> bool:
+    """Whether the text sets this cache variable: ``-DNAME=``, ``-D NAME:BOOL=``,
+    a preset's ``"NAME":``, or a cache file's ``set(NAME``."""
+    name = re.escape(name)
+    return re.search(rf'-D\s*{name}(?::\w+)?=|"{name}"\s*:|set\(\s*{name}\s', text) is not None
+
+
+def _truthy(value: str) -> bool:
+    """CMake's reading of an option's value: ON, YES, TRUE, Y and non-zero
+    numbers are true; OFF, an empty value and anything else are false."""
+    upper = str(value).strip().upper()
+    if upper in ("ON", "YES", "TRUE", "Y"):
+        return True
+    try:
+        return float(upper) != 0
+    except ValueError:
+        return False
 
 
 #: What a vendor ships for some architectures only: NVIDIA's CUDA for x86-64,
@@ -845,7 +945,8 @@ def render_text(result: PlanResult, console) -> None:
             node = result.nodes[node_id]
             chain = " → ".join(_label(result, n) for n in result.why(node_id))
             console.print(f"    • {node.id:<28} {node.detail}", highlight=False)
-            console.print(f"      {chain}{_usage_note(node)}", style="dim", highlight=False)
+            console.print(f"      {chain}{_usage_note(node)}{_basis_note(node)}", style="dim",
+                          highlight=False)
 
     show("required, and nothing public for the target", answer.blockers, "bold red")
     show("required, and only source for the target", answer.from_source, "bold yellow")
@@ -859,8 +960,29 @@ def render_text(result: PlanResult, console) -> None:
             style="dim",
             highlight=False,
         )
+    unknown = sorted(n.id for n in result.nodes.values() if n.required and n.tier == UNKNOWN)
+    show("not settled", unknown, "bold magenta")
+    provided = sorted(n.id for n in result.nodes.values() if n.required and n.tier == PROVIDED)
+    if provided:
+        console.print(Text(f"  provided by the plan itself ({len(provided)})", style="bold cyan"))
+        for node_id in provided:
+            node = result.nodes[node_id]
+            console.print(f"    • {node.name:<20} {node.detail}", highlight=False)
+    if answer.install:
+        console.print(f"  sudo apt install {' '.join(answer.install)}", highlight=False)
+    known = [n for n in result.nodes.values() if n.required]
+    counts = {basis: sum(1 for n in known if n.basis == basis) for basis in _BASIS_RANK}
+    if known:
+        console.print(
+            f"  how the {len(known)} requirements are known: {counts[BY_CONFIGURE]} shown by "
+            f"a configure, {counts[BY_MANIFEST]} declared by the project, "
+            f"{counts[BY_STOPPED]} asked for by a configure that stopped, "
+            f"{counts[BY_LIST]} only named by the plan's package lists",
+            style="dim", highlight=False,
+        )
     if answer.optional or answer.optional_stopped:
-        console.print(Text("  optional — only with an extra flag or choice", style="bold blue"))
+        console.print(Text("  note — optional: only with an extra flag or choice",
+                           style="bold blue"))
         crossed = any(
             result.nodes[n].tier == NONE for ids in answer.optional.values() for n in ids
         )
@@ -885,27 +1007,27 @@ def render_text(result: PlanResult, console) -> None:
     )
     if carried_on:
         console.print(
-            f"  optional in the configures — absent, and they carried on ({len(carried_on)}): "
+            f"  note — optional in the configures: absent, and they carried on "
+            f"({len(carried_on)}): "
             + ", ".join(carried_on),
             style="dim",
             highlight=False,
         )
-    unknown = sorted(n.id for n in result.nodes.values() if n.required and n.tier == UNKNOWN)
-    show("not settled", unknown, "bold magenta")
-    provided = sorted(n.id for n in result.nodes.values() if n.required and n.tier == PROVIDED)
-    if provided:
-        console.print(Text(f"  provided by the plan itself ({len(provided)})", style="bold cyan"))
-        for node_id in provided:
-            node = result.nodes[node_id]
-            console.print(f"    • {node.name:<20} {node.detail}", highlight=False)
-    if answer.install:
-        console.print(f"  sudo apt install {' '.join(answer.install)}", highlight=False)
     console.print(
         f"  graph: {len(result.nodes)} nodes, {len(result.edges)} edges — "
         "-f dot | dot -Tsvg > plan.svg",
         style="dim",
     )
     console.print()
+
+
+def _basis_note(node: DepNode) -> str:
+    """How a requirement is known, when not by a configure or a manifest."""
+    if node.basis == BY_STOPPED:
+        return "   · asked for by a configure that stopped: not proven"
+    if node.basis == BY_LIST:
+        return "   · only named by the plan's package lists"
+    return ""
 
 
 def _usage_note(node: DepNode) -> str:
@@ -984,6 +1106,7 @@ def to_dict(result: PlanResult) -> dict:
                 "tier": n.tier,
                 "detail": n.detail,
                 "required": n.required,
+                "basis": n.basis,
                 "optional_via": n.optional_via,
                 "carried_on": n.carried_on,
                 "steps": n.steps,

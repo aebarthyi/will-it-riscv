@@ -193,6 +193,11 @@ class PlanResult:
     """``(step, name, near names, distro)``: system packages the distro has no package called."""
     arch: str = "riscv64"
     """The target, for an error that refuses it by name."""
+    unconfigured: list[str] = field(default_factory=list)
+    """Build files at the project's root the executor can configure --
+    CMakeLists.txt, meson.build -- when no default step builds the project:
+    then its package lists were looked up and nothing more. qemu's plan of
+    apt lines alone answered yes."""
 
     def why(self, node_id: str) -> list[str]:
         """The shortest chain from a step to this node: step, ..., node."""
@@ -257,8 +262,27 @@ def execute(
 
     _plan_check(result)
     _usage(result)
+    result.unconfigured = _unconfigured(plan, root)
     result.answer = _answer(result)
     return result
+
+
+#: What the executor can configure, by the file at a project's root.
+_CONFIGURABLE = {"CMakeLists.txt": CMAKE_CONFIGURE, "meson.build": MESON_SETUP}
+
+
+def _unconfigured(plan: Plan, root: Path) -> list[str]:
+    """The root's configurable build files, when no default step builds the
+    project: no configure, no driver of its own, and no install of its own
+    pyproject.toml -- pybcj's CMakeLists.txt is for its developers, and pip
+    builds it with setuptools."""
+    defaults = [s for s in plan.steps if not s.optional]
+    if any(s.kind in (CMAKE_CONFIGURE, MESON_SETUP, PYTHON_RUN) for s in defaults):
+        return []
+    if any(s.kind == PYTHON_INSTALL and s.manifest is not None
+           and Path(s.manifest) == Path("pyproject.toml") for s in defaults):
+        return []
+    return [name for name in _CONFIGURABLE if (root / name).is_file()]
 
 
 def _node(result: PlanResult, node_id: str, ecosystem: str, name: str) -> DepNode:
@@ -927,6 +951,9 @@ def render_text(result: PlanResult, console) -> None:
             )
     for problem in result.evidence_problems:
         console.print(f"  evidence: {problem}", style="yellow", highlight=False)
+    for name in result.unconfigured:
+        console.print(f"  plan: no default step configures the {name} at the root, so the "
+                      "answer only looked its packages up", style="yellow", highlight=False)
     console.print()
 
     answer = result.answer
@@ -1069,6 +1096,7 @@ def to_dict(result: PlanResult) -> dict:
             if answer else None
         ),
         "evidence_problems": result.evidence_problems,
+        "unconfigured": result.unconfigured,
         "steps": [
             {
                 "id": s.step.id,

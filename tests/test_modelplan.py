@@ -404,18 +404,22 @@ def test_a_rerun_records_what_todays_executor_says_and_keeps_the_old_run(tmp_pat
 
 
 def test_only_what_the_plan_got_wrong_goes_back_to_the_teacher():
-    def outcome(step_id, status, detail, plan_check=None):
-        return SimpleNamespace(step=SimpleNamespace(id=step_id), status=status, detail=detail,
-                               plan_check=plan_check)
+    def outcome(step_id, status, detail, plan_check=None, kind="cmake-configure"):
+        return SimpleNamespace(step=SimpleNamespace(id=step_id, kind=kind), status=status,
+                               detail=detail, plan_check=plan_check)
 
     result = SimpleNamespace(evidence_problems=[], steps=[
         outcome("a", "failed", "no CMakeLists.txt in src"),
         outcome("b", "stopped", "3 rounds: MPI; stopped at CMake Error"),   # the build's own
-        outcome("c", "failed", "reqs.txt: [Errno 2] No such file or directory"),
+        outcome("c", "failed", "reqs.txt: [Errno 2] No such file or directory",
+                kind="python-install"),
         outcome("d", "done", "ran", ["the driver configured src -DX=ON, which no plan step does"]),
+        # qemu's meson.build reads what its ./configure writes: the executor's gap.
+        outcome("e", "failed", "Failed to load /tmp/x/build-1/config-host.mak: [Errno 2] No "
+                "such file or directory", kind="meson-setup"),
     ])
     problems = dataset.plan_faults(result)
-    assert len(problems) == 3 and not any("'b'" in p for p in problems)
+    assert len(problems) == 3 and not any("'b'" in p or "'e'" in p for p in problems)
 
 
 # -- evaluation ------------------------------------------------------------------

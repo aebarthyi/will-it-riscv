@@ -553,3 +553,35 @@ def test_a_default_step_that_moves_an_option_off_its_default_is_sent_back(tmp_pa
     assert gpu.plan_check == []
     assert [f for f in dataset.plan_faults(result) if "DEMO" in f] == [
         f"step 'configure': {moved}"]
+
+
+def test_a_plan_that_never_configures_the_project_goes_back(tmp_path, target):
+    """qemu's plan of apt lines alone ran clean and answered yes: it looked
+    packages up and nothing more. A configure, a driver of the project's
+    own, or pip building its own pyproject.toml each build it."""
+    from will_it_riscv import dataset
+
+    (tmp_path / "meson.build").write_text("project('demo', 'c')\n")
+    apt = {"id": "apt", "kind": "system-packages", "packages": ["gcc"], "evidence": []}
+    result = run_plan(tmp_path, target, plan(apt), distro=FakeDistro({"gcc"}))
+    assert result.unconfigured == ["meson.build"]
+    assert dataset.plan_faults(result) == [
+        "the project has a meson.build at its root and no default step configures it: "
+        "package lists alone say nothing of whether it builds, so add the meson-setup "
+        "step its default build runs"]
+    assert planrun.to_dict(result)["unconfigured"] == ["meson.build"]
+
+    def unconfigured(*steps):
+        return planrun._unconfigured(parse_plan(plan(apt, *steps)), tmp_path)
+
+    gpu_only = {"id": "gpu", "kind": "meson-setup", "optional": True, "enabled_by": "--gpu",
+                "evidence": []}
+    assert unconfigured(gpu_only) == ["meson.build"]
+    assert unconfigured({"id": "setup", "kind": "meson-setup", "evidence": []}) == []
+    assert unconfigured({"id": "drive", "kind": "python-run", "script": "build.py",
+                         "evidence": []}) == []
+    assert unconfigured({"id": "pip", "kind": "python-install", "manifest": "pyproject.toml",
+                         "section": "build-system", "evidence": []}) == []
+    assert unconfigured({"id": "ci", "kind": "python-install",
+                         "manifest": "ci/requirements.txt", "evidence": []}) == ["meson.build"]
+    assert planrun._unconfigured(parse_plan(plan(apt)), tmp_path / "nothing") == []

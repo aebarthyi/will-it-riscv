@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import evidence, modelplan
-from .plan import Plan, load_plan, plan_to_dict
+from .plan import PYTHON_INSTALL, Plan, load_plan, plan_to_dict
 
 #: One in this many repositories is held out for evaluation, by name.
 TEST_EVERY = 10
@@ -315,9 +315,13 @@ def plan_faults(result) -> list[str]:
     problems = list(result.evidence_problems)
     for outcome in result.steps:
         detail = outcome.detail or ""
+        # A manifest that will not read is the plan's; a file the executor's
+        # own build directory lacks -- qemu's config-host.mak, which its
+        # ./configure writes before meson -- is not.
+        unread = (getattr(outcome.step, "kind", None) == PYTHON_INSTALL
+                  and re.match(r"^[^:]+: \[Errno", detail))
         if outcome.status == "failed" and (
-            detail.startswith("no ") or re.match(r"^[^:]+: \[Errno", detail)
-            or "not a" in detail
+            detail.startswith("no ") or unread or "not a" in detail
         ):
             problems.append(f"step {outcome.step.id!r} could not run: {detail}")
         for line in getattr(outcome, "plan_check", None) or []:
@@ -332,6 +336,12 @@ def plan_faults(result) -> list[str]:
                         "which is filled in by whoever runs the build, and the configure "
                         f"stopped on it: {detail}; leave the compiler to CMake"
                     )
+    for name in getattr(result, "unconfigured", []):
+        kind = "meson-setup" if name == "meson.build" else "cmake-configure"
+        problems.append(
+            f"the project has a {name} at its root and no default step configures it: "
+            "package lists alone say nothing of whether it builds, so add the "
+            f"{kind} step its default build runs")
     for step_id, name, near, distro in getattr(result, "unknown_names", []):
         problems.append(
             f"step {step_id!r}: {distro} has no package named {name!r} on any architecture"

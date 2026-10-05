@@ -207,3 +207,30 @@ def test_ubuntu_looks_for_a_name_in_the_main_archive_since_ports_has_no_amd64(tm
     assert index.named("openmpi") is False
     assert any("archive.ubuntu.com/ubuntu/dists/resolute/multiverse/binary-amd64" in u
                for u in seen)
+
+
+def test_a_job_asking_while_another_loads_the_contents_waits_for_them(tmp_path, monkeypatch):
+    """Six jobs found the contents cache expired: while one downloaded, the
+    others took None for "no index", and mosquitto's GTest went unchecked."""
+    import threading
+    import time
+
+    from will_it_riscv import contents
+
+    loads = []
+
+    def slow_load(cls, client, cache, spec, arch):
+        loads.append(arch)
+        time.sleep(0.2)
+        return "the index"
+
+    monkeypatch.setattr(contents.ContentsIndex, "load", classmethod(slow_load))
+    index = DistroIndex(httpx.Client(), Cache(root=tmp_path), KNOWN_DISTROS["debian:trixie"],
+                        "riscv64")
+    got = []
+    jobs = [threading.Thread(target=lambda: got.append(index.contents())) for _ in range(4)]
+    for job in jobs:
+        job.start()
+    for job in jobs:
+        job.join()
+    assert got == ["the index"] * 4 and loads == ["riscv64"]

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -64,7 +65,8 @@ class Cache:
         path = self._path(namespace, key)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".tmp")
+            # Each writer its own: jobs and processes put the same key at once.
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
             tmp.write_bytes(value)
             os.replace(tmp, path)
         except OSError:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import gzip
 import re
+import threading
 import time
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -149,6 +150,8 @@ class DistroIndex:
         self.error: Optional[str] = None
         self._contents = None
         self._contents_tried = False
+        # Jobs share one index: one loads it while the rest wait for it.
+        self._loading = threading.RLock()
 
     @property
     def available(self) -> bool:
@@ -157,14 +160,15 @@ class DistroIndex:
     def names(self) -> Optional[set[str]]:
         if self._names is not None:
             return self._names
-        if self.error is not None:
-            return None
-        cached = self.cache.get("distro", self._key, ttl=LONG_TTL)
-        if cached is not None:
-            self._names = set(cached.decode("utf-8").split("\n"))
+        with self._loading:
+            if self._names is not None or self.error is not None:
+                return self._names
+            cached = self.cache.get("distro", self._key, ttl=LONG_TTL)
+            if cached is not None:
+                self._names = set(cached.decode("utf-8").split("\n"))
+                return self._names
+            self._download()
             return self._names
-        self._download()
-        return self._names
 
     def version(self, package: str) -> Optional[str]:
         """The version the archive has, for a real package; None for a virtual one.
@@ -173,15 +177,20 @@ class DistroIndex:
         Debian 13's bazel-bootstrap is 4.2.3.
         """
         if self._versions is None:
-            cached = self.cache.get("distro", self._key + "/versions", ttl=LONG_TTL)
-            if cached is not None:
-                self._versions = dict(
-                    line.split("\t", 1)
-                    for line in cached.decode("utf-8").split("\n") if "\t" in line
-                )
-            elif self.error is None:
-                self._download()
+            with self._loading:
+                if self._versions is None:
+                    self._load_versions()
         return (self._versions or {}).get(package)
+
+    def _load_versions(self) -> None:
+        cached = self.cache.get("distro", self._key + "/versions", ttl=LONG_TTL)
+        if cached is not None:
+            self._versions = dict(
+                line.split("\t", 1)
+                for line in cached.decode("utf-8").split("\n") if "\t" in line
+            )
+        elif self.error is None:
+            self._download()
 
     @property
     def _key(self) -> str:
@@ -241,11 +250,16 @@ class DistroIndex:
 
     def contents(self):
         """Which package ships which file, for this distro and arch; None if unavailable."""
-        if not self._contents_tried:
-            from .contents import ContentsIndex
+        # Tried only once loaded: a job asking while another downloads it
+        # waits, rather than taking None for "no index" -- mosquitto's GTest
+        # and CUnit went unchecked when six jobs found the cache expired.
+        with self._loading:
+            if not self._contents_tried:
+                from .contents import ContentsIndex
 
-            self._contents_tried = True
-            self._contents = ContentsIndex.load(self.client, self.cache, self.spec, self.arch)
+                self._contents = ContentsIndex.load(
+                    self.client, self.cache, self.spec, self.arch)
+                self._contents_tried = True
         return self._contents
 
     def has(self, package: str) -> bool:

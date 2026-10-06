@@ -212,7 +212,10 @@ def available() -> bool:
 #: CMake prefixes its STATUS output with "-- ". A miss reported that way is a
 #: miss the configure shrugged off; the same words indented inside a CMake
 #: Error block are the miss that stopped it.
-_STATUS_MISS = re.compile(r"^-- +Could NOT find ([A-Za-z0-9_.+-]+)", re.MULTILINE)
+#: "-- [Octopus] Could NOT find GSL": CMAKE_MESSAGE_CONTEXT_SHOW puts the
+#: message context between the dashes and the message.
+_CONTEXT = r"(?:\[[^\]\n]*\] +)?"
+_STATUS_MISS = re.compile(rf"^-- +{_CONTEXT}Could NOT find ([A-Za-z0-9_.+-]+)", re.MULTILINE)
 #: FPHSA names the cache variables it wanted: "(missing: PROJ_LIBRARY ...)".
 _MISSING_VARS = re.compile(r"\(missing:\s*([^)]*?)\s*\)")
 #: A Find module reading a header that is not there names the exact path.
@@ -221,8 +224,9 @@ _MISSING_FILE = re.compile(
     # file(STRINGS) says it differently: FindBoost reading boost/version.hpp.
     r'|file\s+STRINGS\s+file\s+"([^"]+)"\s+cannot\s+be\s+read'
 )
-_STATUS_FOUND = re.compile(r"^-- +Found ([A-Za-z0-9_.+-]+)", re.MULTILINE)
-_STATUS_FOUND_AT = re.compile(r"^-- +Found ([A-Za-z0-9_.+-]+): +(\S+)", re.MULTILINE)
+_STATUS_FOUND = re.compile(rf"^-- +{_CONTEXT}Found ([A-Za-z0-9_.+-]+)", re.MULTILINE)
+_STATUS_FOUND_AT = re.compile(rf"^-- +{_CONTEXT}Found ([A-Za-z0-9_.+-]+): +(\S+)",
+                              re.MULTILINE)
 #: FPHSA's two ways of saying so; the second is its HANDLE_COMPONENTS failure.
 _ANY_MISS = re.compile(r"(?:Could NOT find|Failed to find all) ([A-Za-z0-9_.+-]+)")
 #: pkg_check_modules(... REQUIRED) lists what it could not find, one per line.
@@ -279,6 +283,9 @@ def _error_stanzas(text: str) -> list[str]:
     Synthesis must read only these. A "-- Could NOT find MySQL (missing:
     MYSQL_LIBRARY)" status line names variables too, and faking those would
     stub out the very optional dependencies the run exists to identify.
+    feature_summary(FATAL_ON_MISSING_REQUIRED_PACKAGES) names nothing in its
+    error: its stanza gets the packages it listed as REQUIRED and not found,
+    each as its status line said it.
     """
     stanzas: list[list[str]] = []
     current: Optional[list[str]] = None
@@ -290,7 +297,38 @@ def _error_stanzas(text: str) -> list[str]:
             current = None
         elif current is not None:
             current.append(line)
-    return ["\n".join(stanza) for stanza in stanzas]
+    out = ["\n".join(stanza) for stanza in stanzas]
+    for index, stanza in enumerate(out):
+        if _SUMMARY_FATAL in " ".join(stanza.split()):
+            said = {m.group(1): m.group(2).rstrip() for m in map(
+                _STATUS_MISS_LINE.match, text.splitlines()) if m}
+            out[index] = "\n".join([stanza, *(
+                f"  Could NOT find {name}{said.get(name, '')}" for name in _summary_missing(text))])
+    return out
+
+
+_SUMMARY_FATAL = "feature_summary() Error: REQUIRED package(s) are missing"
+
+
+def _summary_missing(text: str) -> list[str]:
+    """What feature_summary listed under "The following REQUIRED packages
+    have not been found": octopus's GSL and FFTW."""
+    names: list[str] = []
+    listing = False
+    for line in text.splitlines():
+        line = re.sub(r"^\[[^\]\n]*\] ?", "", line)    # "[Octopus] -- The following ..."
+        if line.startswith("-- The following "):
+            listing = line.startswith("-- The following REQUIRED packages have not been found")
+            continue
+        if not listing:
+            continue
+        item = re.match(r"^ ?\* ([A-Za-z0-9_.+-]+)", line)
+        if item:
+            if item.group(1) not in names:
+                names.append(item.group(1))
+        elif line.strip() and not line.startswith(" "):
+            listing = False
+    return names
 
 
 def _error_blocks(text: str) -> str:
@@ -962,10 +1000,25 @@ def run(
                 )
                 if note not in aggregate.notes:
                     aggregate.notes.append(note)
+            switched = False
+            if _WANTS_NINJA.search(" ".join((stanzas[0] if stanzas else "").split())) \
+                    and env.get("CMAKE_GENERATOR") != "Ninja" \
+                    and shutil.which("ninja", path=env.get("PATH")):
+                # octopus refuses any generator but Ninja with gfortran. The
+                # generator is the host's choice, as the policy minimum is.
+                env["CMAKE_GENERATOR"] = "Ninja"
+                for sub in (scratch_path / "_deps").glob("*-subbuild"):
+                    shutil.rmtree(sub, ignore_errors=True)    # they keep their generator
+                switched = True
+                if aggregate.round_blockers[-1] is None:
+                    aggregate.round_blockers[-1] = "generator"
+                note = "the project refuses any generator but Ninja; it was configured with Ninja"
+                if note not in aggregate.notes:
+                    aggregate.notes.append(note)
             fresh = {
                 k: v for k, v in fresh.items() if overrides.get(k) != v and k not in fixed
             }
-            if not fresh and not created and not imported:
+            if not fresh and not created and not imported and not switched:
                 # The configure died without naming anything this can fake.
                 # Blame by experiment: stub the likeliest suspect and see.
                 trial = _next_trial(
@@ -1062,7 +1115,7 @@ def _prune(aggregate: PseudoBuild, root: Path, scratch: Path, settings: dict, en
 #: How many suspects to try at one stuck point before giving up on it.
 MAX_SUSPECTS = 3
 
-_STATUS_MISS_LINE = re.compile(r"^-- +Could NOT find ([A-Za-z0-9_.+-]+)(.*)$")
+_STATUS_MISS_LINE = re.compile(rf"^-- +{_CONTEXT}Could NOT find ([A-Za-z0-9_.+-]+)(.*)$")
 
 
 @dataclass
@@ -2915,6 +2968,9 @@ def _component_variables(package: str, component: str) -> list[str]:
 #: The escape hatch CMake 4 names when a project asks for a CMake < 3.5.
 POLICY_MINIMUM = "CMAKE_POLICY_VERSION_MINIMUM"
 _OLD_POLICY = re.compile(r"Compatibility with CMake < 3\.5 has been removed")
+#: octopus: "GNU preprocessor and non-Ninja generator is not supported".
+_WANTS_NINJA = re.compile(r"non-Ninja generator|Ninja generator is required|requires? (?:the )?Ninja",
+                          re.IGNORECASE)
 
 
 def _policy_culprit(error: Optional[str]) -> str:

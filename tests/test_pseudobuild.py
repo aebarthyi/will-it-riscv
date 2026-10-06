@@ -1401,3 +1401,55 @@ def test_stubbed_numpy_headers_make_numpy_importable_too(tmp_path):
     version = subprocess.run([str(python.executable), "-c", "import numpy; print(numpy.__version__)"],
                              capture_output=True, text=True)
     assert version.stdout.strip() == "99.9.9"
+
+
+# -- feature_summary, message context, and the generator ------------------------
+
+OCTOPUS_SUMMARY = """\
+-- [Octopus] Could NOT find GSL (missing: GSL_INCLUDE_DIR GSL_LIBRARY) (found version "")
+-- [Octopus] Found Git: /usr/bin/git (found version "2.43.0")
+-- Could NOT find PSolver (missing: PSolver_DIR)
+[Octopus] -- The following OPTIONAL packages have not been found:
+[Octopus] 
+[Octopus]  * PSolver, Poisson solver library
+[Octopus] 
+[Octopus] -- The following REQUIRED packages have not been found:
+[Octopus] 
+[Octopus]  * GSL, The GNU Scientific Library (GSL) is a numerical library
+[Octopus]    Numerical library
+[Octopus]  * FFTW, FFTW is a C subroutine library
+[Octopus] 
+-- Configuring incomplete, errors occurred!
+CMake Error at /usr/share/cmake-3.31/Modules/FeatureSummary.cmake:464 (message):
+  feature_summary() Error: REQUIRED package(s) are missing, aborting CMake
+  run.
+Call Stack (most recent call first):
+  CMakeLists.txt:463 (feature_summary)
+"""
+
+
+def test_a_feature_summary_error_blames_the_required_packages_it_listed():
+    """octopus's error names nothing; its summary listed GSL and FFTW as
+    REQUIRED and missing, and PSolver as optional -- which stays optional."""
+    from will_it_riscv.pseudobuild import _error_stanzas, _summary_missing
+
+    assert _summary_missing(OCTOPUS_SUMMARY) == ["GSL", "FFTW"]
+    (stanza,) = _error_stanzas(OCTOPUS_SUMMARY)
+    assert "Could NOT find GSL (missing: GSL_INCLUDE_DIR GSL_LIBRARY)" in stanza
+    assert _stanza_blockers(stanza)[:2] == ["GSL", "FFTW"]
+    found, soft, blockers = _read_outcomes(OCTOPUS_SUMMARY)
+    assert "Git" in found and "PSolver" in soft and blockers[:2] == ["GSL", "FFTW"]
+
+
+@needs_cmake
+@pytest.mark.skipif(shutil.which("ninja") is None, reason="ninja is not installed")
+def test_a_project_that_refuses_any_generator_but_ninja_gets_ninja(tmp_path):
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\nproject(demo NONE)\n"
+        "if(NOT CMAKE_GENERATOR MATCHES Ninja)\n"
+        '  message(FATAL_ERROR "GNU preprocessor and non-Ninja generator is not supported")\n'
+        "endif()\n")
+    result = run(tmp_path, timeout=120)
+    assert result.completed, result.error
+    assert result.blockers == [] and result.experiments == []
+    assert any("Ninja" in note for note in result.notes)

@@ -95,7 +95,9 @@ BY_CONFIGURE = "configure"
 """A default configure that ran to the end demanded it."""
 BY_MANIFEST = "manifest"
 """The project's own manifest -- a pyproject.toml, a requirements file --
-declares it, and a default step installs from that."""
+declares it, and a default step installs from that. A requirements file of
+CI's own is a package list (``BY_LIST``): NEURON's ci/requirements.txt, and
+grass's under .github/."""
 BY_STOPPED = "stopped"
 """Only a default configure that stopped demanded it. Until a configure
 completes, an optional package a stub made present can look required:
@@ -105,6 +107,19 @@ BY_LIST = "listed"
 a CI script, which carry runtime libraries and tooling along with the build's
 needs."""
 PROVEN = (BY_CONFIGURE, BY_MANIFEST)
+
+#: Directories whose requirements files are CI's: what CI installs carries
+#: its test runners and tooling beside the build's needs.
+_CI_DIRS = {"ci", ".ci", ".github", ".gitlab", ".circleci", ".azure-pipelines", ".buildkite",
+            ".travis", ".ci_support", "continuous_integration"}
+
+
+def _ci_manifest(manifest: str) -> bool:
+    """Whether a requirements file is CI's: under a CI directory, or named
+    for it, as requirements-ci.txt."""
+    path = Path(manifest)
+    return (any(part.lower() in _CI_DIRS for part in path.parts[:-1])
+            or re.search(r"(?:^|[-_.])ci(?:[-_.]|$)", path.stem.lower()) is not None)
 _BASIS_RANK = {BY_CONFIGURE: 0, BY_MANIFEST: 1, BY_STOPPED: 2, BY_LIST: 3}
 
 
@@ -371,7 +386,8 @@ def _python_install(
     for report in analysis.packages.values():
         node = _node(result, f"pypi:{report.name}", "pypi", report.name)
         node.version = node.version or report.version
-        _need(node, step, BY_MANIFEST if step.manifest is not None else BY_LIST)
+        _need(node, step, BY_LIST if step.manifest is None or _ci_manifest(step.manifest)
+              else BY_MANIFEST)
         if step.id not in node.steps:
             node.steps.append(step.id)
         detail = report.reasons[0] if report.reasons else report.verdict.value

@@ -508,6 +508,24 @@ def test_a_requirement_says_how_it_is_known(tmp_path, target):
     assert planrun.to_dict(result)["nodes"][0]["basis"] is not None
 
 
+def test_a_requirements_file_of_cis_own_is_a_package_list(tmp_path, target):
+    """NEURON's ci/requirements.txt carries CI's tooling along with what the
+    build needs, as an apt line out of a CI script does: listed, not proven."""
+    files = {"ci/requirements.txt": "alpha", ".github/workflows/reqs.txt": "beta",
+             "requirements-ci.txt": "gamma", "requirements.txt": "delta"}
+    for name, package in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(package + "\n")
+    index = index_for(**{p: ([f"{p}-1.0-py3-none-any.whl"], []) for p in files.values()})
+    result = run_plan(tmp_path, target, plan(*[
+        {"id": f"s{i}", "kind": "python-install", "manifest": name, "evidence": []}
+        for i, name in enumerate(files)]), index=index)
+    assert {n.name: n.basis for n in result.nodes.values()} == {
+        "alpha": planrun.BY_LIST, "beta": planrun.BY_LIST, "gamma": planrun.BY_LIST,
+        "delta": planrun.BY_MANIFEST}
+    assert planrun._ci_manifest("tools/circleci_reqs.txt") is False
+
+
 @needs_cmake
 def test_what_only_a_configure_that_stopped_asked_for_is_not_proven(tmp_path, target):
     """Until a configure completes, an optional package a stub made present

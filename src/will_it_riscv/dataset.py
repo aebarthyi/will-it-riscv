@@ -267,7 +267,7 @@ class Environment:
     distro: Any
     target: Any
     pip_cache: Path
-    timeout: int = 600
+    timeout: int = 1200
 
 
 #: What labels were made and checked against; ``--distro`` elsewhere.
@@ -275,7 +275,7 @@ LABEL_DISTRO = "debian:trixie"
 
 
 def environment(
-    python: str = "3.12", arch: str = "riscv64", timeout: int = 600, distro: str = LABEL_DISTRO,
+    python: str = "3.12", arch: str = "riscv64", timeout: int = 1200, distro: str = LABEL_DISTRO,
 ) -> Environment:
     import httpx
 

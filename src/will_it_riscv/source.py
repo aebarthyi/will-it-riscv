@@ -469,7 +469,7 @@ def inspect_repository(
     scan_ci: bool = True,
     use_meson_introspect: bool = True,
     pseudobuild: bool = False,
-    pseudobuild_timeout: int = 600,
+    pseudobuild_timeout: int = 1200,
     pseudobuild_arch: str = "riscv64",
 ) -> RepositoryInspection:
     """Read a source tree and work out what building it needs from the system."""

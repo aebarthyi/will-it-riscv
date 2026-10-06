@@ -110,7 +110,7 @@ def recurse(
     cache_root: Path,
     max_depth: int = MAX_DEPTH,
     max_packages: int = MAX_PACKAGES,
-    timeout: int = 600,
+    timeout: int = 1200,
     pip_cache: Optional[Path] = None,
     progress: Optional[Callable[[str], None]] = None,
 ) -> Recursion:

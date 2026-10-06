@@ -166,7 +166,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="the most packages to fetch and configure (default: %(default)s)",
     )
     scope.add_argument(
-        "--pseudobuild-timeout", type=int, default=600, metavar="SECONDS",
+        "--pseudobuild-timeout", type=int, default=1200, metavar="SECONDS",
         help="time allowed for the whole unblock-and-rerun loop "
         "(default: %(default)s)",
     )

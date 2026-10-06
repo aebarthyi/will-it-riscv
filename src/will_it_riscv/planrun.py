@@ -244,7 +244,7 @@ def execute(
     index: PackageIndex,
     target: Target,
     distro: Optional[DistroIndex] = None,
-    timeout: int = 600,
+    timeout: int = 1200,
     progress: Optional[Callable[[str], None]] = None,
     pip_cache: Optional[Path] = None,
 ) -> PlanResult:

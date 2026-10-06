@@ -43,7 +43,11 @@ from typing import Optional
 
 from .hostpython import HostPython
 
-TIMEOUT_SECONDS = 600
+#: A configure gets past one missing dependency a round: obs-studio's needed
+#: 54 and poppler's 37. A round can take half a minute -- audacity's, with Qt6 --
+#: and audacity's 21 took about 700 s. The timeout bounds the rounds first.
+TIMEOUT_SECONDS = 1200
+MAX_ROUNDS = 80
 
 #: Commands whose execution means the project asked the system for something.
 FIND_COMMANDS = {
@@ -738,7 +742,7 @@ def run(
     root: Path,
     timeout: int = TIMEOUT_SECONDS,
     deny_pkg_config: bool = True,
-    max_rounds: int = 30,
+    max_rounds: int = MAX_ROUNDS,
     arch: str = "riscv64",
     confine: bool = True,
     defines: Optional[dict] = None,

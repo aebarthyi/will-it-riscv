@@ -194,6 +194,7 @@ def run(
             "PKG_CONFIG_PATH": str(sysroot / "lib" / "pkgconfig"),
         })
 
+        newer_tried = False
         for attempt in range(1, max_rounds + 1):
             left = timeout - (time.monotonic() - started)
             if left <= 0:
@@ -204,6 +205,18 @@ def run(
                 fixed, env, max(1, int(left)),
             )
             aggregate.rounds = attempt
+            too_old = _MESON_VERSION.search(outcome.error or "")
+            if too_old and not newer_tried:
+                # vlc's meson.build wants 1.10 and the pinned Meson is
+                # Debian 13's 1.7: a person would pip install a newer one.
+                newer_tried = True
+                newer = _newer_meson(too_old.group(2), interpreter)
+                if newer is not None:
+                    command = newer
+                    aggregate.notes.append(
+                        f"configured with a meson from PyPI: the project wants "
+                        f"{too_old.group(2)}, and the pinned one is {too_old.group(1)}")
+                    continue
             _absorb(aggregate, outcome, calls, attempt)
 
             if trial is not None:
@@ -285,6 +298,15 @@ def _meson_command(
     if interpreter.install("meson"):
         return [sys.executable, str(interpreter.scripts / "meson")], None
     return None, "meson is not installed, and no wheel of it would install"
+
+
+def _newer_meson(wanted: str, interpreter: HostPython) -> Optional[list[str]]:
+    """A meson from PyPI that meets the project's meson_version, or None."""
+    if not re.fullmatch(r"\s*(?:[<>=!]=?|~=)\s*[0-9][0-9.]*\s*", wanted):
+        return None
+    if interpreter.install("meson" + wanted.replace(" ", "")) is None:
+        return None
+    return [sys.executable, str(interpreter.scripts / "meson")]
 
 
 def _tool(interpreter: HostPython, dist: str) -> bool:

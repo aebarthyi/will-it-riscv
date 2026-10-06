@@ -182,3 +182,29 @@ def test_a_program_a_build_requirement_provides_is_installed_and_said_so(tmp_pat
     assert result.build_tools == ["wirtool"]
     graph = depgraph.build(result, "demo")
     assert graph.nodes["wirtool"].provided_by == depgraph.BUILD_REQUIREMENTS
+
+
+@needs_meson
+def test_a_project_wanting_a_newer_meson_gets_one_from_pypi(tmp_path, monkeypatch):
+    """vlc's meson.build wants Meson 1.10, and the pinned one is Debian 13's 1.7."""
+    from will_it_riscv import hostpython
+
+    installed = []
+
+    def install(spec, site, cache, wheels_only=False):
+        installed.append(spec)
+        script = site / "bin" / "meson"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text(   # this host's Meson, saying it is 99
+            "import sys\nfrom mesonbuild import coredata\n"
+            "coredata.version = coredata.stable_version = '99.0.0'\n"
+            "from mesonbuild import mesonmain\nsys.exit(mesonmain.main())\n")
+        return True
+
+    monkeypatch.setattr(hostpython, "_pip_install", install)
+    (tmp_path / "meson.build").write_text("project('demo', [], meson_version: '>= 99.0')\n")
+    result = run(tmp_path, timeout=120)
+    assert result.completed, result.error
+    assert installed == ["meson>=99.0"] and result.python_installed == ["meson>=99.0"]
+    assert result.notes == ["configured with a meson from PyPI: the project wants >= 99.0, "
+                            f"and the pinned one is {__import__('mesonbuild.coredata').coredata.version}"]

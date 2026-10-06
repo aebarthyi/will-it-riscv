@@ -98,6 +98,18 @@ def test_cache_variables_are_lookup_results_only(tmp_path):
         "FROB_LIBRARY", "FROB_DATA", "eckit_dlopen_ok", "Frob_DIR", "FROB_VERSION"}
 
 
+def test_an_install_location_the_error_asks_for_may_be_set(tmp_path):
+    """axom looks for Conduit only once CONDUIT_DIR is set, and says so."""
+    bench = _session(tmp_path)
+    bench.signature = ("CMake Error at cmake/AxomMacros.cmake:491 (message): Sina requires "
+                       "Conduit.  Set CONDUIT_DIR to location of a Conduit install.")
+    assert "-DCONDUIT_DIR" in bench.set_cache("CONDUIT_DIR", str(bench.sysroot))
+    text, refused = call(bench, "set_cache", {"name": "MFEM_DIR", "value": str(bench.sysroot)})
+    assert refused and "plan_fault" in text      # not asked for
+    text, refused = call(bench, "set_cache", {"name": "CONDUIT_DIR", "value": "/usr"})
+    assert refused and "on the host" in text
+
+
 def test_a_blocker_is_named_the_way_the_configure_asked_for_it(tmp_path):
     bench = _session(tmp_path)
     bench.write_file("include/netcdf_meta.h", "#define NC_VERSION_MAJOR 4\n")

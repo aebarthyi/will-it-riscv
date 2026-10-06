@@ -443,6 +443,7 @@ class Workbench:
             name in words["results"] or name in words["checks"] or "HAVE_" in name.upper()
             or pb._VAR_STEM.search(name) is not None or name.upper().endswith("_VERSION")
             or (name.endswith("_DIR") and name[:-4].lower() in packages)
+            or self._asked_for(name)
         )
         if not lookup:
             return ("it is neither what a find_* or check_* filled nor a package's _DIR; if "
@@ -454,6 +455,15 @@ class Workbench:
             ):
                 return f"{token} is on the host; a found path has to be in the sysroot"
         return None
+
+    def _asked_for(self, name: str) -> bool:
+        """Whether the error stopping the configure asks for this install
+        location by name: axom's "Sina requires Conduit.  Set CONDUIT_DIR to
+        location of a Conduit install." Pointing it at a stub in the sysroot
+        is what a person would do with a real install."""
+        return (name.upper().endswith(("_DIR", "_ROOT", "_PREFIX", "_PATH"))
+                and re.search(rf"\bset\s+{re.escape(name)}\b", self.signature or "", re.I)
+                is not None)
 
     def unset_cache(self, name: str) -> str:
         if self.ledger["cache"].pop(name, None) is None:
@@ -658,7 +668,8 @@ TOOLS = [
     {
         "name": "set_cache",
         "description": "Pass -D<name>=<value> on later configures: only for a lookup's result "
-                       "(FOO_LIBRARY, FOO_INCLUDE_DIR, Foo_DIR, a check's result variable). "
+                       "(FOO_LIBRARY, FOO_INCLUDE_DIR, Foo_DIR, a check's result variable), or an "
+                       "install location the error asks for by name (\"Set FOO_DIR to ...\"). "
                        "Refused for the plan's flags, build options, CMAKE_* and host paths.",
         "inputSchema": {"type": "object", "required": ["name", "value"], "properties": {
             "name": {"type": "string"}, "value": {"type": "string"},

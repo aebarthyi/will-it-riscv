@@ -1937,7 +1937,13 @@ def _stub_mpi(sysroot: Path, suffix: str) -> tuple[dict, list]:
     except OSError:
         return {}, []
     include = str(sysroot / "include")
-    overrides = {"MPI_SKIP_COMPILER_WRAPPER": "TRUE", "MPI_mpi_LIBRARY": str(library)}
+    overrides = {
+        "MPI_SKIP_COMPILER_WRAPPER": "TRUE", "MPI_mpi_LIBRARY": str(library),
+        # The compiler is no MPI wrapper. Told nothing, FindMPI takes WORKS
+        # to mean c++ has MPI built in, and leaves MPI_LIBRARIES empty:
+        # multiverso's MESSAGE(${MPI_LIBRARIES}) then has no arguments.
+        "MPI_ASSUME_NO_BUILTIN_MPI": "TRUE",
+    }
     for language in ("C", "CXX", "Fortran"):
         overrides[f"MPI_{language}_LIB_NAMES"] = "mpi"
         overrides[f"MPI_{language}_WORKS"] = "TRUE"

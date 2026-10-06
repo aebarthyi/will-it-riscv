@@ -1175,6 +1175,7 @@ def test_mpi_is_answered_the_way_findmpi_asks(tmp_path):
     assert overrides["MPI_Fortran_WORKS"] == "TRUE"
     assert overrides["MPI_C_VERSION"] == "3.1"  # or FindMPI reads its test binary
     assert overrides["MPI_SKIP_COMPILER_WRAPPER"] == "TRUE"
+    assert overrides["MPI_ASSUME_NO_BUILTIN_MPI"] == "TRUE"  # or MPI_LIBRARIES is empty
     assert "MPI_Fortran_FOUND" not in overrides
     assert {Path(p).name for p in created} >= {"mpi.h", "mpif.h"}
 

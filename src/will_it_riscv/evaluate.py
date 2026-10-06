@@ -15,7 +15,8 @@ verified one.
   required    with --execute: overlap of what its run and the reference's are
               shown to need -- by a configure that ran to the end, or the
               project's own manifest -- each dependency once; not scored where
-              the reference's run shows nothing (planrun.proven)
+              the reference's run shows nothing (planrun.proven), unless its
+              default configures all ran to the end: then nothing is the answer
   req_all     the same over everything required, the plan's own package lists
               included: which apt lines were copied as much as what is needed
   tokens      what the example cost in model tokens, in and out: the planner's,
@@ -471,7 +472,8 @@ def _example(directory: Path, planners: dict[str, Planner], env, baselines: bool
             else:
                 ran = dataset.summary(dataset.run_plan(candidate, root, env))
             result.verdict = ran["verdict"] == reference_run["verdict"]
-            result.required, result.required_all = required_overlap(ran, reference_run)
+            result.required, result.required_all = required_overlap(
+                ran, reference_run, shown=configured(reference, reference_run))
             result.plan_check = ran.get("plan_check", [])
             if "proven" not in reference_run:
                 progress(f"{directory.name}: its reference run predates proven requirements; "
@@ -489,14 +491,27 @@ def _example(directory: Path, planners: dict[str, Planner], env, baselines: bool
     return scores
 
 
-def required_overlap(ran: dict, reference: dict) -> tuple[Optional[float], float]:
+def required_overlap(
+    ran: dict, reference: dict, shown: bool = False,
+) -> tuple[Optional[float], float]:
     """``(proven, all)``: how far two runs agree on what the default build is
-    shown to need -- None where the reference's run shows nothing, or was
-    recorded before runs said -- and on everything they require."""
+    shown to need, and on everything they require. The first is None where
+    the reference's run was recorded before runs said, or shows nothing --
+    unless ``shown``: its configures ran to the end and needed nothing, as
+    amqp-cpp's do, and claiming something is then wrong."""
     everything = _overlap(set(ran["required"]), set(reference["required"]))
-    if not reference.get("proven"):
+    if "proven" not in reference or not (reference["proven"] or shown):
         return None, everything
     return _overlap(set(ran.get("proven", ())), set(reference["proven"])), everything
+
+
+def configured(plan: Plan, run: dict) -> bool:
+    """Whether a run configured the plan's default build to the end: it has
+    a default configure, and every one completed."""
+    status = {s["id"]: s["status"] for s in run.get("steps", ())}
+    configures = [s for s in plan.steps
+                  if not s.optional and s.kind in (CMAKE_CONFIGURE, MESON_SETUP)]
+    return bool(configures) and all(status.get(s.id) == "completed" for s in configures)
 
 
 def _overlap(a: set, b: set) -> float:

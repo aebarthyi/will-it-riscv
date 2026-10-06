@@ -749,3 +749,27 @@ def test_required_is_scored_on_what_the_runs_prove():
     assert evaluate.required_overlap({"required": [], "proven": []}, reference)[0] == 0.0
     assert evaluate.required_overlap(ran, {"required": ["debian:gcc"], "proven": []})[0] is None
     assert evaluate.required_overlap(ran, {"required": ["debian:gcc"]})[0] is None
+    # amqp-cpp's configure ran to the end and needed nothing: that is the answer.
+    nothing = {"required": ["debian:gcc"], "proven": []}
+    assert evaluate.required_overlap(ran, nothing, shown=True)[0] == 0.0
+    assert evaluate.required_overlap({"required": [], "proven": []}, nothing, shown=True)[0] == 1.0
+
+
+def test_a_reference_shows_nothing_needed_only_when_its_configures_completed():
+    from will_it_riscv.plan import parse_plan
+
+    reference = parse_plan({"repo": "r", "steps": [
+        {"id": "apt", "kind": "system-packages", "packages": ["gcc"], "evidence": []},
+        {"id": "cfg", "kind": "cmake-configure", "evidence": []},
+        {"id": "gpu", "kind": "cmake-configure", "optional": True, "enabled_by": "-DGPU=ON",
+         "evidence": []}]})
+
+    def run(cfg, gpu="stopped"):
+        return {"steps": [{"id": "apt", "status": "done"}, {"id": "cfg", "status": cfg},
+                          {"id": "gpu", "status": gpu}]}
+
+    assert evaluate.configured(reference, run("completed"))
+    assert not evaluate.configured(reference, run("stopped", "completed"))
+    apt_only = parse_plan({"repo": "r", "steps": [
+        {"id": "apt", "kind": "system-packages", "packages": ["gcc"], "evidence": []}]})
+    assert not evaluate.configured(apt_only, run("completed"))

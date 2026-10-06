@@ -81,11 +81,42 @@ if any(a in ("--version", "-version", "-v", "-V", "--showme:version") for a in s
 #: module named in WIR_STUB_MODULES. Written as it goes: MFC ends by sending
 #: itself SIGTERM, which no atexit handler survives.
 _BOOTSTRAP = r'''
-import atexit, importlib.abc, importlib.machinery, json, os, runpy, signal, sys
+import atexit, importlib.abc, importlib.machinery, json, os, re, runpy, signal, site, subprocess, sys
 
 LOG = os.environ["WIR_IMPORT_LOG"]
 STUBS = set(filter(None, os.environ.get("WIR_STUB_MODULES", "").split(",")))
 missing = []
+
+# -S skips site.main(), and with it the exit() and quit() builtins that
+# axom's config-build.py ends on.
+site.setquit()
+
+# A build tool called by its path is the shim too: axom's host-config names
+# /usr/bin/cmake, which the shims on PATH never see.
+SHIMS = os.environ.get("WIR_SHIMS", "")
+SHIMMED = set(os.listdir(SHIMS)) if SHIMS else set()
+LEAD = re.compile(r'^(\s*)("?)(/[^"\s]+)\2(?=\s|$)')
+
+
+def _shim(word):
+    if os.path.isabs(word) and os.path.basename(word) in SHIMMED:
+        return os.path.join(SHIMS, os.path.basename(word))
+    return word
+
+
+_popen_init = subprocess.Popen.__init__
+
+
+def _popen(self, args, *rest, **kwargs):
+    if isinstance(args, str) and kwargs.get("shell"):
+        args = LEAD.sub(lambda m: m.group(1) + m.group(2) + _shim(m.group(3)) + m.group(2),
+                        args, count=1)
+    elif isinstance(args, (list, tuple)) and args and isinstance(args[0], str):
+        args = [_shim(args[0]), *args[1:]]
+    _popen_init(self, args, *rest, **kwargs)
+
+
+subprocess.Popen.__init__ = _popen
 
 
 class _Anything:
@@ -240,6 +271,7 @@ def trace(
                 "PYTHONPATH": str(site),
                 "HOME": str(home),
                 "WIR_SHIM_LOG": str(shim_log),
+                "WIR_SHIMS": str(shims),
                 "WIR_IMPORT_LOG": str(import_log),
                 "WIR_STUB_MODULES": ",".join(sorted(stubs)),
                 "PYTHONDONTWRITEBYTECODE": "1",

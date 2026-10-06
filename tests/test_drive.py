@@ -83,6 +83,19 @@ def test_the_source_tree_is_left_alone(tmp_path, monkeypatch):
     assert sorted(p.relative_to(root).as_posix() for p in root.rglob("*")) == before
 
 
+
+def test_a_driver_may_call_exit_and_a_build_tool_by_its_path(tmp_path):
+    """axom's config-build.py ends on exit(), which python -S leaves out, and
+    its host-config names /usr/bin/cmake, past the shims on PATH."""
+    (tmp_path / "config-build.py").write_text(
+        "import subprocess\n"
+        "subprocess.run(['/usr/bin/cmake', '-S', 'src', '-B', 'b'], check=True)\n"
+        "subprocess.run('/opt/tools/bin/make -C b', shell=True, check=True)\n"
+        "exit(0)\n")
+    trace = drive.trace(tmp_path, "config-build.py", [], {}, timeout=120)
+    assert trace.returncode == 0, trace.tail
+    assert [tool for tool, _ in trace.commands] == ["cmake", "make"]
+
 def test_module_names_are_mapped_to_their_distributions():
     wanted = {"pyyaml": "6.0", "scikit-image": "0.2", "rich": "15"}
     assert drive.dist_for_module("yaml", wanted) == "pyyaml"

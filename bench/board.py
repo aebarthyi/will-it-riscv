@@ -6,7 +6,8 @@ Each argument is one eval's scores; a comma joins files of one eval, later
 ones replacing an example's earlier scores (a rerun of what failed). Every
 planner in them gets a row per kind (all, repo, pypi): accuracy -- verdict,
 required overlap (proven, and all of it), F1 -- and what it spent per example:
-thousands of tokens, dollars, unblocker sessions. Only examples every planner
+thousands of tokens (all, and fresh: less what was read back from a prompt
+cache, which an older eval did not record), dollars, unblocker sessions. Only examples every planner
 scored are counted, so the rows compare like with like; an unparsed plan
 counts as wrong. A measure no planner has for an example -- required, where
 the reference's run proves nothing -- leaves that example out of its mean.
@@ -22,7 +23,7 @@ import json
 import random
 from collections import defaultdict
 
-MEASURES = ("verdict", "required", "req_all", "f1", "tokens", "usd", "unblock_sessions")
+MEASURES = ("verdict", "required", "req_all", "f1", "tokens", "fresh", "usd", "unblock_sessions")
 
 
 def load(arguments: list[str]) -> dict:
@@ -39,15 +40,15 @@ def load(arguments: list[str]) -> dict:
 
 def scored(table: dict, keys: list[str], measure: str) -> list[str]:
     """The examples some planner has this measure for."""
-    if measure in ("tokens", "usd", "unblock_sessions", "f1"):
+    if measure in ("tokens", "fresh", "usd", "unblock_sessions", "f1"):
         return keys
     return [k for k in keys if any(scores[k].get(measure) is not None
                                    for scores in table.values())]
 
 
 def value(score: dict, measure: str) -> float:
-    if measure == "tokens":
-        return score.get("tokens", 0) / 1000
+    if measure in ("tokens", "fresh"):
+        return score.get(measure, score.get("tokens", 0)) / 1000
     got = score.get(measure)
     if got is None:
         return 0.0

@@ -21,6 +21,8 @@ verified one.
               included: which apt lines were copied as much as what is needed
   tokens      what the example cost in model tokens, in and out: the planner's,
               and with --unblock the unblocker agent's (in thousands, per repo)
+  fresh       the same less what was read back from a prompt cache: the tokens
+              a model had to take in for the first time, and write
   usd         the same in dollars, where the backend says
 
 Each score also keeps how long its planner and run took (``seconds``), which
@@ -89,16 +91,24 @@ class Score:
     planner_tokens_in: int = 0
     planner_tokens_out: int = 0
     planner_usd: Optional[float] = None
+    planner_tokens_cached: int = 0
     unblock_sessions: int = 0
     unblock_replays: int = 0
     unblock_tokens_in: int = 0
     unblock_tokens_out: int = 0
     unblock_usd: float = 0.0
+    unblock_tokens_cached: int = 0
 
     @property
     def tokens(self) -> int:
         return (self.planner_tokens_in + self.planner_tokens_out
                 + self.unblock_tokens_in + self.unblock_tokens_out)
+
+    @property
+    def fresh(self) -> int:
+        """Tokens less those read from a prompt cache: an agent that takes
+        many turns reads its context again on each, at a tenth of the price."""
+        return self.tokens - self.planner_tokens_cached - self.unblock_tokens_cached
 
     @property
     def usd(self) -> Optional[float]:
@@ -287,7 +297,7 @@ def model_planner(
 
         outcome = modelplan.plan_repository(
             root, backend, pack=pack, rounds=rounds, verify=verify)
-        meta["usage"] = (*outcome.tokens, outcome.cost_usd)
+        meta["usage"] = (*outcome.tokens, outcome.cost_usd, outcome.cached_tokens)
         if transcripts is not None:
             transcripts.mkdir(parents=True, exist_ok=True)
             (transcripts / f"{meta['key']}.json").write_text(json.dumps({
@@ -334,7 +344,8 @@ def agent_planner(agent, env) -> Planner:
         outcome = agent(root, pack, name, arch=env.target.arch, distro=env.distro.spec.id,
                         python=".".join(map(str, env.target.python_version)),
                         distro_label=env.distro.spec.label)
-        meta["usage"] = (outcome.tokens_in, outcome.tokens_out, outcome.cost)
+        meta["usage"] = (outcome.tokens_in, outcome.tokens_out, outcome.cost,
+                         outcome.tokens_cached)
         return outcome.plan
 
     return planner
@@ -479,13 +490,14 @@ def _example(directory: Path, planners: dict[str, Planner], env, baselines: bool
                 progress(f"{directory.name}: its reference run predates proven requirements; "
                          "required is not scored (will-it-riscv-dataset rerun)")
         if "usage" in context:
-            result.planner_tokens_in, result.planner_tokens_out, result.planner_usd = \
-                context["usage"]
+            (result.planner_tokens_in, result.planner_tokens_out, result.planner_usd,
+             result.planner_tokens_cached) = context["usage"]
         agent = unblock.spent()
         result.unblock_sessions, result.unblock_replays = agent["sessions"], agent["replays"]
         result.unblock_tokens_in = agent["tokens_in"]
         result.unblock_tokens_out = agent["tokens_out"]
         result.unblock_usd = agent["cost"]
+        result.unblock_tokens_cached = agent["tokens_cached"]
         result.seconds = round(time.monotonic() - began, 1)
         scores.append(result)
     return scores
@@ -551,6 +563,7 @@ def table(scores: list[Score]) -> list[dict]:
             "required": mean([s.required for s in mine]),
             "req_all": mean([s.required_all for s in mine]),
             "ktokens": mean([s.tokens / 1000 for s in mine]),
+            "kfresh": mean([s.fresh / 1000 for s in mine]),
             "usd": mean([s.usd for s in mine]),
             "sessions": mean([float(s.unblock_sessions) for s in mine]),
         })
@@ -573,6 +586,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="for --planner saved: --transcripts directories of earlier runs; "
                              "a later one's answer for a key wins")
     parser.add_argument("--planner-model")
+    parser.add_argument("--lean-pack", action="store_true",
+                        help="for agent: name what CI shows (workflows, Dockerfiles, the scripts "
+                             "they call) instead of showing it; it reads what it needs")
     parser.add_argument("--planner-url",
                         help="for openai: the server, or several of the same model, comma-separated")
     parser.add_argument("--planner-slots", type=int, default=1,
@@ -630,7 +646,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         from .agent import ClaudeAgent
 
         model = args.planner_model or "sonnet"
-        planners[f"agent:{model}"] = agent_planner(ClaudeAgent(model=model), env)
+        name = f"agent-lean:{model}" if args.lean_pack else f"agent:{model}"
+        planners[name] = agent_planner(ClaudeAgent(model=model, lean=args.lean_pack), env)
     elif args.planner == "saved":
         saved = [Path(d) for d in args.saved.split(",")]
         planners[f"saved:{saved[0].name}"] = saved_planner(saved)
@@ -647,14 +664,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     rows = table(scores)
     columns = ["planner", "kind", "repos", "parsed", "cited", "grounded", "precision", "recall", "f1",
-               "optional", "order", "verdict", "required", "req_all", "ktokens", "usd", "sessions"]
+               "optional", "order", "verdict", "required", "req_all", "ktokens", "kfresh", "usd",
+               "sessions"]
     print("  ".join(f"{c:>9}" for c in columns))
     for row in rows:
         print("  ".join(f"{'-' if row[c] is None else row[c]!s:>9}" for c in columns))
     if args.json:
         args.json.write_text(json.dumps(
             {"summary": rows, "scores": [
-                asdict(s) | {"f1": s.f1, "tokens": s.tokens, "usd": s.usd} for s in scores]},
+                asdict(s) | {"f1": s.f1, "tokens": s.tokens, "fresh": s.fresh, "usd": s.usd}
+                for s in scores]},
             indent=2,
         ))
     return 0

@@ -74,6 +74,20 @@ def test_what_does_not_fit_is_named(tmp_path):
     assert "NOT SHOWN, FOR LACK OF ROOM" in pack.render()
 
 
+def test_a_lean_pack_names_what_ci_shows_for_a_planner_that_reads(tmp_path):
+    write(tmp_path, REPO)
+    full = evidence.build(tmp_path, "demo")
+    pack = evidence.lean(full)
+    paths = [e.path for e in pack.excerpts]
+    assert ".github/workflows/ci.yml" not in paths and "CMakeLists.txt" in paths
+    assert (".github/workflows/ci.yml", "how CI builds it") in pack.named
+    text = pack.render()
+    assert "NOT SHOWN: READ THEM IF YOU NEED THEM\n  .github/workflows/ci.yml" in text
+    assert len(text) < len(full.render()) and "named" not in full.to_dict()
+    again = evidence.EvidencePack.from_dict(json.loads(json.dumps(pack.to_dict())))
+    assert again.render() == text
+
+
 # -- the wire format ----------------------------------------------------------
 
 
@@ -299,6 +313,15 @@ def test_claude_code_is_run_headless_with_its_tools_off(monkeypatch):
     assert command[command.index("--tools") + 1] == ""
     assert "--json-schema" in command and ran["input"] == "pack"
     assert json.loads(completion.text) == {"repo": "x"} and completion.cost_usd == 0.02
+
+
+def test_claude_code_caches_for_five_minutes_unless_told_otherwise(monkeypatch):
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.delenv("CLAUDE_CODE_PROMPT_CACHE_TTL", raising=False)
+    env = modelplan.claude_environment()
+    assert env["CLAUDE_CODE_PROMPT_CACHE_TTL"] == "5m" and "CLAUDECODE" not in env
+    monkeypatch.setenv("CLAUDE_CODE_PROMPT_CACHE_TTL", "1h")
+    assert modelplan.claude_environment()["CLAUDE_CODE_PROMPT_CACHE_TTL"] == "1h"
 
 
 # -- the dataset ---------------------------------------------------------------

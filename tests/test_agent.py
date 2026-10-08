@@ -78,6 +78,10 @@ def test_a_stuck_run_pauses_for_the_agent_and_goes_on_when_it_resumes(session):
     assert "answered by earlier fixes: frob" in again
     record = json.loads((session.directory / "agent.json").read_text())
     assert [r["replayed"] for r in record["runs"]] == [0, 1] and record["wire"] == WIRE
+    # A run with no fault of the plan's is the end: no finish call, no summary.
+    assert "you are done: reply done" in again and record["finish"] == {"note": "", "clean": True}
+    session.write_plan(WIRE)        # unless the agent writes another plan
+    assert json.loads((session.directory / "agent.json").read_text())["finish"] is None
 
 
 @needs_cmake
@@ -153,6 +157,7 @@ def test_the_agent_end_to_end_through_claude(tmp_path):
     assert outcome.error is None and outcome.finished
     assert [s.id for s in outcome.plan.steps] == ["configure"]
     assert (outcome.tokens_in, outcome.tokens_out, outcome.cost) == (1000, 50, 0.25)
+    assert outcome.tokens_cached == 900
     calls = [json.loads(line)["tool"]
              for line in (Path(outcome.log) / "calls.jsonl").read_text().splitlines()]
     assert calls == ["write_plan", "finish"]

@@ -12,7 +12,8 @@ as a loop the model drives, with tools:
 - where a configure stops and the executor's rules have nothing left to try,
   the run pauses, and the agent has the unblocker's workbench there
   (:mod:`unblock`). Its stubs go back as a trial the executor judges, as ever;
-- fix what the run shows is the plan's fault, run again, finish.
+- fix what the run shows is the plan's fault, and run again. A run that
+  shows no fault of the plan's ends the session: its plan is the answer.
 
 What it leaves is the plan, and its last run's graph. Every fix it made at a
 stuck point is kept for replay (:class:`unblock.Replays`), so running the
@@ -147,6 +148,7 @@ class Session:
             parsed, notes = modelplan.relocate(parsed, self.pack)
         self.plan, self.wire = parsed, plan
         self.record["plans"] += 1
+        self.record["finish"] = None
         self._save()
         problems = check_evidence(parsed, self.root)
         lines = [f"plan kept: {len(parsed.steps)} steps."]
@@ -261,7 +263,12 @@ class Session:
             lines += ["the plan's faults:"] + [f"- {f}" for f in faults]
             lines.append("Fix them with write_plan and run_plan again, or finish if you cannot.")
         else:
-            lines.append("No faults of the plan's. finish, unless you know the plan is wrong.")
+            # The end, unless the agent knows better: it has not, in 82
+            # sessions, and a finish call and a summary cost two more turns.
+            self.record["finish"] = {"note": "", "clean": True}
+            self._save()
+            lines.append("No faults of the plan's: it is your answer, recorded. Unless you know "
+                         "the plan is wrong, you are done: reply done.")
         return "\n".join(lines)
 
     def resume(self, outcome: str, reason: str, blocker: Optional[str] = None,
@@ -395,7 +402,11 @@ you have a workbench there (show_error, show_trace, show_lookups, show_sysroot, 
 set_cache, configure). Find what the configure looked for, stub it, and resume with the \
 outcome. The executor judges your stubs: they stay only if the error moved.
 4. If the run shows the plan at fault -- a flag the build insists on, a step that is not there \
--- fix it with write_plan and run_plan again. Otherwise finish.
+-- fix it with write_plan and run_plan again. A run with no fault of the plan's ends the \
+session: its plan is your answer. If faults remain that you cannot fix, finish.
+5. When you are done, reply with the one word done. No summary: nobody reads it.
+
+Send write_plan and run_plan in the same message.
 
 At a stuck point:
 - Write only inside the sysroot, and set only what a lookup or check fills. Never the source \
@@ -435,6 +446,7 @@ class Outcome:
     runs: list = field(default_factory=list)
     tokens_in: int = 0
     tokens_out: int = 0
+    tokens_cached: int = 0
     cost: Optional[float] = None
     log: Optional[str] = None
     error: Optional[str] = None
@@ -451,11 +463,15 @@ class ClaudeAgent:
     max_runs: int = MAX_RUNS
     log_dir: Optional[Path] = None
     command: str = "claude"
+    lean: bool = False
+    """Name what CI shows rather than show it (:func:`evidence.lean`)."""
 
     def __call__(self, root: Path, pack: evidence_pack.EvidencePack, name: str,
                  arch: str = "riscv64", distro: str = "debian:trixie", python: str = "3.12",
                  distro_label: Optional[str] = None) -> Outcome:
         root = Path(root)
+        if self.lean:
+            pack = evidence_pack.lean(pack)
         base = Path(self.log_dir or unblock.Replays().base()) / "agent"
         directory = base / f"{name}-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
         directory.mkdir(parents=True, exist_ok=True)
@@ -472,7 +488,7 @@ class ClaudeAgent:
                 p for p in (source, os.environ.get("PYTHONPATH", "")) if p)},
         }}}))
         text = (f"Project: {name}, at {root}\nTarget: {arch}, {distro_label or distro}\n\n"
-                + pack.render() + "\n\nWrite the plan, run it, and finish.")
+                + pack.render() + "\n\nWrite the plan and run it.")
         (directory / "prompt.txt").write_text(text)
         dirs = [str(root)] + ([str(unblock.cmake_modules())] if unblock.cmake_modules() else [])
         command = [
@@ -498,7 +514,8 @@ class ClaudeAgent:
             outcome.error = f"the agent ran past {self.timeout}s"
         except OSError as exc:
             outcome.error = f"could not run {self.command}: {exc}"
-        outcome.cost, outcome.tokens_in, outcome.tokens_out = unblock._usage(transcript)
+        outcome.cost, outcome.tokens_in, outcome.tokens_out, outcome.tokens_cached = \
+            unblock._usage(transcript)
         return _read(directory, root, pack, outcome)
 
 

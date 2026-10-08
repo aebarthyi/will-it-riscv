@@ -310,6 +310,9 @@ class Completion:
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: Optional[float] = None
+    cached_tokens: int = 0
+    """Of the input, what was read back from a prompt cache: a tenth of the
+    price on Claude, and next to nothing for a server that keeps its KV cache."""
 
 
 class Backend(Protocol):
@@ -355,6 +358,7 @@ class OpenAICompatible:
             text=body["choices"][0]["message"]["content"] or "",
             input_tokens=usage.get("prompt_tokens", 0),
             output_tokens=usage.get("completion_tokens", 0),
+            cached_tokens=(usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
         )
 
 
@@ -425,10 +429,15 @@ class Anthropic:
         if message.stop_reason == "max_tokens":
             raise RuntimeError(f"{self.model} ran out of room before the plan was finished")
         text = next((b.text for b in message.content if b.type == "text"), "")
+        usage = message.usage
+        cached = getattr(usage, "cache_read_input_tokens", 0) or 0
         return Completion(
             text=text,
-            input_tokens=message.usage.input_tokens,
-            output_tokens=message.usage.output_tokens,
+            # What it read from its cache, or wrote to it, is still what it read.
+            input_tokens=usage.input_tokens + cached
+            + (getattr(usage, "cache_creation_input_tokens", 0) or 0),
+            output_tokens=usage.output_tokens,
+            cached_tokens=cached,
         )
 
 
@@ -476,6 +485,7 @@ class ClaudeCLI:
             + usage.get("cache_read_input_tokens", 0),
             output_tokens=usage.get("output_tokens", 0),
             cost_usd=result.get("total_cost_usd"),
+            cached_tokens=usage.get("cache_read_input_tokens", 0),
         )
 
 
@@ -490,8 +500,16 @@ _PARENT_SESSION = {
 
 
 def claude_environment() -> dict:
-    """This process's environment, for a ``claude -p`` of its own."""
-    return {k: v for k, v in os.environ.items() if k not in _PARENT_SESSION}
+    """This process's environment, for a ``claude -p`` of its own.
+
+    Its prompt cache lives five minutes, not the hour a subscription gets by
+    default: an hour's cache writes cost twice the input price, five minutes'
+    1.25 times, and our sessions come back to the cache within a minute or
+    two -- a configure that runs longer is rare. Set
+    CLAUDE_CODE_PROMPT_CACHE_TTL to choose otherwise."""
+    env = {k: v for k, v in os.environ.items() if k not in _PARENT_SESSION}
+    env.setdefault("CLAUDE_CODE_PROMPT_CACHE_TTL", "5m")
+    return env
 
 
 def _as_one_prompt(messages: list[dict]) -> str:
@@ -559,6 +577,11 @@ class ModelPlan:
         """Input and output tokens, over every attempt."""
         done = [a.completion for a in self.attempts if a.completion]
         return sum(c.input_tokens for c in done), sum(c.output_tokens for c in done)
+
+    @property
+    def cached_tokens(self) -> int:
+        """Of the input tokens, those read from a prompt cache."""
+        return sum(a.completion.cached_tokens for a in self.attempts if a.completion)
 
     @property
     def cost_usd(self) -> Optional[float]:

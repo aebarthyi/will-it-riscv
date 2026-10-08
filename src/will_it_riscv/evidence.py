@@ -112,6 +112,8 @@ class EvidencePack:
     excerpts: list = field(default_factory=list)
     omitted: list = field(default_factory=list)
     """Files that would have been shown, had there been room."""
+    named: list = field(default_factory=list)
+    """Files left out for a planner that reads the tree itself (:func:`lean`)."""
 
     def excerpt(self, path: str) -> Optional[Excerpt]:
         return next((e for e in self.excerpts if e.path == path), None)
@@ -139,6 +141,9 @@ class EvidencePack:
         if self.omitted:
             out += ["", "NOT SHOWN, FOR LACK OF ROOM"]
             out += [f"  {path}  ({why})" for path, why in self.omitted]
+        if self.named:
+            out += ["", "NOT SHOWN: READ THEM IF YOU NEED THEM"]
+            out += [f"  {path}  ({why})" for path, why in self.named]
         return "\n".join(out) + "\n"
 
     def digest(self) -> str:
@@ -156,7 +161,7 @@ class EvidencePack:
                 for e in self.excerpts
             ],
             "omitted": [list(x) for x in self.omitted],
-        }
+        } | ({"named": [list(x) for x in self.named]} if self.named else {})
 
     @classmethod
     def from_dict(cls, data: dict) -> EvidencePack:
@@ -168,7 +173,26 @@ class EvidencePack:
                 for e in data.get("excerpts", [])
             ],
             omitted=[tuple(x) for x in data.get("omitted", [])],
+            named=[tuple(x) for x in data.get("named", [])],
         )
+
+
+#: What :func:`_ci` shows: the last in the pack, and the least cited.
+_CI = ("how CI builds it", "a container it builds in", "a script CI runs")
+
+
+def lean(pack: EvidencePack) -> EvidencePack:
+    """The pack for a planner that can read the tree itself: what CI shows --
+    its workflows, Dockerfiles and the scripts they call -- is named, not
+    shown. A third of a pack, on the dev set, written to a prompt cache on
+    the first turn and read back on every turn after."""
+    return EvidencePack(
+        repo=pack.repo, tree=list(pack.tree),
+        excerpts=[e for e in pack.excerpts if e.why not in _CI],
+        omitted=[o for o in pack.omitted if o[1] not in _CI],
+        named=[(e.path, e.why) for e in pack.excerpts if e.why in _CI]
+        + [o for o in pack.omitted if o[1] in _CI] + list(pack.named),
+    )
 
 
 def build(root: Path, name: Optional[str] = None, budget: int = BUDGET) -> EvidencePack:

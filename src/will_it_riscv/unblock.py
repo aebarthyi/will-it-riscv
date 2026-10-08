@@ -132,6 +132,8 @@ class Result:
     cost: Optional[float] = None
     tokens_in: int = 0
     tokens_out: int = 0
+    tokens_cached: int = 0
+    """Of tokens_in, those read from the prompt cache."""
     configures: int = 0
     memo: Optional[tuple] = None
     """Where it is remembered for replay, to forget it if it is rejected."""
@@ -151,6 +153,7 @@ class Result:
             "files": len(self.files) + len(self.restore), "confirmed": None,
             "configures": self.configures, "cost": self.cost, "log": self.log,
             "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
+            "tokens_cached": self.tokens_cached,
         }
 
 
@@ -1011,7 +1014,7 @@ class ClaudeUnblocker(Replays):
         result = bench.result()
         if failure and result.outcome == GAVE_UP:
             result.reason = failure
-        result.cost, result.tokens_in, result.tokens_out = _usage(transcript)
+        result.cost, result.tokens_in, result.tokens_out, result.tokens_cached = _usage(transcript)
         result.log = self._keep(session, stuck, result, time.monotonic() - started)
         return result
 
@@ -1127,13 +1130,15 @@ def spent() -> dict:
         "replays": sum(1 for r in SPENT if r.get("replayed")),
         "tokens_in": sum(r.get("tokens_in") or 0 for r in SPENT),
         "tokens_out": sum(r.get("tokens_out") or 0 for r in SPENT),
+        "tokens_cached": sum(r.get("tokens_cached") or 0 for r in SPENT),
         "cost": round(sum(r.get("cost") or 0 for r in SPENT), 4),
     }
 
 
-def _usage(transcript: Path) -> tuple[Optional[float], int, int]:
-    """Dollars and tokens in and out, from the final message ``claude -p``
-    streams. Read from its cache is still read."""
+def _usage(transcript: Path) -> tuple[Optional[float], int, int, int]:
+    """Dollars, tokens in and out, and how many of those in were read from
+    the prompt cache, from the final message ``claude -p`` streams. Read from
+    its cache is still read."""
     try:
         for line in reversed(transcript.read_text().splitlines()):
             message = json.loads(line)
@@ -1141,10 +1146,11 @@ def _usage(transcript: Path) -> tuple[Optional[float], int, int]:
                 usage = message.get("usage") or {}
                 read = sum(usage.get(k) or 0 for k in (
                     "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
-                return message.get("total_cost_usd"), read, usage.get("output_tokens") or 0
+                return (message.get("total_cost_usd"), read, usage.get("output_tokens") or 0,
+                        usage.get("cache_read_input_tokens") or 0)
     except (OSError, ValueError):
         pass
-    return None, 0, 0
+    return None, 0, 0, 0
 
 
 #: An unblocker set for this thread's configures (``using``), ahead of the

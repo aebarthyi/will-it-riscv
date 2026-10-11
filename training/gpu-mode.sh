@@ -8,7 +8,10 @@
 set -e
 MODE=${1:-train}; PERCENT=${PERCENT:-70}
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo $0 $*"; exit 1; }
+# Whichever of the two cards are on the bus: b5 went missing on 2026-10-08.
+shopt -s nullglob
 CARDS=(/sys/bus/pci/devices/0000:{67,b5}:00.0/hwmon/hwmon*)
+[ ${#CARDS[@]} -gt 0 ] || { echo "no GPU found"; exit 1; }
 case $MODE in
   train)
     systemctl stop gdm

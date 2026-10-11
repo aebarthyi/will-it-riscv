@@ -35,6 +35,8 @@ from typing import Callable, Optional
 
 from packaging.utils import canonicalize_name
 
+from . import buildenv
+
 MAX_ROUNDS = 8
 
 #: Build tools the driver may call, answered by a shim. None of them runs:
@@ -265,9 +267,9 @@ def trace(
             shim_log.write_text("")
             if import_log.exists():
                 import_log.unlink()
-            env = dict(os.environ)
+            env = buildenv.environment()
             env.update({
-                "PATH": f"{shims}{os.pathsep}{env.get('PATH', '')}",
+                "PATH": f"{shims}{os.pathsep}{env['PATH']}",
                 "PYTHONPATH": str(site),
                 "HOME": str(home),
                 "WIR_SHIM_LOG": str(shim_log),

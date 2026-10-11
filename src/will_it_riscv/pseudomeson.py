@@ -46,6 +46,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from . import buildenv
 from .drive import clone_tree, dist_for_module
 from .hostpython import HostPython
 from .pseudobuild import (
@@ -186,9 +187,9 @@ def run(
 
         cross = _cross_file(scratch_path, sysroot, arch, interpreter)
         native = _native_file(scratch_path, interpreter)
-        env = dict(os.environ)
+        env = buildenv.environment()
         env.update({
-            "PATH": os.pathsep.join([str(stubs), str(interpreter.scripts), env.get("PATH", "")]),
+            "PATH": os.pathsep.join([str(stubs), str(interpreter.scripts), env["PATH"]]),
             "PYTHONPATH": interpreter.path,
             "PKG_CONFIG_LIBDIR": str(sysroot / "lib" / "pkgconfig"),
             "PKG_CONFIG_PATH": str(sysroot / "lib" / "pkgconfig"),

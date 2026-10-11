@@ -1,6 +1,7 @@
 """Pseudobuilds: configure the project, watch what it asks for, throw it away."""
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -159,7 +160,7 @@ def test_missing_cmake_is_reported_not_raised(tmp_path, monkeypatch):
 
 def test_timeout_keeps_whatever_the_trace_already_held(tmp_path, monkeypatch):
     (tmp_path / "CMakeLists.txt").write_text("project(x)\n")
-    monkeypatch.setattr(pseudobuild.shutil, "which", lambda _: "/usr/bin/cmake")
+    monkeypatch.setattr(pseudobuild, "cmake", lambda: "/usr/bin/cmake")
 
     def timeout(*args, **kwargs):
         raise subprocess.TimeoutExpired(cmd="cmake", timeout=1)
@@ -174,6 +175,15 @@ def test_pkg_config_is_denied_so_optionality_is_demonstrated(tmp_path):
     env = pseudobuild._environment(tmp_path, deny_pkg_config=True)
     assert env["PKG_CONFIG_LIBDIR"].startswith(str(tmp_path))
     assert env["PKG_CONFIG_PATH"].startswith(str(tmp_path))
+
+
+def test_the_hosts_compiler_choice_does_not_reach_the_configure(tmp_path, monkeypatch):
+    monkeypatch.setenv("CXX", "/opt/vendor/bin/clang++")
+    monkeypatch.setenv("CMAKE_PREFIX_PATH", "/opt/vendor")
+    env = pseudobuild._environment(tmp_path, deny_pkg_config=True, sysroot=tmp_path / "sysroot")
+    assert "CXX" not in env and "CMAKE_PREFIX_PATH" not in env
+    assert env["CMAKE_BUILD_PARALLEL_LEVEL"] == "1"
+    assert env["PATH"].split(os.pathsep)[-1] == str(tmp_path / "sysroot" / "bin")
 
 
 # -- against a real cmake ---------------------------------------------------
@@ -715,11 +725,6 @@ def test_fortran_and_c_are_taken_to_agree_without_linking(tmp_path):
     )
     result = run(tmp_path, timeout=120)
     assert result.completed, result.error
-
-
-def test_shims_that_only_fail_are_not_on_the_configures_path():
-    path = "/home/u/.pyenv/shims:/usr/bin:/home/u/.asdf/shims/:/opt/bin"
-    assert pseudobuild._without_shims(path) == "/usr/bin:/opt/bin"
 
 
 def test_a_config_mode_dir_hint_leads_to_a_config_that_is_there(tmp_path):

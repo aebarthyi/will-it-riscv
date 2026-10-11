@@ -41,6 +41,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 
+from . import buildenv
 from .hostpython import HostPython
 
 #: A configure gets past one missing dependency a round: obs-studio's needed
@@ -3012,7 +3013,7 @@ def _host_gaps(narration: str) -> list[str]:
 def _environment(scratch: Path, deny_pkg_config: bool, sysroot: Optional[Path] = None) -> dict:
     import os
 
-    env = dict(os.environ)
+    env = buildenv.environment()
     if deny_pkg_config:
         # PKG_CONFIG_LIBDIR replaces the search path outright, so every query
         # misses -- until a blocker's stub .pc file is written there.
@@ -3022,21 +3023,11 @@ def _environment(scratch: Path, deny_pkg_config: bool, sysroot: Optional[Path] =
         env["PKG_CONFIG_LIBDIR"] = str(empty)
         env["PKG_CONFIG_PATH"] = str(empty)
     env["CMAKE_BUILD_PARALLEL_LEVEL"] = "1"
-    env["PATH"] = _without_shims(env.get("PATH", ""))
     if sysroot is not None:
         # Last, so a host program comes first: the stubs there are only what a
         # build asked for, and tvm runs its llvm-config by bare name.
         env["PATH"] += os.pathsep + str(sysroot / "bin")
     return env
-
-
-def _without_shims(path: str) -> str:
-    """PATH less pyenv's and asdf's shims: a shim is there for every program any
-    installed version has, and fails when the active one has none -- so a
-    configure finds a cython that says "pyenv: cython: command not found"
-    where it should have found nothing, and been given a stub."""
-    shim = re.compile(r"/\.(pyenv|asdf)/shims/?$")
-    return os.pathsep.join(d for d in path.split(os.pathsep) if d and not shim.search(d))
 
 
 def _first_error(stdout: str, stderr: str) -> str:

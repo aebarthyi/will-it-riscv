@@ -1364,6 +1364,9 @@ def test_a_command_a_stubbed_package_would_define_is_stubbed_too(tmp_path):
         "wirnano_add_module(demo_ext NB_STATIC ext.cpp)\n"
         "target_compile_definitions(demo_ext PRIVATE X=1)\n"
         "wirnano_add_stub(demo_ext_stub MODULE demo_ext)\n"
+        # audacity: qt_add_qml_module adds to the target the project made.
+        "add_library(demo_qml STATIC ext.cpp)\n"
+        "wirnano_add_qml_module(demo_qml URI Demo)\n"
     )
     result = run(tmp_path, timeout=120)
     assert result.completed, result.error

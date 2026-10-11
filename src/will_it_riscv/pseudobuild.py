@@ -1830,7 +1830,12 @@ _MAKES_TARGET = re.compile(r"(?:^|_)add_(?:\w+_)?(?:module|library|executable|ex
 _COMMAND_STUB = """\
 function({command} name)
   # stub emitted by will-it-riscv: {command}, which its package's CMake would define.
-  # It makes the target it names, from whichever of its arguments are files.
+  # It makes the target it names, from whichever of its arguments are files --
+  # unless the project made it first: qt_add_qml_module adds to a target it is
+  # handed (audacity's muse_ui_qml).
+  if(TARGET ${{name}})
+    return()
+  endif()
   set(_wir_sources)
   foreach(_wir_arg IN LISTS ARGN)
     if(EXISTS "${{CMAKE_CURRENT_SOURCE_DIR}}/${{_wir_arg}}" OR IS_ABSOLUTE "${{_wir_arg}}")

@@ -592,10 +592,29 @@ def test_the_command_line_runs_the_plan_a_model_wrote(tmp_path, monkeypatch):
     repo = write(tmp_path / "repo", REPO)
     monkeypatch.setattr(modelplan, "backend", lambda *a: Scripted(wire(quote="nope"), wire()))
     saved, report = tmp_path / "plan.json", tmp_path / "report.json"
-    cli.main([str(repo), "--plan-from-model", "--save-plan", str(saved), "--no-distro",
+    cli.main([str(repo), "--plan-from-model", "--planner", "claude-cli",
+              "--save-plan", str(saved), "--no-distro",
               "-f", "json", "-o", str(report), "--exit-zero"])
     assert load_plan(saved).step("configure").defines == {"WITH_FFTW": "ON"}
     steps = {s["id"]: s for s in json.loads(report.read_text())["steps"]}
+    assert steps["configure"]["status"] == "completed"
+
+
+def test_the_command_line_takes_the_repository_relative_to_where_it_is_run(tmp_path, monkeypatch):
+    """`will-it-riscv repo --plan-from-model`, not only an absolute path: the
+    configure runs from a scratch directory, where `repo` is not."""
+    from will_it_riscv import cli
+    from will_it_riscv.pseudobuild import available
+
+    if not available():
+        pytest.skip("cmake is not installed")
+    write(tmp_path / "repo", REPO)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(modelplan, "backend", lambda *a: Scripted(wire()))
+    cli.main(["repo", "--plan-from-model", "--planner", "claude-cli",
+              "--no-distro", "-f", "json", "-o", "report.json",
+              "--exit-zero"])
+    steps = {s["id"]: s for s in json.loads((tmp_path / "report.json").read_text())["steps"]}
     assert steps["configure"]["status"] == "completed"
 
 
@@ -616,7 +635,8 @@ def test_the_command_line_sends_back_what_running_the_plan_showed(tmp_path, monk
     execute = planrun.execute
     monkeypatch.setattr(planrun, "execute", lambda plan, *a, **k: runs.append(plan) or execute(plan, *a, **k))
     report = tmp_path / "report.json"
-    cli.main([str(repo), "--plan-from-model", "--no-distro", "-f", "json", "-o", str(report),
+    cli.main([str(repo), "--plan-from-model", "--planner", "claude-cli",
+              "--no-distro", "-f", "json", "-o", str(report),
               "--exit-zero"])
     assert "no CMakeLists.txt in src" in planner.asked[1][-1]["content"]
     assert [p.step("configure").source for p in runs] == ["src", "."]
@@ -630,28 +650,60 @@ def test_a_gguf_planner_is_served_for_the_run(tmp_path, monkeypatch):
 
     from rich.console import Console
 
-    from will_it_riscv import cli, serve
+    from will_it_riscv import cli, fetch, serve
 
     served = []
 
     @contextlib.contextmanager
-    def fake(model):
-        served.append(("up", model))
+    def fake(model, server=None):
+        served.append(("up", model, server))
         yield "http://127.0.0.1:9/v1"
-        served.append(("down", model))
+        served.append(("down", model, server))
 
     monkeypatch.setattr(serve, "llama_server", fake)
+    monkeypatch.setattr(fetch, "llama_server", lambda console=None: "/opt/llama-server")
+    monkeypatch.setattr(fetch, "planner", lambda console=None: Path("/data/planner-4b.gguf"))
     args = argparse.Namespace(planner=None, planner_model="/m/planner-318.gguf", planner_url=None)
     with contextlib.ExitStack() as stack:
         planner = cli._planner(args, Console(quiet=True), stack)
         assert isinstance(planner, modelplan.OpenAICompatible)
         assert (planner.url, planner.model) == ("http://127.0.0.1:9/v1", "planner-318")
-        assert served == [("up", Path("/m/planner-318.gguf"))]
-    assert served[-1] == ("down", Path("/m/planner-318.gguf"))
-    with pytest.raises(SystemExit, match="needs --planner-model"):
-        cli._planner(argparse.Namespace(planner="llama-server", planner_model=None,
-                                        planner_url=None), Console(quiet=True),
-                     contextlib.ExitStack())
+        assert served == [("up", Path("/m/planner-318.gguf"), "/opt/llama-server")]
+    assert served[-1][0] == "down"
+    # Nothing named: the fine-tuned planner, fetched.
+    for named in (None, "local", "llama-server"):
+        with contextlib.ExitStack() as stack:
+            planner = cli._planner(argparse.Namespace(planner=named, planner_model=None,
+                                                      planner_url=None),
+                                   Console(quiet=True), stack)
+        assert planner.model == "planner-4b" and served[-1][1] == Path("/data/planner-4b.gguf")
+
+
+def test_claude_is_claude_code_where_it_is_installed_and_the_api_where_not(monkeypatch):
+    import argparse
+    import contextlib
+    import shutil
+
+    from rich.console import Console
+
+    from will_it_riscv import cli
+
+    asked = []
+    monkeypatch.setattr(modelplan, "backend", lambda kind, model, url: asked.append(
+        (kind, model, url)) or kind)
+
+    def plan(planner=None, model=None, url=None):
+        return cli._planner(argparse.Namespace(planner=planner, planner_model=model,
+                                               planner_url=url),
+                            Console(quiet=True), contextlib.ExitStack())
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/claude")
+    assert plan("claude") == "claude-cli"
+    assert plan(model="sonnet") == "claude-cli"   # a Claude model, as it always meant
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    assert plan("claude", "opus") == "anthropic"
+    assert plan(model="m", url="http://h:8000/v1") == "openai"
+    assert asked[-1] == ("openai", "m", "http://h:8000/v1")
 
 
 FAKE_LLAMA_SERVER = '''

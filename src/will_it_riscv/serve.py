@@ -6,7 +6,8 @@ waits until the model is loaded, and stops the server when the block ends --
 so ``--planner llama-server --planner-model planner.gguf`` needs nothing
 running beforehand.
 
-The server is found as ``$LLAMA_SERVER``, else ``llama-server`` on the PATH.
+The server is found as ``$LLAMA_SERVER``, else ``llama-server`` on the PATH,
+else it is given (``fetch.llama_server`` downloads llama.cpp's own build).
 It runs with what the planner was evaluated with: a 40k context (the pack,
 then up to three answers and what was sent back about them), every layer on
 the GPU, flash attention, one slot, the model's own chat template.
@@ -33,14 +34,19 @@ CONTEXT = 40960
 ARGS = ("-ngl", "99", "-fa", "on", "-np", "1", "--jinja")
 
 
+def found() -> Optional[str]:
+    """A llama-server of your own: ``$LLAMA_SERVER``, else one on the PATH."""
+    return os.environ.get("LLAMA_SERVER") or shutil.which("llama-server")
+
+
 def binary() -> str:
-    found = os.environ.get("LLAMA_SERVER") or shutil.which("llama-server")
-    if not found:
+    server = found()
+    if not server:
         raise RuntimeError(
             "no llama-server: build llama.cpp, then put llama-server on the PATH "
             "or set LLAMA_SERVER to it"
         )
-    return found
+    return server
 
 
 def _free_port() -> int:
@@ -58,8 +64,9 @@ def command(model: Path, port: int, server: Optional[str] = None) -> list[str]:
 
 
 @contextlib.contextmanager
-def llama_server(model: Path, ready_timeout: float = 600.0) -> Iterator[str]:
-    """Serve ``model``; yields the OpenAI-compatible base URL."""
+def llama_server(model: Path, ready_timeout: float = 600.0,
+                 server: Optional[str] = None) -> Iterator[str]:
+    """Serve ``model`` (with ``server``, else ``binary()``); yields the base URL."""
     import httpx
 
     model = Path(model)
@@ -68,7 +75,7 @@ def llama_server(model: Path, ready_timeout: float = 600.0) -> Iterator[str]:
     port = _free_port()
     with tempfile.TemporaryFile("w+") as log:
         process = subprocess.Popen(
-            command(model, port), stdin=subprocess.DEVNULL, stdout=log,
+            command(model, port, server), stdin=subprocess.DEVNULL, stdout=log,
             stderr=subprocess.STDOUT,
         )
         try:

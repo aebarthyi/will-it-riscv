@@ -79,7 +79,7 @@ KNOWN_DISTROS = {
     ),
 }
 
-DEFAULT_DISTRO = "debian:trixie"
+DEFAULT_DISTRO = "ubuntu:resolute"
 
 #: What a bare family name resolves to: the current stable for Debian, the
 #: newest LTS for Ubuntu. Spelled out rather than left to dict order, so

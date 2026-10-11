@@ -31,6 +31,34 @@ The output is the list you need to hand to whoever is provisioning the board: wh
 to `apt install`, what has no distro package and must be built by hand, and what
 the distro already ships so you can skip the build entirely.
 
+## Quick start
+
+```console
+$ pip install git+https://github.com/aebarthyi/will-it-riscv
+$ will-it-riscv doctor              # what this machine has for it, and lacks
+$ will-it-riscv plan ~/src/nlopt    # write the build plan, run it, answer
+```
+
+`plan` has a fine-tuned 4B model write the repository's build plan:
+everything its build runs, in order. It runs every configure in that plan as
+a linux/riscv64 build confined to an empty sysroot, and sends what the run
+shows the plan got wrong back to the model. Then it answers: will it build on
+riscv64, and what does it need from Ubuntu 26.04's archive?
+
+On 40 held-out repositories, the planner's verdicts agreed with the
+references' on 37 (Claude Sonnet's, in the same loop: 36). It named 94% of
+what those builds require (Sonnet: 94%). The same held-out split also chose
+this checkpoint, so these numbers are optimistic; a fresh holdout is next.
+
+The first run fetches the planner (4.3 GB) and llama.cpp's prebuilt server,
+once, into `~/.local/share/will-it-riscv`. The model runs on this machine:
+with a GPU (Vulkan, so AMD, NVIDIA or Intel) a plan takes well under a
+minute; on the CPU alone, about two minutes and 11 GB of memory.
+
+It needs Linux, and a C and C++ compiler (`sudo apt install build-essential`).
+`--planner claude` uses Claude instead, through Claude Code or the API. **It
+runs the project's configure steps**: only point it at a repository you trust.
+
 ## Why
 
 Wheel availability for riscv64 is real but thin. [manylinux gained
@@ -394,22 +422,27 @@ constrains every backend:
 
 | `--planner` | what writes the plan |
 | --- | --- |
-| `claude-cli` | Claude Code's `claude -p`, tools off, with `--json-schema` (the default, and no API key needed) |
-| `anthropic` | the Claude API with structured outputs (`pip install 'will-it-riscv[teacher]'`, `ANTHROPIC_API_KEY`) |
-| `openai` | any OpenAI-compatible server, such as vLLM, llama.cpp or Ollama, with the schema as `response_format`: what a fine-tuned small model is served by (`--planner-url`, `--planner-model`) |
-| `llama-server` | a GGUF file (`--planner-model planner.gguf`; the default when the name ends in `.gguf`): llama.cpp's server is started on it for the run and stopped afterwards |
+| `local` | the fine-tuned planner, run by llama.cpp on this machine (**the default**; both fetched the first time). `--model planner.gguf` runs another GGUF instead |
+| `claude` | Claude Code's `claude -p` when it is installed (tools off, `--json-schema`, no API key needed), else the Claude API (the `teacher` extra, `ANTHROPIC_API_KEY`). `--model sonnet` or `opus` |
+| `openai` | any OpenAI-compatible server, such as vLLM, llama.cpp or Ollama, with the schema as `response_format` (`--planner-url`, `--model`) |
 
-The fine-tuned planner is one GGUF file, which `training/export.py` writes
-from a trained adapter:
+`claude-cli`, `anthropic` and `llama-server` name one backend exactly.
 
-```console
-$ will-it-riscv ~/src/MFC --plan-from-model --planner-model qwen3-4b-h200-checkpoint-318-q8_0.gguf
-```
+The fine-tuned planner is one GGUF file: Qwen3-4B-Instruct-2507, tuned on
+the teacher's verified plans, which `training/export.py` writes from the
+adapter. It is published as
+Lagutenko-4B, [`aebarthyi/lagutenko-4B`](https://huggingface.co/aebarthyi/lagutenko-4B).
+The first `plan` downloads it into the data directory
+(`$WILL_IT_RISCV_DATA`, else `~/.local/share/will-it-riscv`), picking up
+where it stopped if it is interrupted, and checks it against its SHA-256.
 
-The tool looks for the server in `$LLAMA_SERVER`, then for `llama-server`
-on the PATH. It starts it with the settings the planner was evaluated
-with: a 40k context, every layer on the GPU, flash attention, one slot and
-the model's chat template. `$LLAMA_SERVER_ARGS` is added at the end, so
+The server is llama.cpp's own prebuilt release, pinned, fetched the same
+way: the Vulkan build where there is a Vulkan loader (it uses the GPU when
+it finds one, and the CPU when not), the CPU build where there is none. A
+server of your own wins: `$LLAMA_SERVER`, then `llama-server` on the PATH.
+It is started with the settings the planner was evaluated with: a 40k
+context, every layer on the GPU, flash attention, one slot and the model's
+chat template. `$LLAMA_SERVER_ARGS` is added at the end, so
 `LLAMA_SERVER_ARGS='-ngl 0'` runs on the CPU only.
 
 **A dataset of verified plans.** `will-it-riscv-dataset` labels a corpus
@@ -571,6 +604,14 @@ isolation would have given them:
   are dropped from the configure's PATH: a shim exists for every program
   any installed Python has, and fails when the active one has none, so a
   configure would find a `cython` that only says "command not found".
+- **What steers the host's own builds stays with the host.** A
+  configure's PATH holds only the system's directories and this Python's.
+  With `/opt/rocm/bin` on it, PyTorch's configure said "ROCm enabled"; a
+  vendor's `clang++` ahead of `/usr/bin` stopped saltfm. `CC`, `CXX`,
+  `CFLAGS`, `CPATH`, `LIBRARY_PATH`, `CMAKE_PREFIX_PATH` and the like are
+  left out as well. If the system has no compiler at all, as on an HPC
+  login node with a compiler module loaded, that compiler's directory is
+  kept.
 - **What needs a linker is answered for the target.** FortranCInterface
   links a program of C and Fortran to prove the two compilers agree, and
   nothing links here. On the target gcc and gfortran do agree, so the
@@ -780,14 +821,29 @@ are not evaluated — an install anywhere in them counts.
 
 ## Install
 
+It is not on PyPI yet; install it from the repository:
+
 ```console
-$ pip install will-it-riscv
+$ pip install git+https://github.com/aebarthyi/will-it-riscv
+$ pip install 'will-it-riscv[teacher] @ git+https://github.com/aebarthyi/will-it-riscv'   # with the Claude API
 ```
 
 ## Use
 
 ```console
-# the project in the current directory
+# have the planner write the build plan, run it, and answer (see Quick start)
+$ will-it-riscv plan ~/src/MFC
+
+# the same, drawn, against Debian 13, with the plan kept
+$ will-it-riscv plan ~/src/MFC --distro debian:trixie --save-plan mfc.json -f dot | dot -Tsvg > mfc.svg
+
+# with Claude writing the plan
+$ will-it-riscv plan ~/src/MFC --planner claude
+
+# what this machine has for `plan`, and lacks
+$ will-it-riscv doctor
+
+# the project in the current directory, read rather than configured
 $ will-it-riscv
 
 # a specific file, with extras
@@ -817,7 +873,7 @@ $ will-it-riscv ~/src/MFC --plan examples/plans/mfc.json -f dot | dot -Tsvg > mf
 # then fetch and configure whatever it needs from source, all the way down
 $ will-it-riscv ~/src/MFC --plan examples/plans/mfc.json --recurse
 
-# have a model write the plan instead, then run it
+# have a model write the plan instead, then run it (what `plan` does)
 $ will-it-riscv ~/src/MFC --plan-from-model --save-plan mfc.json
 
 # just the names of everything that is not pure Python
@@ -853,13 +909,13 @@ aarch64                        nothing here is riscv-specific
 
 | identifier | |
 | --- | --- |
-| `debian:trixie` | Debian 13 — riscv64 is an official release architecture as of 13 (**default**) |
+| `debian:trixie` | Debian 13 — riscv64 is an official release architecture as of 13 |
 | `debian:sid` | Debian unstable |
 | `debian:forky` | Debian 14 |
 | `ubuntu:noble` | Ubuntu 24.04 LTS |
 | `ubuntu:plucky` | Ubuntu 25.04 |
 | `ubuntu:questing` | Ubuntu 25.10 |
-| `ubuntu:resolute` | Ubuntu 26.04 LTS |
+| `ubuntu:resolute` | Ubuntu 26.04 LTS (**default**) |
 
 A bare family name resolves to the current Debian stable (`debian` →
 `debian:trixie`) or the newest Ubuntu LTS (`ubuntu` → `ubuntu:resolute`).
@@ -919,6 +975,10 @@ those are. Do not paste them into a provisioning script unchecked.
 Index pages, wheel metadata, source distributions and distro package lists are
 cached under your platform cache directory (override with `WILL_IT_RISCV_CACHE`).
 `will-it-riscv --clear-cache` empties it.
+
+The planner and llama.cpp's server are not cache: they go in the data
+directory (`$WILL_IT_RISCV_DATA`, else `~/.local/share/will-it-riscv`), and
+`--clear-cache` leaves them alone. Delete that directory to remove them.
 
 ## License
 

@@ -24,7 +24,7 @@ from .report import render_dot, render_json, render_list, render_markdown, rende
 from .source import RepositoryInspection, inspect_repository
 from .target import Target
 
-USER_AGENT = f"will-it-riscv/{__version__} (+https://github.com/tactcomplabs/will-it-riscv)"
+USER_AGENT = f"will-it-riscv/{__version__} (+https://github.com/aebarthyi/will-it-riscv)"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,6 +40,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
+            "commands:\n"
+            "  will-it-riscv plan [PATH]   have the planner write the build plan, run it,\n"
+            "                              and report what the build needs (see plan -h)\n"
+            "  will-it-riscv doctor        what this machine has for that, and lacks\n\n"
             "exit codes:\n"
             "  0  everything installs from wheels or is pure Python\n"
             "  1  some packages must be built from source\n"
@@ -126,26 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
         "and what the run shows the plan got wrong, and report the last run as --plan "
         "would. RUNS THE CONFIGURE STEPS THE MODEL LISTS.",
     )
-    scope.add_argument(
-        "--planner", choices=("claude-cli", "anthropic", "openai", "llama-server"),
-        default=None,
-        help="what writes the plan: claude-cli (Claude Code's `claude -p`; the default "
-        "when it is installed), anthropic (the Claude API; needs ANTHROPIC_API_KEY and "
-        "the teacher extra), openai (any OpenAI-compatible server -- vLLM, llama.cpp, "
-        "Ollama -- serving a small model), or llama-server (start llama.cpp's server on "
-        "the --planner-model GGUF for this run; the default when that ends in .gguf)",
-    )
-    scope.add_argument(
-        "--planner-model", metavar="NAME",
-        help="the model the planner runs; for llama-server, the .gguf file",
-    )
-    scope.add_argument(
-        "--planner-url", metavar="URL",
-        help="an OpenAI-compatible endpoint, e.g. http://localhost:8000/v1",
-    )
-    scope.add_argument(
-        "--save-plan", metavar="PLAN.json", help="write the model's plan here as well",
-    )
+    _planner_arguments(scope)
     scope.add_argument(
         "--show-pack", action="store_true",
         help="print the evidence pack a planner would be shown, and exit",
@@ -223,6 +208,106 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
+
+#: What --planner takes. local and claude are the two to choose between; the
+#: rest name one backend exactly.
+PLANNERS = ("local", "claude", "openai", "claude-cli", "anthropic", "llama-server")
+
+
+def _planner_arguments(group) -> None:
+    group.add_argument(
+        "--planner", choices=PLANNERS, default=None,
+        help="what writes the plan: local (the default: the fine-tuned planner, run by "
+        "llama.cpp on this machine -- both are fetched the first time, 4.3 GB), claude "
+        "(Claude Code's `claude -p` when it is installed, else the Claude API, which needs "
+        "ANTHROPIC_API_KEY and the teacher extra), or openai (any OpenAI-compatible "
+        "server -- vLLM, llama.cpp, Ollama -- at --planner-url). claude-cli, anthropic "
+        "and llama-server name one of those exactly",
+    )
+    group.add_argument(
+        "--planner-model", "--model", metavar="NAME",
+        help="the model the planner runs: for local, a .gguf file in place of the "
+        "fine-tuned planner; for claude, sonnet or opus; for openai, the served model",
+    )
+    group.add_argument(
+        "--planner-url", metavar="URL",
+        help="an OpenAI-compatible endpoint, e.g. http://localhost:8000/v1 "
+        "(--planner openai, unless another is named)",
+    )
+    group.add_argument(
+        "--save-plan", metavar="PLAN.json", help="write the model's plan here as well",
+    )
+
+
+def build_plan_parser() -> argparse.ArgumentParser:
+    """``will-it-riscv plan``: --plan-from-model, with only what it takes."""
+    parser = argparse.ArgumentParser(
+        prog="will-it-riscv plan",
+        description=(
+            "Have a model write the repository's build plan -- everything its build\n"
+            "runs, in order -- from its install docs, scripts, manifests, build files\n"
+            "and CI. Every configure the plan lists is run as a linux build for the\n"
+            "target, confined to an empty sysroot; what the run shows the plan got\n"
+            "wrong goes back to the model; and the report says what the build needs,\n"
+            "checked against the target distro's archive.\n\n"
+            "RUNS THE PROJECT'S CONFIGURE STEPS: only do this for a repository you trust."
+        ),
+        epilog=(
+            "The first run fetches the planner (4.3 GB) and llama.cpp's server;\n"
+            "`will-it-riscv doctor` says what this machine has and lacks.\n\n"
+            "exit codes:\n"
+            "  0  yes: it builds from what the target distro has\n"
+            "  1  probably, or yes once something is built from source first\n"
+            "  2  no, or unknown: a step could not be got past\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "path", nargs="?", default=".",
+        help="the repository (default: the current directory)",
+    )
+    parser.add_argument(
+        "-t", "--target", default="riscv64", metavar="ARCH",
+        help="target architecture: riscv64 (default), aarch64, x86_64 ...",
+    )
+    parser.add_argument(
+        "--distro", default=DEFAULT_DISTRO, metavar="ID",
+        help="the archive to check packages against: "
+        + ", ".join(sorted(KNOWN_DISTROS)) + " (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--python", metavar="X.Y", default=None,
+        help="target Python version (default: whatever this interpreter is)",
+    )
+    _planner_arguments(parser)
+    parser.add_argument(
+        "--recurse", action="store_true",
+        help="also fetch, plan and configure everything the build requires that has no "
+        "binary for the target, and so on down",
+    )
+    parser.add_argument(
+        "--pseudobuild-timeout", type=int, default=1200, metavar="SECONDS",
+        help="time allowed for each configure's unblock-and-rerun loop "
+        "(default: %(default)s)",
+    )
+    parser.add_argument(
+        "-f", "--format", choices=("text", "json", "dot"), default="text",
+        help="'dot' draws the dependency graph for Graphviz (dot -Tsvg)",
+    )
+    parser.add_argument("-o", "--output", metavar="FILE", help="write the report here")
+    parser.add_argument("-q", "--quiet", action="store_true", help="no progress output")
+    parser.add_argument(
+        "--exit-zero", action="store_true", help="always exit 0, whatever we find"
+    )
+    return parser
+
+
+def _plan_arguments(argv: list[str]) -> argparse.Namespace:
+    # Every default the rest of main reads, then what `plan` was given.
+    args = build_parser().parse_args([])
+    vars(args).update(vars(build_plan_parser().parse_args(argv)))
+    args.plan_from_model = True
+    return args
 
 
 def _python_version(raw: Optional[str]) -> tuple[int, int]:
@@ -355,7 +440,15 @@ def _annotate_distro(analysis: Analysis, distro: DistroIndex) -> None:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["doctor"]:
+        from . import doctor
+
+        return doctor.main(argv[1:])
+    if argv[:1] == ["plan"]:
+        args = _plan_arguments(argv[1:])
+    else:
+        args = build_parser().parse_args(argv)
     stderr = Console(stderr=True, quiet=args.quiet)
     cache = Cache(enabled=not args.no_cache)
 
@@ -379,17 +472,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.show_pack:
         from . import evidence
 
-        root = Path(args.path)
+        root = Path(args.path).resolve()
         if not root.is_dir():
             raise SystemExit(f"{root}: --show-pack needs the repository directory")
         sys.stdout.write(evidence.build(root).render())
         return 0
     if args.recurse and not (args.plan or args.plan_from_model):
         raise SystemExit("--recurse needs --plan: it recurses from a plan's answer")
-    if args.plan_from_model:
-        return _run_plan(args, target, cache, stderr, from_model=True)
-    if args.plan:
-        return _run_plan(args, target, cache, stderr)
+    if args.plan or args.plan_from_model:
+        try:
+            return _run_plan(args, target, cache, stderr, from_model=args.plan_from_model)
+        except KeyboardInterrupt:
+            stderr.print("[yellow]interrupted[/yellow]")
+            return 130
 
     scan = _scan_source_tree(args, stderr, target.arch)
     roots = _roots(args)
@@ -488,25 +583,29 @@ def _planner(args: argparse.Namespace, stderr: Console, stack: contextlib.ExitSt
 
     from . import modelplan
 
-    kind = args.planner
-    if kind is None and (args.planner_model or "").endswith(".gguf"):
-        kind = "llama-server"
+    kind, model = args.planner, args.planner_model
     if kind is None:
+        if args.planner_url:
+            kind = "openai"
+        elif model and not model.endswith(".gguf"):
+            kind = "claude"   # --planner-model sonnet, as it always meant
+        else:
+            kind = "local"
+    if kind == "claude":
         kind = "claude-cli" if shutil.which("claude") else "anthropic"
-    if kind == "llama-server":
-        from . import serve
+    if kind in ("local", "llama-server"):
+        from . import fetch, serve
 
-        if not args.planner_model:
-            raise SystemExit("--planner llama-server needs --planner-model MODEL.gguf")
-        model = Path(args.planner_model)
         try:
-            with stderr.status(f"loading {model.name}…"):
-                url = stack.enter_context(serve.llama_server(model))
+            gguf = Path(model) if model else fetch.planner(stderr)
+            server = fetch.llama_server(stderr)
+            with stderr.status(f"loading {gguf.name}…"):
+                url = stack.enter_context(serve.llama_server(gguf, server=server))
         except RuntimeError as exc:
             raise SystemExit(str(exc)) from exc
-        return modelplan.OpenAICompatible(url, model.stem)
+        return modelplan.OpenAICompatible(url, gguf.stem)
     try:
-        return modelplan.backend(kind, args.planner_model, args.planner_url)
+        return modelplan.backend(kind, model, args.planner_url)
     except (ValueError, RuntimeError) as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -524,7 +623,7 @@ def _model_plan(args: argparse.Namespace, stderr: Console, run):
     from . import dataset, modelplan
     from .plan import plan_to_dict
 
-    root = Path(args.path)
+    root = Path(args.path).resolve()
     last: dict = {}
     with contextlib.ExitStack() as stack:
         planner = _planner(args, stderr, stack)
@@ -577,7 +676,8 @@ def _run_plan(
     from . import planrun
     from .plan import PlanError, load_plan
 
-    root = Path(args.path)
+    # Absolute: the configures run from a scratch directory, and "." has no name.
+    root = Path(args.path).resolve()
     flag = "--plan-from-model" if from_model else "--plan"
     if not root.is_dir():
         raise SystemExit(f"{root}: {flag} needs the repository directory")

@@ -10,5 +10,5 @@ dist/
 .coverage
 htmlcov/
 dist/
-data/
+/data/
 .venv

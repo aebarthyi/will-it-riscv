@@ -53,6 +53,10 @@ will-it-riscv-quiz = "will_it_riscv.quiz:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/will_it_riscv"]
 
+[tool.hatch.build.targets.sdist]
+# What builds and tests the package: not the training runs, nor a local venv.
+include = ["/src", "/tests", "/examples", "/README.md", "/LICENSE", "/pyproject.toml"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py39"

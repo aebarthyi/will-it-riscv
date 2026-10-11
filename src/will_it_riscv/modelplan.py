@@ -327,8 +327,11 @@ class OpenAICompatible:
     def __init__(
         self, url: str, model: str, api_key: Optional[str] = None, max_tokens: int = 8192,
         timeout: float = 600.0, client: Any = None, temperature: float = 0.0,
+        extra: Optional[dict] = None,
     ):
-        """``temperature`` above 0 samples, for drawing several answers to one pack."""
+        """``temperature`` above 0 samples, for drawing several answers to one pack.
+        ``extra`` goes in every request as it is: ``top_p``, or llama.cpp's
+        ``chat_template_kwargs`` (gpt-oss's ``reasoning_effort``)."""
         import httpx
 
         self.name = f"openai:{model}"
@@ -336,6 +339,7 @@ class OpenAICompatible:
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.extra = dict(extra or {})
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         self.client = client or httpx.Client(timeout=timeout, headers=headers)
 
@@ -350,6 +354,7 @@ class OpenAICompatible:
                 "type": "json_schema",
                 "json_schema": {"name": "plan", "schema": bounded(in_written_order(schema))},
             },
+            **self.extra,
         })
         response.raise_for_status()
         body = response.json()
@@ -525,21 +530,24 @@ def _as_one_prompt(messages: list[dict]) -> str:
 
 def backend(
     kind: str, model: Optional[str] = None, url: Optional[str] = None, slots: int = 1,
+    temperature: float = 0.0, extra: Optional[dict] = None,
 ) -> Backend:
     """A backend by name, as the command line names it.
 
     For ``openai``, ``url`` may name several servers of the same model,
     comma-separated; requests then go to whichever has one of its ``slots``
-    free (see Shared).
+    free (see Shared). ``temperature`` and ``extra`` are its sampling.
     """
     if kind == "openai":
         if not url or not model:
             raise ValueError("the openai backend needs --planner-url and --planner-model")
         key = os.environ.get("PLANNER_API_KEY")
         urls = [u.strip() for u in url.split(",") if u.strip()]
+        servers = [OpenAICompatible(u, model, api_key=key, temperature=temperature, extra=extra)
+                   for u in urls]
         if len(urls) == 1 and slots == 1:
-            return OpenAICompatible(urls[0], model, api_key=key)
-        return Shared([OpenAICompatible(u, model, api_key=key) for u in urls], slots)
+            return servers[0]
+        return Shared(servers, slots)
     if kind == "anthropic":
         return Anthropic(model or DEFAULT_TEACHER)
     if kind == "claude-cli":

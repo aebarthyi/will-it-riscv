@@ -33,7 +33,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from . import evidence as evidence_pack
 from . import modelplan, unblock
@@ -139,6 +139,11 @@ class Session:
     def write_plan(self, plan: dict) -> str:
         if self.running:
             raise Refused("a run is paused at a stuck point: resume or abort_run first")
+        if plan == self.wire:
+            # A small model can write the same plan over and over, at citations
+            # it cannot mend: that is no reason never to run it.
+            return ("unchanged: that is the plan you have. Change what the notes name, or "
+                    "run_plan to run it as it is.")
         try:
             parsed = parse_plan(modelplan.to_plan(plan))
         except PlanError as exc:
@@ -311,13 +316,21 @@ class Session:
 _WORKBENCH = {t["name"]: t for t in unblock.TOOLS if t["name"] != "finish"}
 _RESUME = next(t for t in unblock.TOOLS if t["name"] == "finish")
 
+def _plan_input(plan: dict) -> dict:
+    """write_plan's input: the plan, with its definitions at the top, where
+    its ``$ref``s (``#/$defs/evidence``) resolve from."""
+    plan = dict(plan)
+    defs = plan.pop("$defs", {})
+    return {"type": "object", "required": ["plan"], "properties": {"plan": plan},
+            **({"$defs": defs} if defs else {})}
+
+
 TOOLS = [
     {
         "name": "write_plan",
         "description": "Set the build plan (the format is in your instructions). Citations "
                        "are checked against the files; it says which do not hold.",
-        "inputSchema": {"type": "object", "required": ["plan"],
-                        "properties": {"plan": modelplan.WIRE_SCHEMA}},
+        "inputSchema": _plan_input(modelplan.WIRE_SCHEMA),
     },
     {
         "name": "show_plan",
@@ -450,6 +463,28 @@ class Outcome:
     cost: Optional[float] = None
     log: Optional[str] = None
     error: Optional[str] = None
+    seconds: Optional[float] = None
+    """For a local model: how long the server took to answer, all turns."""
+
+
+def _open(log_dir: Optional[Path], root: Path, pack: evidence_pack.EvidencePack, name: str,
+          arch: str, distro: str, python: str, max_runs: int, lean: bool,
+          distro_label: Optional[str]) -> tuple[Path, str]:
+    """A session directory for one project, and the first message: the pack."""
+    if lean:
+        pack = evidence_pack.lean(pack)
+    base = Path(log_dir or unblock.Replays().base()) / "agent"
+    directory = base / f"{name}-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "pack.json").write_text(json.dumps(pack.to_dict()))
+    (directory / "state.json").write_text(json.dumps({
+        "root": str(root), "name": name, "arch": arch, "distro": distro, "python": python,
+        "pack": str(directory / "pack.json"), "max_runs": max_runs,
+    }, indent=1))
+    text = (f"Project: {name}, at {root}\nTarget: {arch}, {distro_label or distro}\n\n"
+            + pack.render() + "\n\nWrite the plan and run it.")
+    (directory / "prompt.txt").write_text(text)
+    return directory, text
 
 
 @dataclass
@@ -463,23 +498,18 @@ class ClaudeAgent:
     max_runs: int = MAX_RUNS
     log_dir: Optional[Path] = None
     command: str = "claude"
-    lean: bool = False
-    """Name what CI shows rather than show it (:func:`evidence.lean`)."""
+    lean: bool = True
+    """Name what CI shows rather than show it (:func:`evidence.lean`): on the
+    dev set (score4) a fifth cheaper, and as right within the noise."""
 
     def __call__(self, root: Path, pack: evidence_pack.EvidencePack, name: str,
                  arch: str = "riscv64", distro: str = "debian:trixie", python: str = "3.12",
-                 distro_label: Optional[str] = None) -> Outcome:
+                 distro_label: Optional[str] = None, env=None) -> Outcome:
+        """``env`` is unused: the tools' server makes its own."""
         root = Path(root)
-        if self.lean:
-            pack = evidence_pack.lean(pack)
-        base = Path(self.log_dir or unblock.Replays().base()) / "agent"
-        directory = base / f"{name}-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / "pack.json").write_text(json.dumps(pack.to_dict()))
-        (directory / "state.json").write_text(json.dumps({
-            "root": str(root), "name": name, "arch": arch, "distro": distro, "python": python,
-            "pack": str(directory / "pack.json"), "max_runs": self.max_runs,
-        }, indent=1))
+        directory, text = _open(self.log_dir, root, pack, name, arch, distro, python,
+                                self.max_runs, self.lean, distro_label)
+        pack = evidence_pack.EvidencePack.from_dict(json.loads((directory / "pack.json").read_text()))
         source = str(Path(__file__).resolve().parents[1])
         (directory / "mcp.json").write_text(json.dumps({"mcpServers": {"plan": {
             "command": sys.executable,
@@ -487,9 +517,6 @@ class ClaudeAgent:
             "env": {"PYTHONPATH": os.pathsep.join(
                 p for p in (source, os.environ.get("PYTHONPATH", "")) if p)},
         }}}))
-        text = (f"Project: {name}, at {root}\nTarget: {arch}, {distro_label or distro}\n\n"
-                + pack.render() + "\n\nWrite the plan and run it.")
-        (directory / "prompt.txt").write_text(text)
         dirs = [str(root)] + ([str(unblock.cmake_modules())] if unblock.cmake_modules() else [])
         command = [
             self.command, "-p", "--model", self.model,
@@ -517,6 +544,283 @@ class ClaudeAgent:
         outcome.cost, outcome.tokens_in, outcome.tokens_out, outcome.tokens_cached = \
             unblock._usage(transcript)
         return _read(directory, root, pack, outcome)
+
+
+
+# ------------------------------------------------------------------ a model of one's own
+
+#: What Claude Code gives Claude, for a model served without it: read the
+#: project, and CMake's own modules, never write them.
+BROWSE = [
+    {
+        "name": "Read",
+        "description": "Read a file of the project (or of CMake's own modules), its lines "
+                       "numbered. A relative path is from the project root. offset: the first "
+                       f"line, from 1; limit: how many lines (default {200}).",
+        "inputSchema": {"type": "object", "required": ["file_path"], "properties": {
+            "file_path": {"type": "string"}, "offset": {"type": "integer"},
+            "limit": {"type": "integer"}}},
+    },
+    {
+        "name": "Grep",
+        "description": "Search the project's files with an extended regular expression: each "
+                       "matching line as path:line:text, at most 100. path narrows it to a file "
+                       "or directory, glob to file names (such as *.cmake).",
+        "inputSchema": {"type": "object", "required": ["pattern"], "properties": {
+            "pattern": {"type": "string"}, "path": {"type": "string"},
+            "glob": {"type": "string"}, "ignore_case": {"type": "boolean"}}},
+    },
+    {
+        "name": "Glob",
+        "description": "The project's files whose paths match a glob, such as "
+                       "**/CMakeLists.txt; at most 200.",
+        "inputSchema": {"type": "object", "required": ["pattern"], "properties": {
+            "pattern": {"type": "string"}, "path": {"type": "string"}}},
+    },
+]
+
+
+class Browser:
+    """Read, Grep and Glob over the project and the directories beside it."""
+
+    LINES = 200
+    MATCHES = 100
+    FILES = 200
+    WIDTH = 400
+
+    def __init__(self, root: Path, also: Optional[list] = None):
+        self.root = Path(root).resolve()
+        self.allowed = [self.root] + [Path(d).resolve() for d in also or []]
+
+    def _path(self, path: Optional[str]) -> Path:
+        found = (self.root / path).resolve() if path else self.root
+        if not any(found == d or d in found.parents for d in self.allowed):
+            raise Refused(f"{path}: outside the project")
+        return found
+
+    def _shown(self, path: Path) -> str:
+        try:
+            return path.relative_to(self.root).as_posix()
+        except ValueError:
+            return str(path)
+
+    def read(self, file_path: str, offset: int = 1, limit: int = LINES) -> str:
+        path = self._path(file_path)
+        if not path.is_file():
+            raise Refused(f"{file_path}: no such file")
+        data = path.read_bytes()
+        if b"\0" in data[:8192]:
+            raise Refused(f"{file_path}: not text")
+        lines = data.decode("utf-8", "replace").splitlines()
+        start = max(int(offset or 1), 1)
+        limit = max(int(limit or self.LINES), 1)
+        shown = [f"{n:>6}\t{line[:self.WIDTH]}"
+                 for n, line in enumerate(lines[start - 1:start - 1 + limit], start)]
+        rest = len(lines) - (start - 1 + len(shown))
+        if rest > 0:
+            shown.append(f"... {rest} more lines: offset={start + len(shown)}")
+        return "\n".join(shown) or f"{file_path}: no lines from {start} (it has {len(lines)})"
+
+    def grep(self, pattern: str, path: Optional[str] = None, glob: Optional[str] = None,
+             ignore_case: bool = False) -> str:
+        target = self._path(path)
+        command = ["grep", "-rHnIE", "-m", "20", "--exclude-dir=.git"]
+        command += ["-i"] if ignore_case else []
+        command += [f"--include={glob}"] if glob else []
+        try:
+            done = subprocess.run([*command, "-e", pattern, "--", str(target)],
+                                  capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            raise Refused("the search ran past a minute: narrow it with path or glob") from None
+        if done.returncode > 1:
+            raise Refused(done.stderr.strip()[:300] or "grep failed")
+        found = []
+        for line in done.stdout.splitlines():
+            where, _, rest = line.partition(":")
+            found.append(f"{self._shown(Path(where))}:{rest}"[:self.WIDTH])
+        if len(found) > self.MATCHES:
+            return "\n".join(found[:self.MATCHES] + [f"... {len(found) - self.MATCHES} more"])
+        return "\n".join(found) or "no matches"
+
+    def glob(self, pattern: str, path: Optional[str] = None) -> str:
+        base = self._path(path)
+        found = []
+        for match in base.glob(pattern):
+            if ".git" in match.relative_to(base).parts:
+                continue
+            found.append(self._shown(match))
+            if len(found) > self.FILES:
+                break
+        found.sort()
+        if len(found) > self.FILES:
+            return "\n".join(found[:self.FILES] + ["... more"])
+        return "\n".join(found) or "no files"
+
+    def call(self, name: str, arguments: dict) -> tuple[str, bool]:
+        method = {"Read": self.read, "Grep": self.grep, "Glob": self.glob}[name]
+        try:
+            return method(**arguments), False
+        except Refused as exc:
+            return f"refused: {exc}", True
+        except (TypeError, ValueError) as exc:
+            return f"bad arguments: {exc}", True
+        except OSError as exc:
+            return f"failed: {exc}", True
+
+
+def _function(tool: dict) -> dict:
+    """An MCP tool, as an OpenAI chat request lists it."""
+    parameters = tool["inputSchema"]
+    if tool["name"] == "write_plan":
+        # As the planner's grammar has it: keys in the order the plan writes
+        # them, and lists and strings bounded, so a small model cannot loop.
+        parameters = _plan_input(modelplan.bounded(
+            modelplan.in_written_order(modelplan.WIRE_SCHEMA)))
+    return {"type": "function", "function": {
+        "name": tool["name"], "description": tool["description"], "parameters": parameters}}
+
+
+@dataclass
+class OpenAIAgent:
+    """The agent as a model behind an OpenAI-compatible chat endpoint -- llama.cpp's
+    server, vLLM, Ollama -- with the same tools, called in this process.
+
+    It ends where the Claude agent is told to: at finish, or at a run that
+    shows no fault of the plan's. It also ends at an answer with no tool call,
+    at ``max_turns``, at a call repeated three times over, or when the server
+    refuses a turn (the context is full). A turn the server could not read --
+    gpt-oss now and then writes a tool call's header askew, and llama.cpp
+    answers 500 -- is asked again, ``retries`` times.
+    """
+
+    url: str
+    model: str
+    max_turns: int = 60
+    max_tokens: int = 8192
+    """Per turn."""
+    sampling: dict = field(default_factory=dict)
+    """Sent in every request: temperature, top_p, chat_template_kwargs."""
+    timeout: int = 3600
+    max_runs: int = MAX_RUNS
+    log_dir: Optional[Path] = None
+    lean: bool = True
+    request_timeout: float = 900.0
+    retries: int = 3
+    client: Any = None
+
+    def __call__(self, root: Path, pack: evidence_pack.EvidencePack, name: str,
+                 arch: str = "riscv64", distro: str = "debian:trixie", python: str = "3.12",
+                 distro_label: Optional[str] = None, env=None) -> Outcome:
+        import httpx
+
+        root = Path(root)
+        directory, text = _open(self.log_dir, root, pack, name, arch, distro, python,
+                                self.max_runs, self.lean, distro_label)
+        pack = evidence_pack.EvidencePack.from_dict(json.loads((directory / "pack.json").read_text()))
+        session = Session(directory, env)
+        browser = Browser(root, [unblock.cmake_modules()] if unblock.cmake_modules() else [])
+        tools = [_function(t) for t in BROWSE + TOOLS]
+        messages = [{"role": "system", "content": system_prompt(arch, distro_label or distro)},
+                    {"role": "user", "content": text}]
+        outcome = Outcome(log=str(directory), seconds=0.0)
+        client = self.client or httpx.Client(timeout=self.request_timeout)
+        recent: list = []
+        began = time.monotonic()
+        with (directory / "transcript.jsonl").open("w") as transcript:
+            def log(**record) -> None:
+                transcript.write(json.dumps(record) + "\n")
+                transcript.flush()
+
+            try:
+                for turn in range(self.max_turns):
+                    if time.monotonic() - began > self.timeout:
+                        outcome.error = f"the agent ran past {self.timeout}s"
+                        break
+                    body = None
+                    for attempt in range(self.retries + 1):
+                        try:
+                            response = client.post(
+                                f"{self.url.rstrip('/')}/chat/completions", json={
+                                    "model": self.model, "messages": messages, "tools": tools,
+                                    "max_tokens": self.max_tokens, **self.sampling})
+                            response.raise_for_status()
+                            body = response.json()
+                            break
+                        except httpx.HTTPStatusError as exc:
+                            outcome.error = f"turn {turn}: {exc.response.status_code} " \
+                                            f"{exc.response.text[:300]}"
+                            log(turn=turn, attempt=attempt, error=outcome.error)
+                            if exc.response.status_code < 500:
+                                break
+                        except (httpx.HTTPError, ValueError) as exc:
+                            outcome.error = f"turn {turn}: {exc}"
+                            break
+                    if body is None:
+                        break
+                    outcome.error = None
+                    usage, timings = body.get("usage") or {}, body.get("timings") or {}
+                    outcome.tokens_in += usage.get("prompt_tokens") or 0
+                    outcome.tokens_out += usage.get("completion_tokens") or 0
+                    outcome.tokens_cached += (
+                        (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+                        or timings.get("cache_n") or 0)
+                    outcome.seconds += ((timings.get("prompt_ms") or 0)
+                                        + (timings.get("predicted_ms") or 0)) / 1000
+                    choice = body["choices"][0]
+                    message = choice["message"]
+                    log(turn=turn, usage=usage, timings=timings,
+                        finish_reason=choice.get("finish_reason"), message=message)
+                    calls = message.get("tool_calls") or []
+                    kept = {"role": "assistant", "content": message.get("content") or ""}
+                    if message.get("reasoning_content"):
+                        kept["reasoning_content"] = message["reasoning_content"]
+                    if calls:
+                        kept["tool_calls"] = calls
+                    messages.append(kept)
+                    if not calls:
+                        break
+                    for call in calls:
+                        function = call.get("function") or {}
+                        tool = function.get("name") or ""
+                        text, refused = self._call(session, browser, tool,
+                                                   function.get("arguments"))
+                        messages.append({"role": "tool", "tool_call_id": call.get("id") or "",
+                                         "content": text})
+                        log(tool=tool, refused=refused, result=text)
+                        recent = (recent + [(tool, json.dumps(function.get("arguments")))])[-3:]
+                    if session.record["finish"] is not None:
+                        break
+                    if len(recent) == 3 and len(set(recent)) == 1:
+                        outcome.error = f"it called {recent[0][0]} three times over"
+                        break
+                else:
+                    outcome.error = f"no end in {self.max_turns} turns"
+            finally:
+                session.close()
+                if self.client is None:
+                    client.close()
+        outcome.seconds = round(outcome.seconds, 1)
+        return _read(directory, root, pack, outcome)
+
+    @staticmethod
+    def _call(session: Session, browser: Browser, tool: str, raw: Any) -> tuple[str, bool]:
+        try:
+            arguments = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+        except (ValueError, TypeError):
+            return f"the arguments are not JSON: {str(raw)[:200]}", True
+        if not isinstance(arguments, dict):
+            return "the arguments must be an object", True
+        if tool in ("Read", "Grep", "Glob"):
+            return browser.call(tool, arguments)
+        if tool == "write_plan":
+            plan = arguments.get("plan", arguments)
+            if isinstance(plan, str):
+                try:
+                    plan = json.loads(plan)
+                except ValueError:
+                    return "the plan is not JSON", True
+            arguments = {"plan": plan}
+        return call(session, tool, arguments)
 
 
 def _read(directory: Path, root: Path, pack, outcome: Outcome) -> Outcome:

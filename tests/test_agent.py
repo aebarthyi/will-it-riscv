@@ -1,5 +1,6 @@
 """The agent: plan, run, stop at stuck points, fix, finish -- with tools."""
 
+import copy
 import io
 import json
 import sys
@@ -80,7 +81,7 @@ def test_a_stuck_run_pauses_for_the_agent_and_goes_on_when_it_resumes(session):
     assert [r["replayed"] for r in record["runs"]] == [0, 1] and record["wire"] == WIRE
     # A run with no fault of the plan's is the end: no finish call, no summary.
     assert "you are done: reply done" in again and record["finish"] == {"note": "", "clean": True}
-    session.write_plan(WIRE)        # unless the agent writes another plan
+    session.write_plan({**WIRE, "unsure": ["a note"]})     # unless it writes another plan
     assert json.loads((session.directory / "agent.json").read_text())["finish"] is None
 
 
@@ -102,6 +103,8 @@ def test_the_workbench_is_only_for_stuck_points(session):
     text, refused = call(session, "write_plan", {"plan": {"repo": "x", "steps": [{"id": "?"}]}})
     assert refused and "not a plan" in text
     assert "kept" in call(session, "write_plan", {"plan": WIRE})[0]
+    assert call(session, "write_plan", {"plan": WIRE})[0].startswith("unchanged: ")
+    assert json.loads((session.directory / "agent.json").read_text())["plans"] == 1
     assert "recorded" in call(session, "finish", {"note": "done"})[0]
 
 
@@ -161,3 +164,75 @@ def test_the_agent_end_to_end_through_claude(tmp_path):
     calls = [json.loads(line)["tool"]
              for line in (Path(outcome.log) / "calls.jsonl").read_text().splitlines()]
     assert calls == ["write_plan", "finish"]
+
+
+class FakeServer:
+    """An OpenAI-compatible endpoint that answers from a script, and keeps what it was sent."""
+
+    def __init__(self, answers):
+        self.answers, self.requests = list(answers), []
+
+    def post(self, url, json):
+        self.requests.append(copy.deepcopy(json))      # as it went out
+        message = self.answers.pop(0)
+        if isinstance(message, int):                    # the server could not read the turn
+            import httpx
+
+            response = httpx.Response(message, text="does not match the expected format",
+                                      request=httpx.Request("POST", url))
+            response.raise_for_status()
+        body = {"choices": [{"message": message, "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 1000, "completion_tokens": 50},
+                "timings": {"cache_n": 600, "prompt_ms": 400.0, "predicted_ms": 1600.0}}
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: body)
+
+
+def _calls(*calls):
+    return {"role": "assistant", "content": "", "tool_calls": [
+        {"id": f"c{i}", "type": "function",
+         "function": {"name": name, "arguments": json.dumps(arguments)}}
+        for i, (name, arguments) in enumerate(calls)]}
+
+
+@needs_cmake
+def test_a_served_model_plans_with_the_same_tools_and_a_clean_run_ends_it(tmp_path, target):
+    from will_it_riscv.agent import OpenAIAgent
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.16)\nproject(ok NONE)\n")
+    wire = {"repo": "ok", "steps": [{"id": "configure", "kind": "cmake-configure", "source": ".",
+            "after": [], "evidence": [{"at": "CMakeLists.txt:2", "quote": "project(ok NONE)"}]}],
+            "unsure": []}
+    server = FakeServer([
+        500,                                            # asked again
+        _calls(("Grep", {"pattern": "project\\(", "glob": "CMakeLists.txt"})),
+        # A small model may hand the plan over bare, not under "plan".
+        _calls(("write_plan", wire), ("run_plan", {})),
+    ])
+    env = SimpleNamespace(index=FakeIndex({}), target=target, distro=FakeDistro(set()),
+                          timeout=120, pip_cache=tmp_path / "pip")
+    outcome = OpenAIAgent("http://x/v1", "m", client=server, log_dir=tmp_path / "logs")(
+        project, EvidencePack(repo="ok"), "ok", env=env)
+    assert outcome.error is None and outcome.finished      # no turn after the clean run
+    assert [s.id for s in outcome.plan.steps] == ["configure"] and len(server.requests) == 3
+    names = [t["function"]["name"] for t in server.requests[0]["tools"]]
+    plan = next(t["function"]["parameters"] for t in server.requests[0]["tools"]
+                if t["function"]["name"] == "write_plan")
+    assert "evidence" in plan["$defs"] and "$defs" not in plan["properties"]["plan"]
+    assert names[:3] == ["Read", "Grep", "Glob"] and "write_plan" in names
+    grep = server.requests[2]["messages"][-1]
+    assert grep["role"] == "tool" and grep["content"] == "CMakeLists.txt:2:project(ok NONE)"
+    assert (outcome.tokens_in, outcome.tokens_out, outcome.tokens_cached) == (2000, 100, 1200)
+    assert outcome.seconds == 4.0
+
+
+def test_a_served_model_that_repeats_itself_is_stopped(tmp_path):
+    from will_it_riscv.agent import OpenAIAgent
+
+    (tmp_path / "state.json").write_text("{}")
+    server = FakeServer([_calls(("show_plan", {}))] * 5)
+    outcome = OpenAIAgent("http://x/v1", "m", client=server, log_dir=tmp_path / "logs")(
+        tmp_path, EvidencePack(repo="x"), "x", env=SimpleNamespace())
+    assert outcome.error == "it called show_plan three times over" and len(server.requests) == 3
+    assert outcome.plan is None

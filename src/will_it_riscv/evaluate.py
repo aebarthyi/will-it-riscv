@@ -343,7 +343,7 @@ def agent_planner(agent, env) -> Planner:
         name = (meta.get("entry") or {}).get("name") or meta["key"]
         outcome = agent(root, pack, name, arch=env.target.arch, distro=env.distro.spec.id,
                         python=".".join(map(str, env.target.python_version)),
-                        distro_label=env.distro.spec.label)
+                        distro_label=env.distro.spec.label, env=env)
         meta["usage"] = (outcome.tokens_in, outcome.tokens_out, outcome.cost,
                          outcome.tokens_cached)
         return outcome.plan
@@ -579,20 +579,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--split", default="test")
     parser.add_argument("--planner",
                         choices=("claude-cli", "anthropic", "openai", "agent", "saved"),
-                        help="a model to score beside the baselines; agent: Claude (via claude "
-                             "-p, --planner-model) planning with tools, needs --execute; saved: "
-                             "the last answers kept in --saved")
+                        help="a model to score beside the baselines; agent: a model planning "
+                             "with tools, needs --execute -- Claude (via claude -p, "
+                             "--planner-model), or with --planner-url a model served there; "
+                             "saved: the last answers kept in --saved")
     parser.add_argument("--saved", metavar="DIR[,DIR...]",
                         help="for --planner saved: --transcripts directories of earlier runs; "
                              "a later one's answer for a key wins")
     parser.add_argument("--planner-model")
-    parser.add_argument("--lean-pack", action="store_true",
-                        help="for agent: name what CI shows (workflows, Dockerfiles, the scripts "
-                             "they call) instead of showing it; it reads what it needs")
+    parser.add_argument("--full-pack", action="store_true",
+                        help="for agent: show it what CI shows (workflows, Dockerfiles, the "
+                             "scripts they call), which it is otherwise only told the names of")
     parser.add_argument("--planner-url",
                         help="for openai: the server, or several of the same model, comma-separated")
     parser.add_argument("--planner-slots", type=int, default=1,
                         help="requests each server takes at once (llama-server's -np)")
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="for a served model (openai, or agent with --planner-url)")
+    parser.add_argument("--top-p", type=float)
+    parser.add_argument("--reasoning-effort", choices=("low", "medium", "high"),
+                        help="for a served gpt-oss: passed to its chat template")
     parser.add_argument("--rounds", type=int, default=1,
                         help="let the model revise this many times (default: 1, none)")
     parser.add_argument("--execute", action="store_true",
@@ -640,20 +646,36 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         env = dataset.environment(args.python, distro=args.distro)
     planners: dict[str, Planner] = {} if args.no_baselines else {"autoplan": autoplan_planner}
+    sampling: dict = {}
+    if args.top_p is not None:
+        sampling["top_p"] = args.top_p
+    if args.reasoning_effort:
+        sampling["chat_template_kwargs"] = {"reasoning_effort": args.reasoning_effort}
     if args.planner == "agent":
         if env is None:
             parser.error("--planner agent needs --execute")
         from .agent import ClaudeAgent
 
-        model = args.planner_model or "sonnet"
-        name = f"agent-lean:{model}" if args.lean_pack else f"agent:{model}"
-        planners[name] = agent_planner(ClaudeAgent(model=model, lean=args.lean_pack), env)
+        if args.planner_url:
+            from .agent import OpenAIAgent
+
+            if not args.planner_model:
+                parser.error("--planner agent --planner-url needs --planner-model")
+            model = args.planner_model
+            agent = OpenAIAgent(args.planner_url, model, lean=not args.full_pack,
+                                sampling={"temperature": args.temperature, **sampling})
+        else:
+            model = args.planner_model or "sonnet"
+            agent = ClaudeAgent(model=model, lean=not args.full_pack)
+        name = f"agent-full:{model}" if args.full_pack else f"agent:{model}"
+        planners[name] = agent_planner(agent, env)
     elif args.planner == "saved":
         saved = [Path(d) for d in args.saved.split(",")]
         planners[f"saved:{saved[0].name}"] = saved_planner(saved)
     elif args.planner:
         backend = modelplan.backend(
-            args.planner, args.planner_model, args.planner_url, args.planner_slots)
+            args.planner, args.planner_model, args.planner_url, args.planner_slots,
+            temperature=args.temperature, extra=sampling)
         planners[backend.name] = model_planner(
             backend, args.rounds, args.transcripts, env if args.run_feedback else None)
     keys = list(dict.fromkeys(args.keys.read_text().split())) if args.keys else None

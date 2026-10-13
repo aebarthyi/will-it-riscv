@@ -1,0 +1,20 @@
+# qwen3-4b-h200's recipe (Lagutenko-4B = its step 318) on one Gaudi 2, seed 1.
+# Same data (v3: 1266 train, 33 valid, 159 steps an epoch, 795 in all), same
+# effective batch (1 card x 8). Seeds 0-2 measure run-to-run noise before any
+# recipe change; checkpoints at epochs 2 and 3 (318, 477) are scored on dev.
+model: Qwen/Qwen3-4B-Instruct-2507
+data: data/prepared-v3/32768
+dtype: bfloat16
+device: hpu
+attention: fused
+loss: static
+bucket: 512
+fsdp: false
+offload: false
+lora_r: 64
+lora_alpha: 128
+lr: 2.0e-4
+epochs: 5
+accumulation: 8
+seed: 1
+save_every: 10

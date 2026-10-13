@@ -1,0 +1,21 @@
+# The 8B arm: qwen3-4b-gaudi's recipe and data on Qwen3-8B, one Gaudi 2.
+# Qwen3-8B thinks unless told not to: rendered with enable_thinking false, the
+# prompt ends in an empty think block and the completion is the plan alone, so
+# serving it needs the same (llama-server --chat-template-kwargs).
+model: Qwen/Qwen3-8B
+data: data/prepared-v3/32768
+dtype: bfloat16
+device: hpu
+attention: fused
+loss: static
+bucket: 512
+fsdp: false
+offload: false
+lora_r: 64
+lora_alpha: 128
+lr: 2.0e-4
+epochs: 5
+accumulation: 8
+chat_template_kwargs: {enable_thinking: false}
+seed: 0
+save_every: 10

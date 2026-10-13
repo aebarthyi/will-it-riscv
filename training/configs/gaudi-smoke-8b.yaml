@@ -1,0 +1,22 @@
+# qwen3-8b-gaudi for a few steps on one card, longest sequences first: peak
+# memory and tokens per second at 30k, and how long the first graphs take to
+# compile. Its own out, so last/ is not shared.
+model: Qwen/Qwen3-8B
+data: data/prepared-v3/32768
+dtype: bfloat16
+device: hpu
+attention: fused
+loss: static
+bucket: 512
+fsdp: false
+offload: false
+lora_r: 64
+lora_alpha: 128
+lr: 2.0e-4
+epochs: 5
+accumulation: 8
+chat_template_kwargs: {enable_thinking: false}
+longest_first: true
+max_steps: 3
+save_every: 3
+eval_every: 1000

@@ -45,10 +45,11 @@ a linux/riscv64 build confined to an empty sysroot, and sends what the run
 shows the plan got wrong back to the model. Then it answers: will it build on
 riscv64, and what does it need from Ubuntu 26.04's archive?
 
-On 40 held-out repositories, the planner's verdicts agreed with the
-references' on 37 (Claude Sonnet's, in the same loop: 36). It named 94% of
-what those builds require (Sonnet: 94%). The same held-out split also chose
-this checkpoint, so these numbers are optimistic; a fresh holdout is next.
+On 60 fresh repositories that played no part in training or in choosing
+the model, the planner's verdicts agreed with the references' on 52 (Claude
+Sonnet's, in the same loop: 58). It named 86% of what those builds require
+(Sonnet: 93%). The [model card](https://huggingface.co/aebarthyi/lagutenko-4B)
+has the full table.
 
 The first run fetches the planner (4.3 GB) and llama.cpp's prebuilt server,
 once, into `~/.local/share/will-it-riscv`. The model runs on this machine:
@@ -412,8 +413,11 @@ never had on any architecture (with the nearest names it does have), or a
 compiler left as a placeholder (`${FC}`) that stopped the configure. Each
 goes back the same way. A configure that stops for any other reason is the
 build's answer, so it is reported, not sent back. The report is the run the
-last plan was accepted on. On the held-out repositories this feedback takes
-the fine-tuned 4B planner's repository verdicts from 0.79 to 0.94.
+last plan was accepted on. On the held-out split this feedback took the
+fine-tuned 4B planner's verdicts from 0.825 to 0.925; on 60 fresh
+repositories it left them at 0.867 and raised what its plans require a
+little. It matters most for weaker planners: the base Qwen3-4B goes from
+0.050 to 0.367 on those 60.
 
 It writes a wire format: the plan format with every object closed,
 evidence always `{at, quote}`, and `-D` flags as name/value pairs. That is

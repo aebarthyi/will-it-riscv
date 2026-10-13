@@ -63,38 +63,49 @@ temperature 0 and constrains the reply to the plan's JSON schema.
 
 ## Results
 
-The test set is 40 repositories (30 git, 10 PyPI sdists), drawn at random from
-the held-out split. None of them, and no other repository from that split,
-appear in the training or validation data. Each was planned for Ubuntu 26.04
-riscv64 (`ubuntu:resolute`).
+The test is 60 repositories that played no part in training, in choosing
+this checkpoint, or in tuning the tool: 45 Spack CMake packages hosted on
+GitHub and 15 PyPI sdists that ship platform wheels but none for riscv64,
+drawn at random on 2026-10-11 from projects that no training corpus had
+seen. The plan for the test was written down before any result, and each
+row below ran once. Every repository was planned for Ubuntu 26.04 riscv64
+(`ubuntu:resolute`) with will-it-riscv at commit 759ad6b. Claude Opus wrote
+the reference plans, and each was verified by running it, as the training
+data was.
 
 - **verdict**: the share of repositories where the planner's answer (yes,
   probably, unknown or no) agreed with the reference's.
 - **required**: the share of what the reference's configure proved the build
-  needs that the planner's plan also required. It is scored on the 31
+  needs that the planner's plan also required. It is scored on the 52
   repositories where the reference's run proved something.
 
 | planner | loop | verdict | required | tokens / repo |
 | --- | --- | --- | --- | --- |
-| **this model** | one shot | 0.825 | 0.845 | 7k |
-| **this model** | run feedback, 3 rounds | **0.925** | **0.942** | 10k |
-| Qwen3-4B-Instruct-2507 (the base) | one shot | 0.100 | 0.006 | 7k |
-| Qwen3-4B-Instruct-2507 (the base) | run feedback, 3 rounds | 0.400 | 0.397 | 21k |
-| gpt-oss-20b | run feedback, 3 rounds | 0.850 | 0.831 | 17k |
-| Claude Sonnet | run feedback, 3 rounds | 0.900 | 0.937 | 14k |
-| Claude Sonnet | tool-using agent | 0.950 | 0.979 | 31k |
+| **this model** | one shot | 0.867 | 0.854 | 6k |
+| **this model** | run feedback, 3 rounds | **0.867** | **0.861** | 9k |
+| Qwen3-4B-Instruct-2507 (the base) | one shot | 0.050 | 0.093 | 6k |
+| Qwen3-4B-Instruct-2507 (the base) | run feedback, 3 rounds | 0.367 | 0.308 | 18k |
+| gpt-oss-20b | run feedback, 3 rounds | 0.817 | 0.792 | 14k |
+| Claude Sonnet | run feedback, 3 rounds | 0.967 | 0.926 | 11k |
+| Claude Sonnet | tool-using agent | 0.950 | 0.953 | 31k |
 
-In the same loop, this model and Claude Sonnet differ by no significant
-amount on verdict, required or F1 (paired 95% bootstrap). The feedback loop adds 0.100 to
-this model's verdict score over one shot, which is significant.
+In the same loop, this model's verdicts trail Claude Sonnet's by 0.100
+(paired 95% bootstrap: 0.033 to 0.183), which is significant; the gap on
+required (0.065) is not. It is level with gpt-oss-20b, a model five times
+its size. The fine-tune is the whole of the gain: the base model, in the
+same loop, agrees on 0.367. Run feedback left this model's verdict score
+where it was, and raised what its plans require a little.
 
-**These numbers are optimistic.** The same held-out split was used to choose
-this checkpoint from about 14 candidates, and to tune the tool around it.
-Training runs vary a lot: a rerun of the same recipe, on the same data except
-for 21 revised labels, scored 0.83 on verdict for the split's 97 git
-repositories, against this checkpoint's 0.94. A fresh holdout of
-repositories that were never used for any choice is planned, and this table
-will be replaced by its results.
+Of the 8 repositories this model got wrong, Claude Sonnet got 6 right. In
+two, the model copied a GPU backend from the README into the default build;
+in two others its configure pointed at the wrong place in the tree. The
+tool's feedback now names both mistakes, but that has not been measured:
+this test has been used, and the next one needs a fresh draw.
+
+An earlier version of this card reported 0.925 against Sonnet's 0.900 on
+40 repositories from the held-out split. That split also chose this
+checkpoint from about 14 candidates and steered the tool's development, so
+those numbers were optimistic. This table replaces them.
 
 **Caveat:** Claude wrote the reference plans, and it also labelled the
 training data. Agreement with the references therefore partly measures how
@@ -114,6 +125,8 @@ been checked against real riscv64 builds.
   on 2026-09-28.
 - **Checkpoint:** step 318, the end of epoch 2. This is the lowest validation
   loss of the run (0.522). Validation loss rose after it, to 0.670 at the end.
+  It was chosen over about 14 other runs and checkpoints on the held-out
+  split, not on the test above.
 - **Export:** the adapter was merged into the base in fp32, saved in fp16, and
   converted to GGUF Q8_0 by llama.cpp's `convert_hf_to_gguf.py`. The Q8_0 file
   is the one evaluated above.

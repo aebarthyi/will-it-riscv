@@ -37,7 +37,12 @@ the distro already ships so you can skip the build entirely.
 $ pip install git+https://github.com/aebarthyi/will-it-riscv
 $ will-it-riscv doctor              # what this machine has for it, and lacks
 $ will-it-riscv plan ~/src/nlopt    # write the build plan, run it, answer
+$ will-it-riscv plan ~/src/nlopt --graph deps.html --build-script build-riscv.sh
 ```
+
+The second form also draws the dependency graph as a page to explore, and
+writes a script that builds the project on the riscv64 machine itself:
+`bash build-riscv.sh` from the checkout there.
 
 `plan` has a fine-tuned 4B model write the repository's build plan:
 everything its build runs, in order. It runs every configure in that plan as
@@ -335,8 +340,9 @@ and Debian's python3-numpy stay two things. A requirement that an earlier
 step provides — the CMake configure wants `fypp`, which the Python toolchain
 installs; it wants FFTW, which the dependency target builds from source — is
 resolved to that step rather than looked for in the archive, and it stays off
-the install line. `-f dot` draws it: a node per dependency, coloured by how it
-can be had, with a dashed edge from whichever step provides it.
+the install line. `--graph deps.html` draws it: a node per dependency,
+coloured by how it can be had, with a dashed edge from whichever step
+provides it (`-f dot` gives the same graph to Graphviz).
 
 **What the build step imports is worth knowing.** `./mfc.sh build` installs
 115 Python packages and then hands over to `toolchain/main.py`, which loads
@@ -631,6 +637,55 @@ build scripts, run on this host: confined to a scratch sysroot, never
 compiled, never emulated, but run. `--recurse` is opt-in and bounded by
 `--recurse-depth` (3) and `--recurse-limit` (40 packages).
 
+### The graph, to explore
+
+`--graph deps.html` writes the plan's dependency graph as one page that
+needs nothing installed and fetches nothing when it opens: the steps on the
+left, what each needs flowing right, coloured as the report's tiers are
+(in the archive, made by a step of the plan, only source for the target,
+not settled, nothing public). Optional dependencies are dashed and can be
+hidden; so is what a configure looked for and did without. Click a node for
+why the build needs it — the chain from a step down to it — what settled it,
+and the lines the plan cited. Python packages that have wheels for the
+target, and lead to nothing that does not, fold into one node a step: MFC's
+toolchain brings in 83 of them. With `--recurse`, a package built from
+source carries its recursion: its status, its source, its place in the build
+order. It pans, zooms, searches, and follows the system's light or dark
+theme. `--graph deps.svg` writes the same picture, still.
+
+The layout is the tool's own (layered, after Sugiyama), so there is no
+Graphviz to install.
+
+### A build script, from the plan
+
+`--build-script build-riscv.sh` writes the build itself, for the target:
+the plan's steps, each followed by the compile and install its build system
+does after a configure. It is written by code from the plan the run held up,
+not by the model, and every value the plan carries goes into it quoted. Run
+it on the riscv64 machine, from the checkout. In order, it:
+
+1. checks the machine and the distro are the ones planned for
+   (`ANY_ARCH=1` to run it elsewhere);
+2. installs everything the build needs from the archive, in one
+   `apt-get install`;
+3. installs Rust with rustup where the archive's is too old;
+4. makes a virtual environment for the Python steps, since Debian and
+   Ubuntu refuse pip installs into the system's Python;
+5. builds what the target has only as source, dependencies first. When the
+   build needs any, writing the script turns `--recurse` on to find them and
+   the order;
+6. runs the plan's steps in order: pip installs, CMake and Meson configures
+   each built and installed into `$PREFIX`, and the project's own driver.
+   A driver runs the configures it was seen to run, and pip's build runs
+   the configure a meson-python or scikit-build backend owns, so the script
+   leaves those to them.
+
+`DRY_RUN=1` prints every command and runs none; `SKIP_APT=1` skips the
+packages; `PREFIX`, `WORK` and `JOBS` say where and how wide; an optional
+step runs with `WITH_<STEP>=1` (MFC's `WITH_SIMULATION_GPU_ACC=1`). nlopt's
+script, run on x86_64 with `ANY_ARCH=1 SKIP_APT=1`, configures, builds and
+installs `libnlopt.so` in 11 seconds.
+
 ### Meson builds are set up the same way
 
 numpy, scipy, matplotlib and pandas build with Meson, through meson-python.
@@ -839,7 +894,10 @@ $ pip install 'will-it-riscv[teacher] @ git+https://github.com/aebarthyi/will-it
 $ will-it-riscv plan ~/src/MFC
 
 # the same, drawn, against Debian 13, with the plan kept
-$ will-it-riscv plan ~/src/MFC --distro debian:trixie --save-plan mfc.json -f dot | dot -Tsvg > mfc.svg
+$ will-it-riscv plan ~/src/MFC --distro debian:trixie --save-plan mfc.json --graph mfc.html
+
+# and a script that builds it on the riscv64 machine (then: bash build-riscv.sh, there)
+$ will-it-riscv plan ~/src/MFC --build-script build-riscv.sh
 
 # with Claude writing the plan
 $ will-it-riscv plan ~/src/MFC --planner claude

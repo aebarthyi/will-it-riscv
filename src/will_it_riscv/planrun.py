@@ -174,6 +174,8 @@ class StepResult:
     trace: Optional[drive.DriverTrace] = None
     plan_check: list[str] = field(default_factory=list)
     """For a python-run: how the configures it ran compare with the plan's."""
+    driven: list[str] = field(default_factory=list)
+    """For a python-run: the plan's configures it was seen to run itself."""
 
 
 @dataclass
@@ -577,6 +579,7 @@ def _plan_check(result: PlanResult) -> None:
                 flags = " ".join(f"-D{k}={v}" for k, v in sorted(defines.items()) if "MFC_" in k
                                  or k == "CMAKE_BUILD_TYPE")
                 unplanned.append(f"{source} {flags}".strip())
+        outcome.driven = sorted(matched)
         checks = [f"ran {len(configures)} configure{'s' if len(configures) != 1 else ''}; "
                   f"{len(matched)} of the plan's {len(planned)} cmake steps match"]
         checks += [f"the plan has {s.id!r}, which the driver never configured"
@@ -1129,7 +1132,7 @@ def render_text(result: PlanResult, console) -> None:
         )
     console.print(
         f"  graph: {len(result.nodes)} nodes, {len(result.edges)} edges — "
-        "-f dot | dot -Tsvg > plan.svg",
+        "--graph deps.html to explore it",
         style="dim",
     )
     console.print()

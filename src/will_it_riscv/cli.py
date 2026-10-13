@@ -187,6 +187,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     output.add_argument("-o", "--output", metavar="FILE", help="write the report here")
     output.add_argument(
+        "--graph", metavar="FILE",
+        help="draw the plan's dependency graph: FILE.html is an interactive page "
+        "(nothing to install, nothing fetched when it opens), FILE.svg a picture",
+    )
+    output.add_argument(
+        "--build-script", metavar="FILE",
+        help="write a bash script that builds the project on the target, from the plan "
+        "its run held up: system packages, then what must be built from source "
+        "(recursing to find it when the build needs any), then the plan's steps",
+    )
+    output.add_argument(
         "-v", "--verbose", action="store_true",
         help="also table the packages that are fine",
     )
@@ -295,6 +306,17 @@ def build_plan_parser() -> argparse.ArgumentParser:
         help="'dot' draws the dependency graph for Graphviz (dot -Tsvg)",
     )
     parser.add_argument("-o", "--output", metavar="FILE", help="write the report here")
+    parser.add_argument(
+        "--graph", metavar="FILE",
+        help="draw the plan's dependency graph: FILE.html is an interactive page "
+        "(nothing to install, nothing fetched when it opens), FILE.svg a picture",
+    )
+    parser.add_argument(
+        "--build-script", metavar="FILE",
+        help="write a bash script that builds the project on the target, from the plan "
+        "its run held up: system packages, then what must be built from source "
+        "(recursing to find it when the build needs any), then the plan's steps",
+    )
     parser.add_argument("-q", "--quiet", action="store_true", help="no progress output")
     parser.add_argument(
         "--exit-zero", action="store_true", help="always exit 0, whatever we find"
@@ -479,6 +501,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
     if args.recurse and not (args.plan or args.plan_from_model):
         raise SystemExit("--recurse needs --plan: it recurses from a plan's answer")
+    if (args.graph or args.build_script) and not (args.plan or args.plan_from_model):
+        raise SystemExit("--graph and --build-script draw on a plan: use `will-it-riscv plan`, "
+                         "--plan or --plan-from-model")
+    if args.graph and Path(args.graph).suffix.lower() not in (".html", ".htm", ".svg"):
+        raise SystemExit(f"--graph {args.graph}: write .html (interactive) or .svg (a picture)")
     if args.plan or args.plan_from_model:
         try:
             return _run_plan(args, target, cache, stderr, from_model=args.plan_from_model)
@@ -730,7 +757,14 @@ def _run_plan(
             elif result is None:
                 with stderr.status(f"running {plan.repo}'s plan…") as status:
                     result = run(plan, lambda what: status.update(f"{plan.repo}: {what}"))
-            if args.recurse:
+            # A build script builds what has only source; the recursion finds how.
+            sourced = result.answer.from_source if result.answer else []
+            recurse = args.recurse or bool(args.build_script and sourced)
+            if recurse and not args.recurse:
+                stderr.print(f"the build needs {len(sourced)} package"
+                             f"{'s' if len(sourced) != 1 else ''} built from source: recursing "
+                             "to plan them for the build script")
+            if recurse:
                 recurse_options: dict = {
                     "index": index, "target": target, "distro": distro,
                     "cache_root": cache.root / "sources",
@@ -750,6 +784,7 @@ def _run_plan(
             return 3
 
     code = planrun.exit_code(result) if walk is None else _recursion_exit_code(walk)
+    _write_extras(args, result, walk, stderr)
     if args.format == "json":
         data = planrun.to_dict(result)
         if walk is not None:
@@ -773,6 +808,28 @@ def _run_plan(
     else:
         sys.stdout.write(payload + "\n")
     return 0 if args.exit_zero else code
+
+
+def _write_extras(args: argparse.Namespace, result, walk, stderr: Console) -> None:
+    """--graph and --build-script, beside whatever the report is."""
+    if args.graph:
+        from . import viz
+
+        path = Path(args.graph)
+        viz.write(viz.from_plan(result, walk), path)
+        stderr.print(f"graph: {path}", highlight=False, soft_wrap=True)
+    if args.build_script:
+        from .buildscript import build_script
+
+        path = Path(args.build_script)
+        path.write_text(
+            build_script(result, walk, distro=resolve_spec(args.distro).id, name=path.name),
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+        stderr.print(f"build script: {path} (run it on the {result.arch} machine, from the "
+                     "checkout; DRY_RUN=1 shows what it would do)", highlight=False,
+                     soft_wrap=True)
 
 
 def _recursion_exit_code(walk) -> int:

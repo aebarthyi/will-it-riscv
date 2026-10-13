@@ -678,11 +678,12 @@ def _configure(
         )
         missing = "CMakeLists.txt"
     if outcome is None:
-        return StepResult(step, "failed", f"no {missing} in {step.source}")
+        return StepResult(step, "failed", _no_project(root, step.source, missing))
+    checks = [] if step.optional else _moved_defaults(step, outcome, root)
     if outcome.error and not outcome.probes and not outcome.blockers and not outcome.completed:
         # Nothing asked for and nothing blamed. A default build that turns on
         # CUDA dies at project(), before any find_package, with CUDA to blame.
-        return StepResult(step, "failed", outcome.error, pseudobuild=outcome)
+        return StepResult(step, "failed", outcome.error, pseudobuild=outcome, plan_check=checks)
     graph = depgraph.build(outcome, f"{plan.repo}/{step.id}", distro)
     here = f"step:{step.id}"
     ids = {key: f"{node.kind}:{key}" for key, node in graph.nodes.items()}
@@ -712,7 +713,6 @@ def _configure(
         detail += "; installed for the host: " + ", ".join(outcome.python_installed)
     if not outcome.completed and outcome.error:
         detail += f"; stopped at {outcome.error}"
-    checks = [] if step.optional else _moved_defaults(step, outcome, root)
     return StepResult(step, status, detail, pseudobuild=outcome, graph=graph, plan_check=checks)
 
 
@@ -724,21 +724,81 @@ def _moved_defaults(step: Step, outcome: PseudoBuild, root: Path) -> list[str]:
     says otherwise: a default step that turns it OFF reports a build without
     what the default one needs. dd4hep's Geant4 is OFF, and only the
     bootstrap script it cites turns it ON.
+
+    A GPU backend is optional whatever the step cites: spfft's README builds
+    with -DSPFFT_GPU_BACKEND=CUDA, and its default is OFF.
     """
     options = getattr(outcome, "options", None) or {}
     cited = _cited(step, root)
     moved = []
     for name, value in step.defines.items():
-        if name not in options or _sets(name, cited):
+        if name not in options:
             continue
         default, site = options[name]
-        if _truthy(value) != _truthy(default):
+        if _gpu_on(name, value) and not _gpu_on(name, default):
+            moved.append(
+                f"-D{name}={value} moves the project's option from its default {default} "
+                f"({site}) to a GPU backend: a default step keeps the defaults, whatever "
+                "the instructions it cites build, so move it to an optional step")
+        elif _truthy(value) != _truthy(default) and not _sets(name, cited):
             moved.append(
                 f"-D{name}={value} moves the project's option from its default {default} "
                 f"({site}), and nothing the step cites sets it: a default step keeps the "
                 "defaults, so drop it, cite the install instructions that set it, or move "
                 "it to an optional step")
     return moved
+
+
+#: A GPU toolkit by value -- SPLA_GPU_BACKEND=CUDA, dbcsr's USE_ACCEL=cuda --
+#: or a switch by name: EXCHCXX_ENABLE_HIP, KOKKOS_ENABLE_CUDA, USE_GPU. Not
+#: one that turns it off: opensubdiv's NO_CUDA=1.
+_GPU_VALUE = re.compile(r"^(CUDA|HIP|ROCM|SYCL)$", re.IGNORECASE)
+_GPU_NAME = re.compile(r"(^|_)(CUDA|HIP|ROCM|SYCL|GPU)(_|$)", re.IGNORECASE)
+_NEGATED = re.compile(r"(^|_)(NO|DISABLE|WITHOUT|SKIP)(_|$)", re.IGNORECASE)
+
+
+def _gpu_on(name: str, value: str) -> bool:
+    """Whether -DNAME=VALUE turns on a GPU backend."""
+    if _GPU_VALUE.match(str(value).strip()):
+        return True
+    return bool(_GPU_NAME.search(name) and not _NEGATED.search(name) and _truthy(value))
+
+
+def _no_project(root: Path, source: str, name: str) -> str:
+    """Why a configure had nothing to configure, and where the project's
+    CMakeLists.txt is: branson's is in src, and a plan for fckit pointed a
+    configure at a .cmake script. Told only what was not there, a model sent
+    the same step back three times."""
+    what = (f"{source} is a file, not a directory with a {name}"
+            if (root / source).is_file() else f"no {name} in {source}")
+    found = _shallowest(root, name)
+    if found == ["."]:
+        return f"{what}; the project's {name} is at its root, source \".\""
+    if found:
+        return (f"{what}; the project's shallowest {name} "
+                f"{'is' if len(found) == 1 else 'are'} in {', '.join(found)}: the step's "
+                f"source is the directory whose {name} builds the project")
+    return what
+
+
+def _shallowest(root: Path, name: str, depth: int = 3) -> list[str]:
+    """The directories nearest the root that hold a file by this name, at most
+    four of them, none hidden: ["src"] for branson."""
+    level = [root] if root.is_dir() else []
+    for _ in range(depth + 1):
+        found = sorted(d for d in level if (d / name).is_file())
+        if found:
+            return [d.relative_to(root).as_posix() or "." for d in found][:4]
+        below = []
+        for directory in level:
+            try:
+                below += sorted(child for child in directory.iterdir()
+                                if child.is_dir() and not child.name.startswith(".")
+                                and not child.is_symlink())
+            except OSError:
+                continue
+        level = below
+    return []
 
 
 def _cited(step: Step, root: Path) -> str:

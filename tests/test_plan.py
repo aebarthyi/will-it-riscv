@@ -573,6 +573,71 @@ def test_a_default_step_that_moves_an_option_off_its_default_is_sent_back(tmp_pa
         f"step 'configure': {moved}"]
 
 
+@needs_cmake
+def test_a_default_step_that_turns_on_a_gpu_backend_is_sent_back_whatever_it_cites(
+        tmp_path, target):
+    """spfft's README builds with -DSPFFT_GPU_BACKEND=CUDA, a set(... CACHE
+    STRING) whose default is OFF. A plan that copied it into the default step
+    stopped on CUDA, and nothing went back: the README said so, and the
+    option was not an option(). It goes back even when the configure dies
+    before it asks for anything."""
+    from will_it_riscv import dataset
+
+    (tmp_path / "README.md").write_text("cmake .. -DDEMO_GPU_BACKEND=CUDA\n")
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\nproject(demo NONE)\n"
+        'set(DEMO_GPU_BACKEND "OFF" CACHE STRING "GPU backend")\n'
+        'if(DEMO_GPU_BACKEND STREQUAL "CUDA")\n  message(FATAL_ERROR "no CUDA here")\nendif()\n'
+    )
+    readme = [{"at": "README.md:1", "quote": "cmake .. -DDEMO_GPU_BACKEND=CUDA"}]
+    result = run_plan(tmp_path, target, plan(
+        {"id": "configure", "kind": "cmake-configure",
+         "defines": {"DEMO_GPU_BACKEND": "CUDA"}, "evidence": readme},
+        {"id": "cuda", "kind": "cmake-configure", "defines": {"DEMO_GPU_BACKEND": "CUDA"},
+         "optional": True, "enabled_by": "-DDEMO_GPU_BACKEND=CUDA", "evidence": readme},
+    ))
+    configure, cuda = result.steps
+    assert configure.status == "failed"
+    assert configure.plan_check == [
+        "-DDEMO_GPU_BACKEND=CUDA moves the project's option from its default OFF "
+        "(CMakeLists.txt:3) to a GPU backend: a default step keeps the defaults, whatever "
+        "the instructions it cites build, so move it to an optional step"]
+    assert cuda.plan_check == []
+    assert f"step 'configure': {configure.plan_check[0]}" in dataset.plan_faults(result)
+    assert planrun._gpu_on("EXCHCXX_ENABLE_HIP", "ON") and planrun._gpu_on("USE_ACCEL", "cuda")
+    assert not planrun._gpu_on("NO_CUDA", "1") and not planrun._gpu_on("USE_GPU", "OFF")
+
+
+def test_a_configure_with_nothing_to_configure_says_where_the_project_is(tmp_path, target):
+    """branson's CMakeLists.txt is in src, and fckit's plan pointed a configure
+    at a .cmake script. Told only "no CMakeLists.txt in .", the model sent
+    the same step back three times."""
+    from will_it_riscv import dataset
+
+    (tmp_path / "src" / "test").mkdir(parents=True)
+    for where in ("src", "src/test"):
+        (tmp_path / where / "CMakeLists.txt").write_text("project(demo NONE)\n")
+    (tmp_path / ".hidden").mkdir()
+    (tmp_path / ".hidden" / "CMakeLists.txt").write_text("project(other NONE)\n")
+    result = run_plan(tmp_path, target, plan(
+        {"id": "configure", "kind": "cmake-configure", "evidence": []}))
+    (configure,) = result.steps
+    assert configure.detail == (
+        "no CMakeLists.txt in .; the project's shallowest CMakeLists.txt is in src: the "
+        "step's source is the directory whose CMakeLists.txt builds the project")
+    assert dataset.plan_faults(result) == [
+        f"step 'configure' could not run: {configure.detail}"]
+
+    (tmp_path / "CMakeLists.txt").write_text("project(demo NONE)\n")
+    (tmp_path / "cmake").mkdir()
+    (tmp_path / "cmake" / "wheels.cmake").write_text("# a script\n")
+    assert planrun._no_project(tmp_path, "cmake/wheels.cmake", "CMakeLists.txt") == (
+        "cmake/wheels.cmake is a file, not a directory with a CMakeLists.txt; the project's "
+        "CMakeLists.txt is at its root, source \".\"")
+    assert planrun._no_project(tmp_path / "src" / "test" / "nothing", "x", "meson.build") == (
+        "no meson.build in x")
+
+
 def test_a_plan_that_never_configures_the_project_goes_back(tmp_path, target):
     """qemu's plan of apt lines alone ran clean and answered yes: it looked
     packages up and nothing more. A configure, a driver of the project's

@@ -530,6 +530,18 @@ def _parse_trace(
                         options[declared[0]] = (
                             declared[2] if len(declared) > 2 else "OFF", site[0])
                 continue
+            if command == "set" and options is not None:
+                # set(SPFFT_GPU_BACKEND "OFF" CACHE STRING "GPU backend"): an
+                # option by another name. CMake's own, paths, and a FORCE no
+                # -D can move are not.
+                declared = [str(a) for a in event.get("args", [])]
+                if ("CACHE" in declared[1:] and "FORCE" not in declared
+                        and declared[0] not in options and not declared[0].startswith("CMAKE_")):
+                    at = declared.index("CACHE", 1)
+                    kind = declared[at + 1].upper() if len(declared) > at + 1 else ""
+                    site = _project_sites([event], prefixes) if kind in ("BOOL", "STRING") else []
+                    if site:
+                        options[declared[0]] = (";".join(declared[1:at]), site[0])
             if searches is not None and command in _SEARCH_COMMANDS:
                 found_args = [str(a) for a in event.get("args", []) if str(a).strip()]
                 if len(found_args) > 1:

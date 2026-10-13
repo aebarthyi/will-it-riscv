@@ -42,7 +42,8 @@ def merge(adapter: Path | None, base: str, out: Path) -> None:
     # and the converter's BPE path reads vocab.json and merges.txt.
     from huggingface_hub import snapshot_download
 
-    source = Path(snapshot_download(base, allow_patterns=TOKENIZER_FILES))
+    source = Path(base) if Path(base).is_dir() else Path(
+        snapshot_download(base, allow_patterns=TOKENIZER_FILES))
     for name in TOKENIZER_FILES:
         if (source / name).exists():
             shutil.copy(source / name, out / name)

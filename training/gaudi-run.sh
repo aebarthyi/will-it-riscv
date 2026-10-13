@@ -3,10 +3,10 @@
 # a crash. One card by default (two runs side by side); CARDS=2 runs DDP on both.
 #   CARD=0 training/gaudi-run.sh training/configs/qwen3-4b-gaudi-s0.yaml
 #   CARD=1 training/gaudi-run.sh training/configs/qwen3-4b-gaudi-s1.yaml
-# Runs go to $WILL_IT_RISCV_RUNS/<config name>/ (default ~/runs).
+# Runs go to $WIR_ROOT/runs/<config name>/ (WIR_ROOT: the big drive, default ~).
 cd "$(dirname "$0")/.."
-CONFIG=$1; TRIES=${TRIES:-4}; VENV=${VENV:-$HOME/venv-wir}
-export WILL_IT_RISCV_RUNS=${WILL_IT_RISCV_RUNS:-$HOME/runs} HF_HOME=${HF_HOME:-$HOME/hf}
+CONFIG=$1; TRIES=${TRIES:-4}; ROOT=${WIR_ROOT:-$HOME}; VENV=$ROOT/venv-wir
+export WILL_IT_RISCV_RUNS=$ROOT/runs HF_HOME=$ROOT/hf
 export PT_HPU_LAZY_MODE=${PT_HPU_LAZY_MODE:-1}
 if [ -n "${CARDS:-}" ]; then N=$CARDS; TAG=all; else
   export HABANA_VISIBLE_MODULES=${CARD:-0}; N=1; TAG=card${CARD:-0}; fi

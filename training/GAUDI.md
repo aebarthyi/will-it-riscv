@@ -33,13 +33,18 @@ two changes at once and no tuned Gaudi kernels for it.
 
 ## Steps
 
-Everything runs from this machine, with `GAUDI=user@host` (and `GAUDI_PORT`).
+Everything runs from this machine, with `GAUDI=user@host` (and `GAUDI_PORT`)
+and `GAUDI_ROOT` set to the box's 512 GB NVMe. Everything on the box lives
+under that root: the code, `venv-wir`, the HF cache `hf`, llama.cpp's converter,
+and `runs`. Runs stay there. This machine takes only logs, plus the adapter
+and GGUF of each checkpoint being scored.
 
 1. `training/gaudi.sh push`, then `training/gaudi.sh setup`. Setup needs a
    Python with Intel Gaudi's PyTorch (Intel's PyTorch container, or set
-   `SYS_PY`). It makes `~/venv-wir` beside it with transformers 5.17 and
-   peft 0.21, torch pinned so pip cannot replace it, and fetches both base
-   models into `~/hf`.
+   `SYS_PY`). It makes `venv-wir` beside it with transformers 5.17, peft 0.21
+   and sentencepiece, torch pinned so pip cannot replace it. It also fetches
+   llama.cpp's converter at the commit Lagutenko-4B's GGUF came from (b11177)
+   and both base models, and prints the drive's free space and the RAM.
 2. `training/gaudi.sh check`: HCCL between the cards, bf16 matmul TFLOPS, and
    FusedSDPA against plain causal attention, forward and backward. **If the
    attention check fails, nothing trains on `fused`**: hpu_attention passes
@@ -52,11 +57,20 @@ Everything runs from this machine, with `GAUDI=user@host` (and `GAUDI_PORT`).
    96), tokens_per_second, and how long the first step took (graph compiles).
    If compiling dominates, try `PT_HPU_LAZY_MODE=0` (eager) on the same smoke.
 4. The runs: cards 0 and 1 take s0 and s1; then s2 and the 8B. Compiled graphs
-   are cached a card (`~/runs/recipes-card<N>`), so a resume or the next seed
+   are cached a card (`runs/recipes-card<N>` under the root), so a resume or the next seed
    on that card skips the compiles. `stop CONFIG` stops one cleanly.
-5. `training/gaudi.sh pull CONFIG`: adapters and logs to /scratch/runs/<name>
-   (no optimizer state). `training/export.py <checkpoint>` writes the Q8_0 GGUF
-   here, on the CPU (8B: ~32 GB RAM to merge in fp32).
+5. `training/gaudi.sh pull CONFIG` brings a run's logs here.
+   `training/gaudi.sh export RUN/checkpoint-N` runs export.py on the box,
+   writing the Q8_0 GGUF beside the adapter (once). The 8B merges in fp32 on
+   the CPU and needs about 32 GB of RAM. Then the adapter and the GGUF come to
+   /scratch/runs/RUN/checkpoint-N, without optimizer state. Delete a scored
+   GGUF here when it is done (the box keeps its copy): /scratch has about
+   19 GB free.
+
+gaudi.sh was run end to end on this machine, with a stand-in for ssh and a
+scratch directory as the box: push, start (a CPU run through gaudi-run.sh),
+status, pull, export (the converter at b11177, then both files back, then no
+second conversion), and stop (only that config's processes, not its own shell).
 
 ## Choosing, then the holdout
 

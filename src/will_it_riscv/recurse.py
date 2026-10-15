@@ -11,8 +11,8 @@ Then the answer is built back up from the leaves:
 
   buildable   its own configure ran and completed, and everything under it
               is buildable
-  probably    its build could only be read -- Meson, Bazel, Cargo are not
-              configured yet -- and nothing under it is blocked
+  probably    its build could only be read -- setuptools, Bazel and Cargo
+              builds are not configured -- and nothing under it is blocked
   blocked     something it requires has nothing public for the target
   unknown     a configure stopped, a fetch failed, or the budget ran out
 

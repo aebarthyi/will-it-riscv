@@ -71,12 +71,15 @@ Wheel availability for riscv64 is real but thin. [manylinux gained
 `manylinux_2_39_riscv64` images in 2025][manylinux] and packages like `aiohttp`,
 `regex`, `markupsafe`, `charset-normalizer` and `rpds-py` publish riscv64 wheels
 today — but most of PyPI does not, and `pip install` on the target is a slow,
-serialized way to discover that. [uv cannot resolve for riscv64 at all][uv-issue].
+serialized way to discover that. [uv can resolve for riscv64][uv-riscv]
+(`--python-platform riscv64-unknown-linux`), but a resolution names versions;
+which of them must be compiled, and what each compile needs from the system,
+is still left to find out.
 
 The alternative is finding out one traceback at a time on an emulated board.
 
 [manylinux]: https://github.com/pypa/manylinux
-[uv-issue]: https://github.com/astral-sh/uv/issues/8889
+[uv-riscv]: https://github.com/astral-sh/uv/pull/15630
 
 ## Two modes
 
@@ -114,24 +117,22 @@ $ will-it-riscv ~/src/gromacs --pseudobuild
 ```
 ```
 Pseudobuild
-  configured as linux/riscv64, confined to an empty sysroot; configure completed over 3 rounds
-  in 23s — 24 dependency probes observed
-  rounds: OpenMP → FFTW → completed
-  blame by experiment: OpenMP ✓, FFTW ✓   (✓ the error moved once it existed; ✗ it did not,
-  so the stub was taken back out)
+  configured as linux/riscv64, confined to an empty sysroot; configure completed over 2 rounds
+  in 31s — 22 dependency probes observed
+  rounds: FFTW → completed
+  blame by experiment: FFTW ✓   (✓ the error moved once it existed; ✗ it did not, so the stub
+  was taken back out)
 
-  Will it riscv?  YES — every dependency a default build demands is in Debian 13 (trixie) for riscv64
+  Will it riscv?  YES — every dependency a default build demands is in Ubuntu 26.04 LTS
+                  (resolute) for riscv64
     sudo apt install libfftw3-dev    # the minimum a default configure demanded
-    OpenMP comes with the compiler (GCC's libgomp)
     shown by configuring, not compiling: the configure accepts a linux/riscv64 build given only these
 
   hard requirements, in the order the build demanded them:
-    1.  OpenMP  shown by experiment  cmake/gmxManageOpenMP.cmake:46        comes with the compiler
-    2.  FFTW    shown by experiment  cmake/gmxManageFFTLibraries.cmake:67  libfftw3-dev ✓
-  proven optional — absent, and the configure carried on (3): HDF5, ImageMagick, MPI
-  claimed by compile-only checks, unverifiable without a target linker: BLAS, LAPACK
-  located on this host, need untested: LATEX, UnixCommands
-  graph: 9 nodes, 9 edges — -f dot | dot -Tsvg > deps.svg
+    1.  FFTW  shown by experiment  cmake/gmxManageFFTLibraries.cmake:67  libfftw3-dev ✓
+  proven optional — absent, and the configure carried on (4): HDF5, ImageMagick, LATEX, MPI
+  claimed by compile-only checks, unverifiable without a target linker: BLAS, LAPACK, OpenMP
+  graph: 8 nodes, 8 edges — -f dot | dot -Tsvg > deps.svg
 ```
 
 **It configures for riscv64, not for the machine you run it on.** The
@@ -170,7 +171,7 @@ Everything is driven by what the configure itself said:
 | `Could not find FYPP_EXE using the following names: fypp` | a runnable `fypp` — `find_program(… REQUIRED)`, and the same for libraries and paths |
 | `(missing: … SSL Crypto)`, or `links to: OpenSSL::SSL but the target was not found` | the component's `OPENSSL_SSL_LIBRARY` |
 | `The following required packages were not found: - libpsl` | a `libpsl.pc` in the only directory pkg-config may search |
-| `Could not find a package configuration file provided by "Boost"` | a `BoostConfig.cmake` in the sysroot, which then grows each imported target the build links: `Boost::headers` |
+| `Could not find a package configuration file provided by "Boost"` | a `BoostConfig.cmake` in the sysroot, with `Boost::headers`, `Boost::boost` and a target for each component asked for; it grows any other imported target the build links once the configure names it missing |
 | `file failed to open for reading: …/proj.h` | that header, carrying every common spelling of a version macro |
 | `… are set to NOTFOUND … FOO_LIBRARY linked by target` | the variable a target links |
 | `linux/fs.h header not found` | the header — reported as a **host gap**, not a dependency: every riscv64 Linux system has it; the Mac SDK does not |
@@ -180,8 +181,8 @@ Everything is driven by what the configure itself said:
 | `… provided by "QT" with any of the following names: Qt6Config.cmake …` | `Qt6Config.cmake`, the first name searched. A stub whose name ends in its major version (Qt6, Eigen3, SDL2) claims that major, `6.99.9`, and each component gets its own `Qt6Core_VERSION` |
 
 **Blame by experiment.** Some configures die without naming anything.
-GROMACS narrates `-- Could NOT find OpenMP` and then fails in its own words;
-its FindFFTW never says "Could NOT find" at all. So the loop suspects the
+GROMACS's FindFFTW never says "Could NOT find" at all; the configure fails
+in GROMACS's own words, `Cannot find FFTW 3`. So the loop suspects the
 misses nearest the error — first any the error message mentions by name, then
 the find_packages the trace saw it name — and stubs the likeliest the way its
 own Find module looked for it: the trace records every `find_library`,
@@ -195,23 +196,34 @@ trace of the stub is taken back out, so a later round cannot find it, and the
 next suspect is tried — at most three per stuck point.
 
 Status misses are never stubbed on sight — faking an optional dependency
-would erase the very evidence that it is one — and nothing is ever written
-outside the scratch directory.
+would erase the very evidence that it is one — and nothing a configure sees
+is ever written outside the scratch directory.
 
 **An agent for the long tail (opt-in, experimental).** When the rules run out
-of suspects, `WILL_IT_RISCV_UNBLOCK=claude` (or `claude:<model>`) hands the
-stuck point to Claude through `claude -p`, with a workbench served over MCP.
+of suspects, `WILL_IT_RISCV_UNBLOCK=claude` (Sonnet, or `claude:<model>`)
+hands the stuck point to Claude through `claude -p`, with a workbench served
+over MCP.
 It reads: the error, the trace around the line that raised it, what each
 Find module searched for, the source tree and CMake's modules. It writes stub
-files inside the sysroot and sets lookup-result cache variables. It is never
-allowed the source tree, a build option, the plan's `-D` flags or `CMAKE_*`.
-It can rerun the configure a few times. Its stubs come back as a trial like
-any other: if the executor's next round shows the error moved, they stay,
-and if not, they are taken back out. An agent that finds the plan at fault
-(the configure insists on a flag the plan does not give) or something no
-stub can be leaves a note instead. Each session's prompt, transcript and
-stubs are kept under `$WILL_IT_RISCV_UNBLOCK_LOG`. `$WILL_IT_RISCV_UNBLOCK_BUDGET`
-caps the dollars per session.
+files inside the sysroot, and sets cache variables a lookup would have
+filled: a find result, a check's `HAVE_*`, a version, a package's `_DIR`, or
+an install location the error asks for by name — never a path on the host.
+It is never allowed the source tree, a build option, the plan's `-D` flags
+or `CMAKE_*`. It can rerun the configure up to eight times. Its stubs come
+back as a trial like any other: if the executor's next round shows the error
+moved, they stay, and if not, they are taken back out. An agent that finds
+the plan at fault (the configure insists on a flag the plan does not give)
+or something no stub can be (a CUDA toolkit, which is then a hard
+requirement) leaves a note instead.
+
+A configure gets at most six sessions, each capped at $2
+(`$WILL_IT_RISCV_UNBLOCK_BUDGET`) and 20 minutes, and their time is not
+counted against `--pseudobuild-timeout`. Each session's prompt, transcript
+and stubs are kept under `$WILL_IT_RISCV_UNBLOCK_LOG` (default
+`~/.cache/will-it-riscv/unblock`), and so is what it found: a later run that
+meets the same stuck point gets the same stubs back without a new session,
+and a trial that failed is forgotten. `WILL_IT_RISCV_UNBLOCK=replay` uses
+only what earlier sessions found, and never starts one.
 
 ### The dependency graph, and the answer
 
@@ -239,15 +251,15 @@ the configure REQUIRED — against the distro's riscv64 archive:
 | **yes** | the configure completes as a linux/riscv64 build, and the archive has everything it demanded |
 | **probably** | it completes, but a name could not be matched to a package, the archive was not checked, or it only configured for the host |
 | **no** | a hard requirement has no riscv64 package: it has to be built first |
-| **unknown** | the configure stopped somewhere no stub gets past, and says where |
+| **unknown** | the configure stopped somewhere no stub gets past, or ran out of time, and says where |
 
 | repo | static | pseudobuild | hard requirements | will it riscv? |
 | --- | --- | --- | --- | --- |
-| gdal | 297 required / 4 optional | **202 / 99** | PROJ | yes — `libproj-dev` |
-| curl | 47 / 1 | **29 / 19** | OpenSSL, libpsl | yes — `libssl-dev libpsl-dev` |
+| gdal | 315 required / 4 optional | **221 / 98** | PROJ, and SWIG to build with | yes — `libproj-dev swig` |
+| curl | 48 / 1 | **30 / 19** | OpenSSL, libpsl | yes — `libssl-dev libpsl-dev` |
 | opencv | 60 / 13 | **22 / 51** | none — it bundles every codec | yes |
-| gromacs | 20 / 0 | **13 / 7** | OpenMP, FFTW (by experiment) | yes — `libfftw3-dev` |
-| adaptivecpp | 13 / 6 | 13 / 6 | — | unknown: it stops wanting clang's own headers |
+| gromacs | 20 / 0 | **13 / 7** | FFTW (by experiment) | yes — `libfftw3-dev` |
+| adaptivecpp | 13 / 6 | **12 / 8** | LLVM, llc (by experiment) | yes — `llvm-dev` |
 
 "Yes" means the configure accepts a riscv64 build given only those packages.
 It does not mean the code compiles: the pseudobuild never runs the compiler
@@ -255,9 +267,9 @@ on the project.
 
 **This runs the project's build scripts.** Everything else in this tool only
 reads. Use it on repositories you trust, ideally in a container. It is
-opt-in, time-bounded (`--pseudobuild-timeout` bounds the whole loop), confined to a
-temporary directory that is deleted afterwards, and never invokes the compiler
-on the project itself.
+opt-in, time-bounded (`--pseudobuild-timeout`, 20 minutes, bounds the whole
+loop, agent sessions aside), confined to a temporary directory that is
+deleted afterwards, and never invokes the compiler on the project itself.
 
 **Its compile checks are the host's.** There is no riscv64 compiler in the
 loop: the host's compiler answers `check_include_file` and friends, against
@@ -273,7 +285,7 @@ says so.
 
 A repository's build is rarely one configure. `./mfc.sh build` installs a
 Python toolchain, builds FFTW, HDF5, SILO and LAPACK from source through
-`toolchain/dependencies`, and then configures three targets with flags that
+`toolchain/dependencies`, and then configures four targets with flags that
 `toolchain/mfc/build.py` assembles. `--plan` runs a plan: that sequence written
 down as data, one typed step at a time.
 
@@ -284,16 +296,17 @@ $ will-it-riscv ~/src/MFC --plan examples/plans/mfc.json
 Steps
   ✓ ci-packages              system-packages  12 packages
   ✓ fortran                  system-packages  1 package
-  ✓ toolchain                python-install   115 packages resolved, 1 with nothing for riscv64
+  ✓ toolchain                python-install   114 packages resolved, 1 with nothing for riscv64
   ✓ dep-fftw                 cmake-configure  1 round: nothing required
   ...
   ✓ simulation               cmake-configure  4 rounds: fypp → MPI → FFTW
   ✓ post_process             cmake-configure  7 rounds: fypp → MPI → SILO → HDF5 → FFTW → LAPACK
+  ✓ syscheck                 cmake-configure  3 rounds: fypp → MPI
   ✗ simulation-gpu-acc       cmake-configure  CMake Error at CMakeLists.txt:92 (message): ERROR: MFC
                                               with GPU processing is not currently compatible with GNU
                                               compilers.  Please use NVIDIA or Cray compilers.
                                               (optional: ./mfc.sh build --gpu acc)
-  ✓ build                    python-run       imported 14 of the 115 packages the plan installs;
+  ✓ build                    python-run       imported 14 of the 114 packages the plan installs;
                                               called build tools 24 times
     plan check: ran 8 configures; 8 of the plan's 8 cmake steps match
 
@@ -304,20 +317,29 @@ Steps
     • pypi:jaxlib    publishes binary wheels, but none for riscv64 (...)
       toolchain → pyrometheus → jaxlib   · installed by default with pyrometheus; the build step
                                            itself never loads it
-  required, and only source for the target (18)
-    • pypi:numpy     publishes binary wheels, but none for riscv64 (...); Debian 13 (trixie)
-                     ships python3-numpy for riscv64
+  required, and only source for the target (17)
+    • pypi:numpy     publishes binary wheels, but none for riscv64 (...); Ubuntu 26.04 LTS
+                     (resolute) ships python3-numpy for riscv64
       toolchain → numpy   · the build step imports it
     ...
     of these, the build step itself imports 3: cantera, numpy, pyyaml — the rest are installed
     by default all the same
-  optional — only with an extra flag or choice
-    ./mfc.sh build --gpu acc:  step 'simulation-gpu-acc' failed: ... Please use NVIDIA or Cray compilers.
   provided by the plan itself (5)
     • FFTW           provided by step 'dep-fftw'
     • fypp           provided by step 'toolchain'
     ...
+  sudo apt install cmake g++ gcc gfortran hdf5-tools libblas-dev libfftw3-dev libhdf5-dev
+    liblapack-dev libopenmpi-dev openmpi-bin python3 python3-dev
+  how the 133 requirements are known: 6 shown by a configure, 114 declared by the project, 0 asked
+  for by a configure that stopped, 13 only named by the plan's package lists
+  note — optional: only with an extra flag or choice
+    ./mfc.sh build --gpu acc:  step 'simulation-gpu-acc' failed: ... Please use NVIDIA or Cray compilers.
+  note — optional in the configures: absent, and they carried on (4): blas, event_core, hwloc, libz
 ```
+
+The answer is the pseudobuild's yes, probably, no or unknown, with one
+more: *yes, after source builds*, when every default step completes once
+what has only source for the target is built first.
 
 | step kind | how it is answered |
 | --- | --- |
@@ -345,7 +367,7 @@ coloured by how it can be had, with a dashed edge from whichever step
 provides it (`-f dot` gives the same graph to Graphviz).
 
 **What the build step imports is worth knowing.** `./mfc.sh build` installs
-115 Python packages and then hands over to `toolchain/main.py`, which loads
+114 Python packages and then hands over to `toolchain/main.py`, which loads
 its modules lazily. So which of them the build step itself loads has an
 exact answer: run the driver and watch. It runs in a copy-on-write clone of the repository,
 with `HOME` in scratch, and with cmake, make, the compilers and MPI wrappers
@@ -355,7 +377,7 @@ version the plan resolved, or, if the plan provides nothing for it, stubbed;
 then it runs again, the way a configure is unblocked. It sees only the
 standard library and what it was given, never this tool's own packages.
 
-MFC's build step imports 14 of the 115 — pyrometheus among them, which it
+MFC's build step imports 14 of the 114 — pyrometheus among them, which it
 uses to generate `m_thermochem.f90` — and never jax or jaxlib; its driver ran
 exactly the 8 configures the plan lists, with the same `-DMFC_*` flags.
 
@@ -406,20 +428,32 @@ Linting and formatting scripts go last. Anything that doesn't fit the
 budget (about 20k tokens) is named as not shown.
 
 **Every answer is checked, and what is wrong goes back.** The answer might
-not be JSON, the plan format might refuse a step, a quote might not be on
-the lines cited, or a citation might point to a line the pack never
-showed. Each problem goes back as a sentence, and the model writes the
-plan again. The model only plans; the executor judges, so a bad plan costs
-a round, not a wrong verdict.
+not be JSON, the plan format might refuse a step, a quote might be nowhere
+in the pack, or a citation might point to a line the pack never showed.
+Each problem goes back as a sentence, and the model writes the plan again,
+with three attempts in all. A quote the pack does show, on other lines than
+the ones cited, is not a problem: the citation is moved to where the quote
+is. The model only plans; the executor judges, so a bad plan costs a round,
+not a wrong verdict.
 
 **Every plan that holds is run, and what the run shows goes back too**, as
-it does in labelling and evaluation. A run can show three kinds of mistake:
-a manifest or directory that isn't there, a package name the distro has
-never had on any architecture (with the nearest names it does have), or a
-compiler left as a placeholder (`${FC}`) that stopped the configure. Each
-goes back the same way. A configure that stops for any other reason is the
-build's answer, so it is reported, not sent back. The report is the run the
-last plan was accepted on. On the held-out split this feedback took the
+it does in labelling. A run can show these mistakes, and each goes back the
+same way:
+- a manifest that isn't there, or a configure pointed at a directory with
+  nothing to configure (saying where the project's `CMakeLists.txt` is);
+- a package name the distro has never had on any architecture, with the
+  nearest names it does have;
+- a compiler left as a placeholder (`${FC}`) that stopped the configure;
+- a driver that configured something the plan does not list, or a plan
+  step the driver never configured;
+- a default step that moves an option from its default without citing why,
+  or turns on a GPU backend;
+- a `CMakeLists.txt` or `meson.build` at the root that no default step
+  configures.
+
+A configure that stops for any other reason is the build's answer, so it is
+reported, not sent back. The report is the run the last plan was accepted
+on. On the held-out split this feedback took the
 fine-tuned 4B planner's verdicts from 0.825 to 0.925; on 60 fresh
 repositories it left them at 0.867 and raised what its plans require a
 little. It matters most for weaker planners: the base Qwen3-4B goes from
@@ -433,14 +467,17 @@ constrains every backend:
 | `--planner` | what writes the plan |
 | --- | --- |
 | `local` | the fine-tuned planner, run by llama.cpp on this machine (**the default**; both fetched the first time). `--model planner.gguf` runs another GGUF instead |
-| `claude` | Claude Code's `claude -p` when it is installed (tools off, `--json-schema`, no API key needed), else the Claude API (the `teacher` extra, `ANTHROPIC_API_KEY`). `--model sonnet` or `opus` |
-| `openai` | any OpenAI-compatible server, such as vLLM, llama.cpp or Ollama, with the schema as `response_format` (`--planner-url`, `--model`) |
+| `claude` | Claude Code's `claude -p` when it is installed (tools off, `--json-schema`, no API key needed; `--model sonnet` or `opus`, the default), else the Claude API (the `teacher` extra, `ANTHROPIC_API_KEY`; `--model` takes a model id) |
+| `openai` | any OpenAI-compatible server, such as vLLM, llama.cpp or Ollama, with the schema as `response_format` (`--planner-url` and `--model`; `$PLANNER_API_KEY` if it wants a key) |
 
 `claude-cli`, `anthropic` and `llama-server` name one backend exactly.
+Without `--planner`, a `--planner-url` means `openai`, and a `--model` that
+is not a `.gguf` file means `claude`.
 
-The fine-tuned planner is one GGUF file: Qwen3-4B-Instruct-2507, tuned on
-the teacher's verified plans, which `training/export.py` writes from the
-adapter. It is published as
+The fine-tuned planner is one GGUF file, which `training/export.py` writes
+from the adapter: Qwen3-4B-Instruct-2507, tuned on the teacher's verified
+plans and on a quiz about how real builds find their dependencies (both
+below). It is published as
 Lagutenko-4B, [`aebarthyi/lagutenko-4B`](https://huggingface.co/aebarthyi/lagutenko-4B).
 The first `plan` downloads it into the data directory
 (`$WILL_IT_RISCV_DATA`, else `~/.local/share/will-it-riscv`), picking up
@@ -457,12 +494,11 @@ chat template. `$LLAMA_SERVER_ARGS` is added at the end, so
 
 **A dataset of verified plans.** `will-it-riscv-dataset` labels a corpus
 with a teacher and verifies each label by running the plan. Anything that
-fails because of the plan goes back to the teacher: a manifest that isn't
-there, a configure pointed at a directory with nothing to configure, or a
-driver that configured something the plan doesn't list. A configure that
-stops is the build's own answer, not the plan's fault. Each example keeps
-its pack, plan, transcript and run, and the verified ones export as
-chat-format JSONL: the pack in, the plan out.
+fails because of the plan goes back to the teacher: the same mistakes a run
+sends back to a planner, above. A configure that stops is the build's own
+answer, not the plan's fault. Each example keeps its pack, plan, transcript
+and run, and the verified ones export as chat-format JSONL: the pack in,
+the plan out.
 
 ```console
 $ will-it-riscv-dataset seed-pypi --top 3000 --want 350 --to examples/corpus/pypi.jsonl
@@ -470,15 +506,39 @@ $ will-it-riscv-dataset label --corpus examples/corpus/repos.jsonl --out data/re
 $ will-it-riscv-dataset export --out data/repos --to data/sft
 ```
 
-`examples/corpus` holds two corpora:
+The other subcommands look after a labelled set. `relabel` lets the default
+configures mark each package a plan states as required or optional;
+`revise` sends verified labels back to the teacher with what running them
+shows; `rerun` runs them again on today's executor, or against another
+`--distro`; `check` finds each example's tree and rebuilds its pack; and
+`status` says how far a run has got and what it cost. Labelling runs
+against Debian 13 (`debian:trixie`), whatever `plan`'s default.
+
+`examples/corpus` holds four corpora:
 - `pypi.jsonl`: 309 of the 3000 most-downloaded PyPI projects that compile
   and have no riscv64 wheel;
 - `repos.jsonl`: 45 source repositories whose build is a script, a
   toolchain or a CI recipe (MFC, GROMACS, LAMMPS, CP2K, GDAL, OpenCV, jax,
-  XLA, CPython, …).
+  XLA, CPython, …);
+- `repos-large.jsonl`: 166 more, from desktop applications to HPC codes
+  (Audacity, Blender, darktable, …);
+- `repos-spack-2.jsonl`: 120 projects from Spack's package repository.
 
-One in ten entries is held out by a hash of its name, and five
-script-driven repositories are pinned to the held-out set.
+One in ten entries is held out by a hash of its name, unless the entry
+names its split: five script-driven repositories in `repos.jsonl` and four
+in `repos-large.jsonl` are pinned to the held-out set, and every entry in
+`repos-spack-2.jsonl` names its own (70 held out, 50 for training).
+
+**A quiz, answered by the builds themselves.** `will-it-riscv-quiz build`
+configures the dataset's CMake projects, plainly and then with each option
+that guards a lookup turned on, and writes down what CMake did with each
+dependency: required, optional, or never asked for. It also asks which
+Debian packages make a `find_package` succeed, answered from Debian's
+Contents index. No model writes an answer. `ask` puts the questions to a
+served model and scores it, `export` writes them as chat JSONL, and
+`sample` draws a small balanced set for people to take. Questions inherit
+the split of their repository. 792 of them are among the planner's 1,266
+training examples.
 
 A pilot of eight repositories, with Opus as the teacher through
 `claude -p`, gave 8 verified plans for $2.45. Six were right first time.
@@ -498,19 +558,42 @@ from:
   softly (package lists by overlap, configures by directory and `-D`
   flags);
 - agreement on which steps are optional, and on ordering;
-- with `--execute`, whether running it reaches the same verdict and
-  requires the same things.
+- with `--execute`, whether running it reaches the same verdict (`verdict`)
+  and requires the same things: what the runs show is needed (`required`),
+  and everything the plans name, package lists included (`req_all`);
+- what it cost: thousands of tokens, the same less what a prompt cache gave
+  back, and dollars where the backend says.
 
-The baselines are `autoplan`, the build-file reader recursion uses, and
-`teacher-first`, the teacher's plan before any of it was sent back. On
-the pilot's three held-out repositories, autoplan finds 19% of the steps.
-The teacher's first plans were all accepted as written, so they match
-their references by construction; that baseline only means something
-where revisions happened.
+Each planner gets a row over every repository, then one for script-driven
+repositories and one for PyPI packages. The baselines are `autoplan`, the
+build-file reader recursion uses, and `teacher-first`, the teacher's plan
+before any of it was sent back. On the pilot's three held-out repositories,
+autoplan finds 19% of the steps. The teacher's first plans were all
+accepted as written, so they match their references by construction; that
+baseline only means something where revisions happened.
 
 ```console
 $ will-it-riscv-eval --out data/repos --planner openai --planner-url http://localhost:8000/v1 --planner-model qwen3-8b-plans
 ```
+
+A planner gets one attempt unless `--rounds` gives it more, and a run's
+mistakes go back only with `--execute --run-feedback`: `--rounds 3
+--execute --run-feedback` is what `plan` does.
+`--planner` takes `claude-cli`, `anthropic` and `openai` as above, `agent`
+for a model that plans with tools (Claude through `claude -p`, or a model
+at `--planner-url`), and `saved` to rescore the answers an earlier run kept
+with `--transcripts`. `--unblock claude` hands the configures the rules
+cannot get past to the agent, and counts what it spends. Runs go against
+`--distro debian:trixie` unless told otherwise, and the references must
+have been run against the same archive (`will-it-riscv-dataset rerun
+--distro`).
+
+`bench/board.py` sets `--json` files from several evals side by side, over
+only the examples every planner scored, and `--against PLANNER` adds each
+other planner's paired difference from it with a 95% bootstrap interval.
+`bench/dev.txt` is a fixed dev set from the training split (30 repositories,
+10 PyPI packages), for working on the harness without touching the
+held-out set.
 
 ### Recursion: down the tree, and back up
 
@@ -528,11 +611,11 @@ $ will-it-riscv ~/src/MFC --plan examples/plans/mfc.json --recurse
 ```
 ```
 Recursion
-  fetched 20 packages and configured 9, in 148s
+  fetched 19 packages and configured 9, in 181s
   MFC
-  ├─ ✓ cantera 3.2.0  buildable — its configure completed: Python → Boost → BLAS → HDF5   [sdist cantera-3.2.0.tar.gz]
+  ├─ ✓ cantera 3.2.0  buildable — its configure completed: Python → Boost → BLAS → HDF5 → LAPACK   [sdist cantera-3.2.0.tar.gz]
   │  │    installed first: libboost-all-dev, libhdf5-dev, liblapack-dev, libopenblas-dev, the target's Python (python3-dev)
-  │  └─ ✓ numpy 2.5.3  buildable — its configure completed: cython   [sdist numpy-2.5.3.tar.gz]
+  │  └─ ✓ numpy 2.5.4  buildable — its configure completed: cython   [sdist numpy-2.5.4.tar.gz]
   ├─ ✓ contourpy 1.4.0  buildable — its configure completed: pybind11   [sdist contourpy-1.4.0.tar.gz]
   ├─ ~ ffmt 0.4.5  probably — read, not configured: builds with cargo   [sdist ffmt-0.4.5.tar.gz]
   │       installed first: cargo, rustc
@@ -549,23 +632,26 @@ Recursion
   │  │       installed first: g++, openjdk-21-jdk-headless, python3, unzip
   │  ├─ ✓ ml-dtypes 0.6.0  buildable — its configure completed: Python   [sdist ml_dtypes-0.6.0.tar.gz]
   │  │  │    installed first: the target's Python (python3-dev)
-  │  │  └─ ✓ numpy 2.5.3  (above)
-  │  ├─ ✓ numpy 2.5.3  (above)
+  │  │  └─ ✓ numpy 2.5.4  (above)
+  │  ├─ ✓ numpy 2.5.4  (above)
   │  └─ ✓ scipy 1.18.1  buildable — its configure completed: cython → pythran → numpy → pybind11 → OpenBLAS
   │     │    installed first: libopenblas-dev
-  │     └─ ✓ numpy 2.5.3  (above)
+  │     └─ ✓ numpy 2.5.4  (above)
   ├─ ✓ matplotlib 3.11.2  buildable — its configure completed: pybind11   [sdist matplotlib-3.11.2.tar.gz]
   ├─ ...
-  ├─ ~ orjson 3.12.0  probably — read, not configured: builds with cargo   [sdist orjson-3.12.0.tar.gz]
-  │       installed first: cargo, rustc (rustup)
   ├─ ✓ pandas 3.0.6  buildable — its configure completed: cython   [sdist pandas-3.0.6.tar.gz]
-  ...
+  ├─ ...
+  ├─ ~ ruff 0.6.5  probably — read, not configured: builds with cargo   [sdist ruff-0.6.5.tar.gz]
+  │       installed first: cargo, rustc
+  ├─ ...
+  └─ ~ typos 1.51.1  probably — read, not configured: builds with cargo   [sdist typos-1.51.1.tar.gz]
+          installed first: cargo, rustc (rustup)
 
   build order, dependencies first:
-    numpy 2.5.3 → cantera 3.2.0 → contourpy 1.4.0 → ffmt 0.4.5 → h5py 3.16.0 → imageio-ffmpeg 0.6.0 →
+    numpy 2.5.4 → cantera 3.2.0 → contourpy 1.4.0 → ffmt 0.4.5 → h5py 3.16.0 → imageio-ffmpeg 0.6.0 →
     bazel-bootstrap 8.7.0 → ml-dtypes 0.6.0 → scipy 1.18.1 → jaxlib 0.11.2 → matplotlib 3.11.2 → ...
 
-  Will it riscv, all the way down?  PROBABLY — after building 20 packages from source, some of them only
+  Will it riscv, all the way down?  PROBABLY — after building 19 packages from source, some of them only
   read, not configured
 ```
 
@@ -580,11 +666,11 @@ The build order is a post-order walk of the tree, dependencies first, and
 that order is the port plan. *Installed first* is what each package's own
 plan found it needs before it can be built, beyond the Python packages
 already in the tree. That means archive packages, the target's Python, and
-any tool the archive has too old. orjson and typos declare `rust-version =
-"1.95"` and Debian 13 has rustc 1.85, so those two get rustc from rustup.
-ruff asks for 1.76, and Debian's rustc is enough.
+any tool the archive has too old. typos declares `rust-version = "1.95"`
+and Ubuntu 26.04 has rustc 1.93, so it gets rustc from rustup. ruff asks
+for 1.76, and Ubuntu's rustc is enough.
 
-Nine of the twenty configure for real: cantera and ml-dtypes with CMake,
+Nine of the nineteen configure for real: cantera and ml-dtypes with CMake,
 and numpy, scipy, matplotlib, pandas, contourpy, scikit-image and siphash24
 with Meson (below). jaxlib builds with Bazel, which is read rather than run,
 and the Bazel it needs is followed to its own source (below that).
@@ -606,14 +692,16 @@ isolation would have given them:
 - **What they fetch is theirs.** cantera's configure fetches yaml-cpp,
   Eigen and SUNDIALS with FetchContent. Each is downloaded once per run,
   not once per round. yaml-cpp asks for a CMake older than 3.5, which
-  CMake 4 refuses and Debian 13's CMake 3.31 still accepts. That is a gap
-  in the host's CMake, not a dependency, so the configure is rerun with
-  `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` (CMake's own suggested fix) and a
-  note says so.
-- **What the host only pretends to have is not there.** pyenv's shims
-  are dropped from the configure's PATH: a shim exists for every program
-  any installed Python has, and fails when the active one has none, so a
-  configure would find a `cython` that only says "command not found".
+  CMake 4 refuses. The configures run Debian 13's CMake, 3.31, which this
+  tool installs and which still accepts it (`$WILL_IT_RISCV_CMAKE` names
+  another). Where the CMake that runs is 4 or later, the configure is rerun
+  with `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` (CMake's own suggested fix) and
+  a note says so. Ubuntu 26.04 ships CMake 4.2, so a build there meets the
+  same refusal.
+- **What the host only pretends to have is not there.** pyenv's and asdf's
+  shims are dropped from the configure's PATH: a shim exists for every
+  program any installed Python has, and fails when the active one has none,
+  so a configure would find a `cython` that only says "command not found".
 - **What steers the host's own builds stays with the host.** A
   configure's PATH holds only the system's directories and this Python's.
   With `/opt/rocm/bin` on it, PyTorch's configure said "ROCm enabled"; a
@@ -621,7 +709,7 @@ isolation would have given them:
   `CFLAGS`, `CPATH`, `LIBRARY_PATH`, `CMAKE_PREFIX_PATH` and the like are
   left out as well. If the system has no compiler at all, as on an HPC
   login node with a compiler module loaded, that compiler's directory is
-  kept.
+  kept, and the same goes for `make`, `ninja`, `pkg-config` and `git`.
 - **What needs a linker is answered for the target.** FortranCInterface
   links a program of C and Fortran to prove the two compilers agree, and
   nothing links here. On the target gcc and gfortran do agree, so the
@@ -635,7 +723,8 @@ isolation would have given them:
 **This runs the configures of everything it fetches.** They are third-party
 build scripts, run on this host: confined to a scratch sysroot, never
 compiled, never emulated, but run. `--recurse` is opt-in and bounded by
-`--recurse-depth` (3) and `--recurse-limit` (40 packages).
+`--recurse-depth` (3) and `--recurse-limit` (40 packages); `will-it-riscv
+plan --recurse` keeps those defaults.
 
 ### The graph, to explore
 
@@ -648,7 +737,7 @@ hidden; so is what a configure looked for and did without. Click a node for
 why the build needs it — the chain from a step down to it — what settled it,
 and the lines the plan cited. Python packages that have wheels for the
 target, and lead to nothing that does not, fold into one node a step: MFC's
-toolchain brings in 83 of them. With `--recurse`, a package built from
+toolchain brings in 84 of them. With `--recurse`, a package built from
 source carries its recursion: its status, its source, its place in the build
 order. It pans, zooms, searches, and follows the system's light or dark
 theme. `--graph deps.svg` writes the same picture, still.
@@ -664,8 +753,9 @@ does after a configure. It is written by code from the plan the run held up,
 not by the model, and every value the plan carries goes into it quoted. Run
 it on the riscv64 machine, from the checkout. In order, it:
 
-1. checks the machine and the distro are the ones planned for
-   (`ANY_ARCH=1` to run it elsewhere);
+1. checks the machine is the one planned for (`ANY_ARCH=1` to run it
+   elsewhere), says so if the distro is not, and checks it was started
+   from the checkout;
 2. installs everything the build needs from the archive, in one
    `apt-get install`;
 3. installs Rust with rustup where the archive's is too old;
@@ -673,7 +763,9 @@ it on the riscv64 machine, from the checkout. In order, it:
    Ubuntu refuse pip installs into the system's Python;
 5. builds what the target has only as source, dependencies first. When the
    build needs any, writing the script turns `--recurse` on to find them and
-   the order;
+   the order. pip builds the Python packages; a tool such as Bazel, whose
+   bootstrap was read and not run, has no recipe, so the script stops
+   until it is on the PATH;
 6. runs the plan's steps in order: pip installs, CMake and Meson configures
    each built and installed into `$PREFIX`, and the project's own driver.
    A driver runs the configures it was seen to run, and pip's build runs
@@ -681,10 +773,13 @@ it on the riscv64 machine, from the checkout. In order, it:
    leaves those to them.
 
 `DRY_RUN=1` prints every command and runs none; `SKIP_APT=1` skips the
-packages; `PREFIX`, `WORK` and `JOBS` say where and how wide; an optional
-step runs with `WITH_<STEP>=1` (MFC's `WITH_SIMULATION_GPU_ACC=1`). nlopt's
-script, run on x86_64 with `ANY_ARCH=1 SKIP_APT=1`, configures, builds and
-installs `libnlopt.so` in 11 seconds.
+packages; `SRC` is the checkout (the current directory), `WORK` the build
+directories (`$SRC/_riscv`), `PREFIX` where everything is installed
+(`$WORK/install`), `VENV` the virtual environment (`$WORK/venv`), and
+`JOBS` how wide (`nproc`); an optional step runs with `WITH_<STEP>=1`
+(MFC's `WITH_SIMULATION_GPU_ACC=1`). nlopt's script, run on x86_64 with
+`ANY_ARCH=1 SKIP_APT=1`, configures, builds and installs `libnlopt.so` in 11
+seconds.
 
 ### Meson builds are set up the same way
 
@@ -696,26 +791,28 @@ empty sysroot, set up in a copy-on-write clone of the tree because Meson
 writes into it, and unblocked round by round. The Meson is the one the
 project ships, if it names one, else the build requirement's version, else
 Debian 13's (1.7, a dependency of this tool): qemu wants 1.6, libvips 1.4,
-and an older host Meson stops both before they ask for anything.
+and an older host Meson stops both before they ask for anything. A project
+that wants newer still (vlc asks for 1.10) gets a Meson from PyPI that
+meets its `meson_version`, and a note says so.
 
 ```console
 $ will-it-riscv ~/src/numpy --pseudobuild
 ```
 ```
 Pseudobuild
-  configured as linux/riscv64, confined to an empty sysroot; configure completed over 2 rounds in 17s
+  configured as linux/riscv64, confined to an empty sysroot; configure completed over 2 rounds in 16s
   — 8 dependency probes observed
   rounds: cython → completed
   note: configured with the Meson it ships (vendored-meson/meson/meson.py)
 
-  Will it riscv?  YES — every dependency a default build demands is in Debian 13 (trixie) for riscv64
+  Will it riscv?  YES — every dependency a default build demands is in Ubuntu 26.04 LTS (resolute)
+                  for riscv64
     cython comes with its Python build requirements (pip)
     shown by configuring, not compiling: the configure accepts a linux/riscv64 build given only these
 
   hard requirements, in the order the build demanded them:
     1.  cython  stopped the configure    comes with its Python build requirements
-  proven optional — absent, and the configure carried on (2): blis, flexiblas
-  claimed by compile-only checks, unverifiable without a target linker: blas, lapack
+  proven optional — absent, and the configure carried on (4): blas, blis, flexiblas, lapack
   graph: 5 nodes, 5 edges — -f dot | dot -Tsvg > deps.svg
 ```
 
@@ -727,6 +824,7 @@ Pseudobuild
 | `C header 'foo.h' not found` | that header, carrying version macros |
 | `ModuleNotFoundError` in a script Meson ran | the module: pandas' `generate_version.py` imports versioneer, matplotlib runs `python -m setuptools_scm` |
 | `Problem encountered: …` | blame by experiment, as for CMake |
+| `Meson version is 1.7.2 but project requires >= 1.10` | a Meson from PyPI that meets it, installed for the host, once |
 
 The cross file gives Meson this host's compilers with `needs_exe_wrapper =
 false`, which is the Meson equivalent of the CMake loop's pass-through
@@ -754,15 +852,16 @@ things it downloads prebuilt:
 | wheels, `pip.parse(download_only = True, target_platforms = [...])` | whether the target is listed; if not, what `local_wheels` lets `dist/` supply. Those wheels are built first: numpy, scipy and ml-dtypes, already in the tree. The wheels the repository builds itself, jax and jaxlib, are left out |
 
 The build Bazel itself needs is the other half. jax pins Bazel 8.7.0 in
-`.bazelversion`, and Debian 13 has 4.2.3 for riscv64. So the recursion
-follows `bazel-bootstrap` upstream: a 2 MB sparse checkout of the `8.7.0`
-tag, just `compile.sh` and `scripts/bootstrap/`. It reads what the bootstrap
-needs from those scripts: `JAVA_VERSION=${JAVA_VERSION:-21}`, the `unzip`
-in its tool check, rules_python's autodetecting toolchain, `-std=c++17`.
-Each of those is checked against the archive. compile.sh builds Bazel with
-itself, so it is read, not run. jax's `build.py` downloads Bazel only for
-x86_64 and aarch64 Linux, macOS and Windows; anywhere else it takes
-`--bazel_path`, which is where the bootstrapped one goes.
+`.bazelversion`, and Ubuntu 26.04, like Debian 13, has 4.2.3 for riscv64.
+So the recursion follows `bazel-bootstrap` upstream: a 2 MB sparse checkout
+of the `8.7.0` tag, just `compile.sh`, `scripts/bootstrap/`, `MODULE.bazel`
+and `.bazelversion`. It reads what the bootstrap needs from those scripts:
+`JAVA_VERSION=${JAVA_VERSION:-21}`, the `unzip` in its tool check,
+rules_python's autodetecting toolchain, `-std=c++17`. Each of those is
+checked against the archive. compile.sh builds Bazel with itself, so it is
+read, not run. jax's `build.py` downloads Bazel only for x86_64 and aarch64
+Linux, macOS and Windows; anywhere else it takes `--bazel_path`, which is
+where the bootstrapped one goes.
 
 ### Meson projects are asked, not guessed at
 
@@ -944,14 +1043,16 @@ $ will-it-riscv -f list
 
 ### Exit codes
 
-| code | meaning |
-| --- | --- |
-| 0 | everything installs from wheels or is pure Python |
-| 1 | some packages must be built from source |
-| 2 | something is blocked, unresolvable, or has no distribution at all |
-| 3 | the index itself was unusable |
+| code | reading a project, a manifest or packages | `plan`, `--plan`, `--plan-from-model` |
+| --- | --- | --- |
+| 0 | everything installs from wheels or is pure Python | yes: the build has everything it needs from the archive |
+| 1 | some packages, or the project itself, must be built from source | probably, or yes once some packages are built from source |
+| 2 | something is blocked, unresolvable, or has no distribution at all | no, or unknown: a step could not be got past |
+| 3 | the index itself was unusable | the same |
 
-So `will-it-riscv || exit 1` is a reasonable CI gate.
+So `will-it-riscv || exit 1` is a reasonable CI gate. A project that
+compiles code of its own always exits 1 or more when its tree is read: it is
+built from source whatever its dependencies do.
 
 ### Targets
 
@@ -1017,16 +1118,17 @@ SCons is detected but not scraped, and Bazel is read only for what it
 downloads prebuilt; the report says so rather than implying the project has
 no dependencies.
 
-**Repository scanning is inference too.** A CMake option you never enable is
-indistinguishable, statically, from one you always do — so an optional
-backend can appear in the list. Vendor GPU stacks (CUDA, ROCm, SYCL, oneAPI)
-are filtered out entirely, since none of them exists for riscv64 and all are
-opt-in.
+**Repository scanning is inference too.** The option and `if` walk above
+decides what a build with no `-D` flags reaches, but a condition it cannot
+evaluate counts as reachable, so an optional backend can still appear in
+the list. Vendor GPU stacks (CUDA, ROCm, SYCL, oneAPI) are filtered out
+entirely, since none of them exists for riscv64 and all are opt-in.
 
 **It is not a resolver.** For each package it takes the highest version satisfying
 the constraints seen so far, and revisits when a later edge tightens them. It does
-not backtrack. Where pip and uv disagree with it, they are right — but neither can
-target riscv64 today, which is the whole reason this exists.
+not backtrack. Where pip and uv disagree with it, they are right, and `uv pip
+compile --python-platform riscv64-unknown-linux` is a way to check it. What this
+adds is which of those versions must be compiled, and what the compile needs.
 
 **Guessed package names are marked.** A library not in the curated map gets a
 Debian name guessed from convention (`libfoo-dev`). The report says which ones

@@ -54,7 +54,7 @@ To serve it yourself, run any recent llama.cpp:
 
 ```console
 $ llama-server -m lagutenko-4B-Q8_0.gguf --jinja -c 40960 -fa on -ngl 99
-$ will-it-riscv plan ~/src/nlopt --planner-url http://127.0.0.1:8080/v1
+$ will-it-riscv plan ~/src/nlopt --planner-url http://127.0.0.1:8080/v1 --model lagutenko-4B
 ```
 
 The context is 40,960 tokens: the longest packs run to about 32k tokens, and

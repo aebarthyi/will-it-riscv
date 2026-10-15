@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Optional
 from . import __version__, planrun
 from .autoplan import tomllib
 from .plan import CMAKE_CONFIGURE, MESON_SETUP, PYTHON_INSTALL, PYTHON_RUN, SYSTEM_PACKAGES
+from .upstream import UPSTREAM
 
 if TYPE_CHECKING:  # pragma: no cover
     from .plan import Step
@@ -380,8 +381,11 @@ def _source_lines(name: str, version: Optional[str], ecosystem: str, kind: str,
         return [f'run "$PY" -m pip install {_q(spec)}']
     wanted = f"{name} {version}" if version else name
     where = f": {origin}" if origin else ""
+    # The distro package names what it installs: bazel-bootstrap is bazel.
+    tool = UPSTREAM.get(name)
+    command = tool.name if tool is not None else name
     return [
-        f"if ! command -v {_q(name)} >/dev/null 2>&1; then",
+        f"if ! command -v {_q(command)} >/dev/null 2>&1; then",
         f"  echo {_q(f'build {wanted} from its source first{where}; will-it-riscv read its build but has no recipe to run it')} >&2",  # noqa: E501
         '  [ -n "${DRY_RUN:-}" ] || exit 1',
         "fi",

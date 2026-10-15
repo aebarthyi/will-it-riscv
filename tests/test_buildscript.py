@@ -162,6 +162,18 @@ def test_rust_comes_from_rustup_when_the_archive_is_too_old(tmp_path):
     assert "rustc >= 1.95" in script
 
 
+def test_a_tool_built_from_its_source_is_looked_for_by_its_command(tmp_path):
+    """jax wants Bazel 8.7.0: the package is bazel-bootstrap, and what it gives is bazel."""
+    result = result_for(tmp_path, plan(DEPS))
+    bazel = planrun._node(result, "debian:bazel-bootstrap", "debian", "bazel-bootstrap")
+    bazel.required, bazel.wants = True, "8.7.0"
+    planrun._settle(bazel, planrun.SOURCE, "too old; Bazel publishes no riscv64 binaries")
+    result.answer = planrun._answer(result)
+    script = build_script(result)
+    assert "command -v bazel >/dev/null" in script
+    assert "build bazel-bootstrap 8.7.0 from its source first" in script
+
+
 def test_the_checkout_is_checked_before_anything_runs(tmp_path):
     script = build_script(result_for(tmp_path, plan(DEPS, CMAKE)))
     elsewhere = tmp_path / "elsewhere"
